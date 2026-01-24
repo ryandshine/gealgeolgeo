@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+/* Custom styles for Leaflet */
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  background-color: #f1f5f9;
+}
+
+.leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1) !important;
+}
+
+.leaflet-bar a {
+  background-color: white !important;
+  color: #64748b !important;
+  border: 1px solid #e2e8f0 !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-shimmer {
+  animation: shimmer 2s infinite;
+}

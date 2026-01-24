@@ -1,0 +1,30 @@
+server {
+    listen 80;
+    server_name gealgeolgeo.ditpps.com;
+    root /var/www/gealgeolgeo;
+    index index.html;
+    client_max_body_size 200M;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API Proxy with explicit rewrite to strip /api prefix
+    location /api/ {
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Storage Proxy (Thumbnails)
+    location /storage/ {
+        proxy_pass http://127.0.0.1:8000/storage/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
