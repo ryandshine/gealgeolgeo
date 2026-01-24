@@ -1,57 +1,52 @@
-#!/bin/bash
+#!/bash
 
 # Configuration
 APP_DIR="/home/ryandshine/gealgeolgeo"
 SERVICE_NAME="gealgeolgeo-backend"
+WEB_ROOT="/var/www/gealgeolgeo"
 
-echo "🚀 Starting DEEP CLEAN Deployment..."
+echo "🚀 Starting PRODUCTION Deployment (Perfect Mode)..."
 
 # 1. Update Code
-echo "📥 Pulling latest changes from Git..."
+echo "📥 Syncing with GitHub..."
 cd $APP_DIR
-# Reset any local changes to avoid conflicts
+# Clean up any local temporary files not in git
 git reset --hard HEAD
+git clean -fd
 git pull origin main
 
-# 2. Deep Clean & Update Backend
-echo "🐍 Cleaning and Updating Backend (Python)..."
-# Stop service before cleaning
-sudo systemctl stop $SERVICE_NAME
+# 2. Setup/Update Backend
+echo "🐍 Refreshing Virtual Environment..."
+# Stop service to release file locks
+sudo systemctl stop $SERVICE_NAME || true
 
-# Remove virtual environment to force fresh install
 rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate
-echo "📦 Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 3. Deep Clean & Update Frontend
-echo "⚛️  Cleaning and Building Frontend (React)..."
+# 3. Setup/Update Frontend
+echo "⚛️  Building Frontend (Fresh)..."
 cd frontend
-# Remove build artifacts and dependencies
-rm -rf dist
-rm -rf node_modules
-echo "📦 Installing npm dependencies..."
+rm -rf dist node_modules package-lock.json
 npm install
-echo "🛠️  Creating fresh production build..."
 npm run build
 cd ..
 
-# 4. Sync to Web Root & Restart Services
-echo "🔄 Syncing files to Web Root (/var/www/gealgeolgeo)..."
-sudo cp -r frontend/dist/* /var/www/gealgeolgeo/
+# 4. Finalize & Sync
+echo "🔄 Updating Web Root..."
+sudo mkdir -p $WEB_ROOT
+sudo chown -R $USER:$USER $WEB_ROOT
+cp -v -r frontend/dist/* $WEB_ROOT/
 
-echo "🔄 Restarting Systemd Service..."
-sudo systemctl restart $SERVICE_NAME
-# Ensure it's enabled
+# 5. Services Refresh
+echo "🔄 Restarting System Services..."
+sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
-
-echo "🌐 Restarting Nginx..."
+sudo systemctl restart $SERVICE_NAME
 sudo systemctl restart nginx
 
-# 5. Verify Database Access Policy (Ensure public access)
-echo "✅ Backend set to 0.0.0.0:8000"
-echo "✅ CORS set to allow all origins in main.py"
-echo "✅ Deployment Finished Successfully!"
-echo "🌐 App should be live at: http://gealgeolgeo.ditpps.com"
+echo "✅ DEPLOYMENT COMPLETE!"
+echo "🌐 URL: https://gealgeolgeo.ditpps.com"
+echo "🕒 Timestamp: $(date)"
