@@ -1,4 +1,4 @@
-#!/bash
+#!/bin/bash
 
 # Configuration
 APP_DIR="/srv/apps/gealgeolgeo"
