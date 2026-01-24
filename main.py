@@ -582,7 +582,7 @@ ALLOWED_ORIGINS = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False, # Must be False for allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -3787,7 +3787,7 @@ async def get_history():
     print(f"🔄 Cache MISS for {CACHE_KEY} - fetching from database...")
         
     try:
-        # Optimasi: Hapus fetch geom_geojson yang berat. List view cukup pakai thumbnail.
+        # Optimasi: Ambil data esensial saja. Hilangkan geom_geojson.
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
             .select("id, filename, file_size, created_at, metadata, analysis_results")
@@ -3796,47 +3796,33 @@ async def get_history():
             .execute()
         )
         
+        # Pruning Agresif untuk List View (Prevent 524 Timeout)
         data = []
         for item in res.data:
-            cleaned = item.copy()
-            cleaned['geo_data'] = None # Explicitly empty to save bandwidth
-
-            # Prune massive vector data AND RGB thumbnails from list to keep response light
-            results = cleaned.get('analysis_results', [])
+            # 1. Hilangkan GeoJSON Geometri (Terlalu berat untuk list)
+            item['geo_data'] = None 
+            
+            # 2. Bersihkan Analysis Results
+            results = item.get('analysis_results', [])
             if isinstance(results, list) and results:
-                # Sort by year to ensure we identify the latest correctly
-                try:
-                    results.sort(key=lambda x: int(x.get('year', 0)))
-                except:
-                    pass # Keep original order if sort fails
-
-                latest_idx = len(results) - 1
+                # Kita hanya butuh statistik (untuk grafik trend) 
+                # dan thumbnail terbaru (untuk preview card)
+                results.sort(key=lambda x: int(x.get('year', 0)), reverse=True)
                 
-                for idx, res_item in enumerate(results):
-                    # ALWAYS remove massive vector_geojson from list view
-                    if 'vector_geojson' in res_item:
-                        del res_item['vector_geojson']
+                latest_year = results[0]
+                for idx, r in enumerate(results):
+                    # ALWAYS remove massive vector data
+                    if 'vector_geojson' in r: del r['vector_geojson']
+                    if 'rgb_thumb_url' in r: del r['rgb_thumb_url']
                     
-                    # ALWAYS remove rgb_thumb_url from list view (too heavy)
-                    if 'rgb_thumb_url' in res_item:
-                         del res_item['rgb_thumb_url']
-
-                    # Prune ONLY heavy Base64 strings for older years
-                    # Keep lightweight local storage URLs (/storage/...)
-                    if idx != latest_idx:
-                         val = res_item.get('thumb_url')
-                         if val and isinstance(val, str) and val.startswith('data:image'):
-                             del res_item['thumb_url']
+                    # Hilangkan thumbnail kecuali untuk tahun TERBARU
+                    # (Frontend butuh preview thumb di card, tapi cukup 1)
+                    if idx > 0:
+                        if 'thumb_url' in r: del r['thumb_url']
             
-            data.append(cleaned)
-        
-        # Invalidate old heavy cache if exists
-        # invalidate_cache("history_list")  <-- Already handled by overwrite below
-        
-        # Store in cache (permanent - no TTL)
-        cache_file(CACHE_KEY, data)
+            data.append(item)
             
-        return data
+        return data # Hilangkan caching sementara untuk data live murni
         
     except Exception as e:
         print(f"❌ Error fetching history: {e}")
