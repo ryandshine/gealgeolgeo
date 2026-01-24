@@ -1,23 +1,29 @@
 #!/bash
 
 # Configuration
-APP_DIR="/home/ryandshine/gealgeolgeo"
+APP_DIR="/srv/apps/gealgeolgeo"
 SERVICE_NAME="gealgeolgeo-backend"
 WEB_ROOT="/var/www/gealgeolgeo"
+REPO_URL="https://github.com/ryandshine/gealgeolgeo.git"
 
 echo "🚀 Starting PRODUCTION Deployment (Perfect Mode)..."
 
-# 1. Update Code
+# 1. Ensure Directory & Sync Code
+if [ ! -d "$APP_DIR/.git" ]; then
+    echo "📦 Initial Clone..."
+    sudo mkdir -p $APP_DIR
+    sudo chown $USER:$USER $APP_DIR
+    git clone $REPO_URL $APP_DIR
+fi
+
 echo "📥 Syncing with GitHub..."
 cd $APP_DIR
-# Clean up any local temporary files not in git
 git reset --hard HEAD
 git clean -fd
 git pull origin main
 
 # 2. Setup/Update Backend
 echo "🐍 Refreshing Virtual Environment..."
-# Stop service to release file locks
 sudo systemctl stop $SERVICE_NAME || true
 
 rm -rf .venv
@@ -42,6 +48,12 @@ cp -v -r frontend/dist/* $WEB_ROOT/
 
 # 5. Services Refresh
 echo "🔄 Restarting System Services..."
+# Ensure nginx config is enabled
+if [ ! -f "/etc/nginx/sites-enabled/gealgeolgeo" ]; then
+    echo "🌐 Enabling Nginx config..."
+    sudo ln -s /etc/nginx/sites-available/gealgeolgeo /etc/nginx/sites-enabled/
+fi
+
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 sudo systemctl restart $SERVICE_NAME
