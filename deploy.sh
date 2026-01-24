@@ -23,9 +23,11 @@ git clean -fd
 git pull origin main
 
 # 2. Setup/Update Backend
-echo "🐍 Refreshing Virtual Environment..."
+echo "🐍 Refreshing Virtual Environment & Cache..."
 sudo systemctl stop $SERVICE_NAME || true
 
+# Clear stale cache (Important for data consistency)
+rm -rf cache/
 rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate

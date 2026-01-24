@@ -576,17 +576,8 @@ app = FastAPI(
 # Enable GZip compression for all responses > 500 bytes
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# Enable CORS dengan origin terbatas untuk keamanan
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",  # Vite default
-    "http://localhost:5174",  # Vite alternate port
-    "http://localhost:3000",  # React default
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-    "http://127.0.0.1:3000",
-    "https://gealgeolgeo.ditpps.com", # Production domain
-    "https://sipantaups.ditpps.com"   # Alternatif/Redirect domain
-]
+# Enable CORS untuk akses publik (Device mana pun)
+ALLOWED_ORIGINS = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
