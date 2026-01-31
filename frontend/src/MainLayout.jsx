@@ -4,12 +4,19 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { MapContainer, TileLayer, GeoJSON, ImageOverlay, Marker, Popup, useMap, useMapEvents, WMSTileLayer, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { calculateTrends, generateVerbalNarrative } from './utils/analysisUtils';
+import {
+    calculateTrends,
+    generateVerbalNarrative,
+    fetchTemporalStatus,
+    getOpacityByTemporalStatus,
+    getTemporalStatusStyle,
+    createYearOpacityMap
+} from './utils/analysisUtils';
 import HistoryDashboard from './HistoryDashboard';
 import AttributeTag from './AttributeTag';
 import CalibrationPanel from './CalibrationPanel';
-import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures, BigAdminLayer } from './MapComponents';
-import { LAND_COVER_CONFIG, MAP_TILES, CALIBRATION_DEFAULTS, SIGAP_CONFIG, BMKG_HOTSPOT_CONFIG, API_URL, BIG_ADMIN_CONFIG } from './constants';
+import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures } from './MapComponents';
+import { LAND_COVER_CONFIG, MAP_TILES, CALIBRATION_DEFAULTS, SIGAP_CONFIG, NASA_FIRMS_CONFIG, API_URL } from './constants';
 
 
 // Helper for Enhanced Floating Badge Icon - Color aware
@@ -33,12 +40,23 @@ const createPinIcon = (label, color = '#10b981') => L.divIcon({
 // Helper to resolve thumbnail URL (handle relative paths from VPS storage)
 const resolveThumbUrl = (url) => {
     if (!url) return null;
-    if (url.startsWith('/')) {
-        // Remove trailing /api if present in API_URL to get server root
-        const root = API_URL.replace(/\/api\/?$/, '');
-        return `${root}${url}`;
+
+    try {
+        if (url.startsWith('/')) {
+            // Remove trailing /api if present in API_URL to get server root
+            const root = API_URL.replace(/\/api\/?$/, '');
+            const fullUrl = `${root}${url}`;
+            console.debug(`[Thumbnail] Resolved local path: ${url} → ${fullUrl.substring(0, 80)}...`);
+            return fullUrl;
+        }
+
+        // Absolute URL (Supabase or external)
+        console.debug(`[Thumbnail] Using absolute URL: ${url.substring(0, 80)}...`);
+        return url;
+    } catch (e) {
+        console.error(`[Thumbnail] Failed to resolve URL: ${url}`, e);
+        return url; // Return original as fallback
     }
-    return url;
 };
 
 // Component to auto-zoom map to fit all history pin
@@ -190,6 +208,143 @@ const SigapLegend = ({ activeLayers }) => {
     );
 };
 
+// 🔄 TEMPORAL STATUS LEGEND COMPONENT (NEW)
+const TemporalStatusLegend = ({ show }) => {
+    if (!show) return null;
+
+    return (
+        <div className="mt-4 pt-3 border-t border-slate-100">
+            <div className="text-[10px] font-bold text-amber-700 mb-1.5 uppercase tracking-tight">Status Perubahan Tutupan</div>
+            <div className="flex flex-col gap-1.5">
+                {[
+                    { status: 'stable', label: 'Stabil', opacity: 1.0 },
+                    { status: 'transition_confirmed', label: 'Terkonfirmasi', opacity: 1.0 },
+                    { status: 'transition_unconfirmed', label: 'Belum Terkonfirmasi (Grey Area)', opacity: 0.5 },
+                    { status: 'reverted_noise', label: 'Noise/Musiman', opacity: 0.3 }
+                ].map(item => {
+                    const style = getTemporalStatusStyle(item.status);
+                    return (
+                        <div key={item.status} className="flex items-center gap-2">
+                            <div
+                                className="w-3.5 h-3.5 rounded-sm shadow-sm"
+                                style={{
+                                    backgroundColor: style.color,
+                                    opacity: item.opacity,
+                                    border: '1px solid rgba(0,0,0,0.15)'
+                                }}
+                            />
+                            <span className="text-[10px] text-slate-600 leading-normal">{item.label}</span>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+// END TEMPORAL STATUS LEGEND
+
+// Component to display Slope legend (Raster from GEE)
+const SlopeLegend = ({ show }) => {
+    if (!show) return null;
+
+    const slopeClasses = [
+        { label: "Datar (0-8%)", color: "#31a354" },
+        { label: "Landai (8-15%)", color: "#addd8e" },
+        { label: "Agak Curam (15-25%)", color: "#fee391" },
+        { label: "Curam (25-40%)", color: "#fec44f" },
+        { label: "Sangat Curam (40-60%)", color: "#ec7014" },
+        { label: "Ekstrem (>60%)", color: "#662506" }
+    ];
+
+    return (
+        <div className="mt-4 pt-3 border-t border-slate-100">
+            <div className="text-[10px] font-bold text-orange-700 mb-1.5 uppercase tracking-tight">Kelerengan (Slope)</div>
+            <div className="flex flex-col gap-1.5">
+                {slopeClasses.map((item, idx) => (
+                    <div key={`slope-${idx}`} className="flex items-center gap-2">
+                        <div className="w-3 h-3 rounded shadow-sm" style={{ backgroundColor: item.color }} />
+                        <span className="text-[10px] text-slate-600 leading-normal">{item.label}</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// Component to display Slope numerical summary in analysis dashboard
+const SlopeDataPanel = ({ summary, title, variant = 'inside' }) => {
+    if (!summary) return null;
+
+    // KLHK Standard Classification (DB columns: slope_25_40 = 25-45%, slope_above_40 = >45%)
+    const stats = [
+        { label: "Datar (0-8%)", value: summary.slope_0_8, color: "bg-[#31a354]" },
+        { label: "Landai (8-15%)", value: summary.slope_8_15, color: "bg-[#addd8e]" },
+        { label: "Agak Curam (15-25%)", value: summary.slope_15_25, color: "bg-[#fee391]" },
+        { label: "Curam (25-45%)", value: summary.slope_25_40, color: "bg-[#fec44f]" },
+        { label: "Sangat Curam (>45%)", value: summary.slope_above_40, color: "bg-[#cc4c02]" }
+    ];
+
+    const totalArea = stats.reduce((acc, s) => acc + (Number(s.value) || 0), 0);
+    const isOutside = variant === 'outside';
+    const bgColor = isOutside ? 'bg-blue-100' : 'bg-orange-100';
+    const textColor = isOutside ? 'text-blue-600' : 'text-orange-600';
+    const badgeBg = isOutside ? 'bg-blue-50' : 'bg-orange-50';
+    const borderColor = isOutside ? 'border-blue-100/50' : 'border-orange-100/50';
+
+    return (
+        <div className={`bg-white/70 backdrop-blur-md rounded-2xl p-4 border ${borderColor} shadow-sm animate-in fade-in slide-in-from-right duration-500`}>
+            <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                    <div className={`p-1.5 ${bgColor} ${textColor} rounded-lg shadow-sm`}>
+                        <TrendingUp size={16} />
+                    </div>
+                    <div>
+                        <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-tight">{title || 'Rerata Kelerengan'}</div>
+                        <div className="text-sm font-black text-slate-800">{summary.avg_slope || 0}%</div>
+                    </div>
+                </div>
+                <div className="text-right">
+                    <div className="text-[8px] font-bold text-slate-400 uppercase tracking-tighter">Scope</div>
+                    <div className={`text-[10px] font-black ${textColor} ${badgeBg} px-2 py-0.5 rounded-full`}>
+                        {summary.scope === 'INSIDE' ? 'DALAM' : summary.scope === 'OUTSIDE' ? 'BUFFER 2KM' : (summary.scope || 'Wilayah')}
+                    </div>
+                </div>
+            </div>
+
+            <div className="space-y-2.5">
+                {stats.map((stat, i) => {
+                    const pct = totalArea > 0 ? (Number(stat.value) / totalArea * 100).toFixed(1) : 0;
+                    return (
+                        <div key={i} className="flex flex-col gap-1.5">
+                            <div className="flex items-center justify-between text-[10px]">
+                                <span className="text-slate-600 font-bold">{stat.label}</span>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-slate-400 text-[9px]">{pct}%</span>
+                                    <span className="text-slate-800 font-black font-mono">{Number(stat.value).toFixed(1)} Ha</span>
+                                </div>
+                            </div>
+                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden shadow-inner">
+                                <div
+                                    className={`h-full ${stat.color} transition-all duration-1000 ease-out shadow-sm`}
+                                    style={{ width: `${pct}%`, transitionDelay: `${i * 100}ms` }}
+                                />
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between">
+                <div className="text-[9px] text-slate-400 italic">Data Sumber: NASADEM (SRTM-derived)</div>
+                <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="text-[9px] font-bold text-emerald-600 uppercase">Live Analysis</span>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 const MainLayout = (props) => {
     const {
         file, loading, showChart, setShowChart, data, geoData, setData, setGeoData, setFile, setMapUrl, setRgbMapUrl, setVectorLayerData, setError,
@@ -218,11 +373,9 @@ const MainLayout = (props) => {
         // SIGAP Interaktif
         showKawasanHutan, setShowKawasanHutan, kawasanHutanOpacity, setKawasanHutanOpacity,
         showDAS, setShowDAS, dasOpacity, setDasOpacity,
+        // Slope Analysis
+        showSlopeLayer, setShowSlopeLayer, slopeOpacity, setSlopeOpacity, slopeMapUrl, slopeDbSummary, slopeDbSummaryOutside,
 
-        // BNPB Visual Layers
-        showBnpbBanjir, setShowBnpbBanjir,
-        showBnpbLongsor, setShowBnpbLongsor,
-        showBnpbDas,
         onOpenCarbonMode,
         queuePosition
     } = props;
@@ -230,24 +383,17 @@ const MainLayout = (props) => {
     // Local State for SIGAP Panel Visibility
     const [showSigapPanel, setShowSigapPanel] = useState(false);
 
-    // BMKG Hotspot Layer States
-    const [showBmkgHotspot, setShowBmkgHotspot] = useState(false);
-    const [bmkgHotspotData, setBmkgHotspotData] = useState([]);
-    const [bmkgLoading, setBmkgLoading] = useState(false);
-    const [bmkgError, setBmkgError] = useState(null);
-    const [showBigNegara, setShowBigNegara] = useState(false);
-    const [bigNegaraOpacity, setBigNegaraOpacity] = useState(0.9);
-    const [showBigProvinsi, setShowBigProvinsi] = useState(false);
-    const [bigProvinsiOpacity, setBigProvinsiOpacity] = useState(0.8);
-    const [showBigKabKota, setShowBigKabKota] = useState(false);
-    const [bigKabKotaOpacity, setBigKabKotaOpacity] = useState(0.7);
-    const [showBigKecamatan, setShowBigKecamatan] = useState(false);
-    const [bigKecamatanOpacity, setBigKecamatanOpacity] = useState(0.6);
-    const [showBigDesa, setShowBigDesa] = useState(false);
-    const [bigDesaOpacity, setBigDesaOpacity] = useState(0.5);
-    const [showBigLabels, setShowBigLabels] = useState(true);
+    // NASA FIRMS Hotspot Layer States (Fire Information for Resource Management System)
+    const [showNasaHotspot, setShowNasaHotspot] = useState(false);
+    const [nasaHotspotData, setNasaHotspotData] = useState([]);
+    const [nasaLoading, setNasaLoading] = useState(false);
+    const [nasaError, setNasaError] = useState(null);
 
-
+    // 🔄 TEMPORAL STATUS STATES (NEW)
+    const [temporalStatusData, setTemporalStatusData] = useState(null);
+    const [yearOpacityMap, setYearOpacityMap] = useState({});
+    const [showTemporalStatus, setShowTemporalStatus] = useState(true);
+    // END TEMPORAL STATUS STATES
 
     // Global Hotspot Aggregation State
     const [totalGlobalHotspots, setTotalGlobalHotspots] = useState(null);
@@ -261,72 +407,174 @@ const MainLayout = (props) => {
         setChartTab(showAllPins ? 'summary' : 'bar');
     }, [showAllPins]);
 
-    // Fetch BMKG Hotspot data filtered by user's polygon
-    const fetchBmkgHotspot = async (geoDataInput) => {
-        if (!geoDataInput?.features?.[0]?.geometry) {
-            console.warn('BMKG Fetch: No valid geometry found');
-            setBmkgHotspotData([]);
+    // Auto-switch to slope tab when slope layer is enabled
+    useEffect(() => {
+        if (showSlopeLayer) {
+            if (!showAllPins) setChartTab('slope');
+        }
+    }, [showSlopeLayer, showAllPins]);
+
+    // 🔄 FETCH TEMPORAL STATUS WHEN HISTORY CHANGES (NEW)
+    useEffect(() => {
+        // Fetch temporal status when data changes (i.e., when user selects a history)
+        if (!data?.id && !vectorLayerData?.properties?.history_id) {
+            setTemporalStatusData(null);
+            setYearOpacityMap({});
             return;
         }
 
-        setBmkgLoading(true);
-        setBmkgError(null);
+        const historyId = data?.id || vectorLayerData?.properties?.history_id;
+        if (!historyId) {
+            return;
+        }
+
+        const fetchStatus = async () => {
+            console.log(`📅 Fetching temporal status for history ${historyId.substring(0, 8)}...`);
+            try {
+                const statusData = await fetchTemporalStatus(historyId, API_URL);
+
+                if (statusData) {
+                    setTemporalStatusData(statusData);
+                    // Create opacity map for quick lookup
+                    const opacityMap = createYearOpacityMap(statusData.yearly_data || []);
+                    setYearOpacityMap(opacityMap);
+                    console.log('✅ Temporal status loaded:', opacityMap);
+                } else {
+                    console.log('⚠️ No temporal status data found');
+                    setTemporalStatusData(null);
+                    setYearOpacityMap({});
+                }
+            } catch (error) {
+                console.error('Error fetching temporal status:', error);
+                setTemporalStatusData(null);
+                setYearOpacityMap({});
+            }
+        };
+
+        fetchStatus();
+    }, [data?.id, vectorLayerData?.properties?.history_id]);
+    // END FETCH TEMPORAL STATUS
+
+    // Fetch NASA FIRMS Hotspot data filtered by user's polygon bounding box
+    // Uses time series: 1 January - 31 December of selected year
+    const fetchNasaHotspot = async (geoDataInput, year) => {
+        if (!geoDataInput?.features?.[0]?.geometry) {
+            console.warn('NASA FIRMS Fetch: No valid geometry found');
+            setNasaHotspotData([]);
+            return;
+        }
+
+        // Determine target year (use selected year or current year)
+        const targetYear = year || selectedYear || new Date().getFullYear();
+
+        setNasaLoading(true);
+        setNasaError(null);
 
         try {
-            // Extract coordinates from GeoJSON polygon
+            // Extract bounding box from GeoJSON polygon
             const geometry = geoDataInput.features[0].geometry;
-            let rings = [];
+            let allCoords = [];
 
             if (geometry.type === 'Polygon') {
-                rings = geometry.coordinates[0].map(([lng, lat]) => [lng, lat]);
+                allCoords = geometry.coordinates[0];
             } else if (geometry.type === 'MultiPolygon') {
-                // Use first polygon for simplicity
-                rings = geometry.coordinates[0][0].map(([lng, lat]) => [lng, lat]);
+                // Flatten all polygons
+                geometry.coordinates.forEach(poly => {
+                    allCoords = allCoords.concat(poly[0]);
+                });
             }
 
-            if (rings.length === 0) {
-                console.warn('BMKG Fetch: Empty rings');
-                setBmkgHotspotData([]);
-                setBmkgLoading(false);
+            if (allCoords.length === 0) {
+                console.warn('NASA FIRMS Fetch: Empty coordinates');
+                setNasaHotspotData([]);
+                setNasaLoading(false);
                 return;
             }
 
-            // Build ESRI geometry format
-            const esriGeometry = JSON.stringify({ rings: [rings] });
+            // Calculate bounding box
+            const lngs = allCoords.map(c => c[0]);
+            const lats = allCoords.map(c => c[1]);
+            const bounds = {
+                minLon: Math.min(...lngs),
+                minLat: Math.min(...lats),
+                maxLon: Math.max(...lngs),
+                maxLat: Math.max(...lats)
+            };
 
-            // Use backend proxy to bypass CORS
-            const response = await fetch(`${API_URL}/proxy/bmkg/hotspot`, {
+            // Build time series date range: 1 Jan - 31 Dec of target year
+            const startDate = `${targetYear}-01-01`;
+            const endDate = `${targetYear}-12-31`;
+
+            console.log(`🔥 NASA FIRMS: Fetching hotspots for ${targetYear} (${startDate} to ${endDate})`);
+
+            // Use NASA FIRMS backend proxy with time series
+            const response = await fetch(NASA_FIRMS_CONFIG.PROXY_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    geometry: esriGeometry,
-                    geometryType: 'esriGeometryPolygon',
-                    spatialRel: 'esriSpatialRelIntersects'
+                    bounds: bounds,
+                    start_date: startDate,
+                    end_date: endDate,
+                    source: NASA_FIRMS_CONFIG.DEFAULT_SOURCE
                 })
             });
-            if (!response.ok) throw new Error(`BMKG Proxy Error: ${response.status}`);
+            if (!response.ok) throw new Error(`NASA FIRMS Proxy Error: ${response.status}`);
 
             const data = await response.json();
             const features = data.features || [];
-            console.log(`🔥 BMKG Hotspot: Found ${features.length} hotspots in polygon`);
-            setBmkgHotspotData(features);
+
+            // Filter features to only those inside the polygon (more precise than bbox)
+            const filteredFeatures = features.filter(f => {
+                if (!f.geometry?.coordinates) return false;
+                const [lng, lat] = f.geometry.coordinates;
+                return isPointInPolygon([lng, lat], geometry);
+            });
+
+            console.log(`🔥 NASA FIRMS ${targetYear}: Found ${features.length} in bbox, ${filteredFeatures.length} in polygon`);
+            setNasaHotspotData(filteredFeatures);
         } catch (err) {
-            console.error('BMKG Fetch Error:', err);
-            setBmkgError(err.message);
-            setBmkgHotspotData([]);
+            console.error('NASA FIRMS Fetch Error:', err);
+            setNasaError(err.message);
+            setNasaHotspotData([]);
         } finally {
-            setBmkgLoading(false);
+            setNasaLoading(false);
         }
     };
 
-    // Effect: Fetch hotspot when toggle is ON and geoData exists
-    useEffect(() => {
-        if (showBmkgHotspot && geoData) {
-            fetchBmkgHotspot(geoData);
-        } else if (!showBmkgHotspot) {
-            setBmkgHotspotData([]);
+    // Helper: Check if point is inside polygon
+    const isPointInPolygon = (point, geometry) => {
+        const [px, py] = point;
+        let rings = [];
+
+        if (geometry.type === 'Polygon') {
+            rings = [geometry.coordinates[0]];
+        } else if (geometry.type === 'MultiPolygon') {
+            rings = geometry.coordinates.map(poly => poly[0]);
         }
-    }, [showBmkgHotspot, geoData]);
+
+        for (const ring of rings) {
+            let inside = false;
+            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+                const xi = ring[i][0], yi = ring[i][1];
+                const xj = ring[j][0], yj = ring[j][1];
+                const intersect = ((yi > py) !== (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+                if (intersect) inside = !inside;
+            }
+            if (inside) return true;
+        }
+        return false;
+    };
+
+    // Effect: Fetch hotspot when toggle is ON and geoData exists
+    // Re-fetch when selectedYear changes to follow time series
+    useEffect(() => {
+        if (showNasaHotspot && geoData) {
+            fetchNasaHotspot(geoData, selectedYear);
+        } else if (!showNasaHotspot) {
+            setNasaHotspotData([]);
+        }
+    }, [showNasaHotspot, geoData, selectedYear]);
 
 
     const isHistoryVisible = (!data && !loading && !file && !geoData) || showHistoryTable;
@@ -425,66 +673,7 @@ const MainLayout = (props) => {
     // SIGAP Identify State
     const [identifyResult, setIdentifyResult] = useState(null); // { latlng, features }
 
-    // BNPB Risk Info State
-    const [bnpbInfo, setBnpbInfo] = useState(null); // { das, banjir, longsor, loading, error }
 
-    const fetchBNPBData = async (lat, lng) => {
-        setBnpbInfo({ loading: true, error: null });
-
-        // Helper to query ArcGIS REST Identify
-        const queryLayer = async (url, layerIds = 'all:0') => {
-            try {
-                // Construct Identify Parameters
-                // Using a small tolerance to simulate point-in-polygon
-                const params = new URLSearchParams({
-                    f: 'json',
-                    geometry: `${lng},${lat}`,
-                    geometryType: 'esriGeometryPoint',
-                    sr: 4326,
-                    layers: layerIds,
-                    tolerance: 2,
-                    mapExtent: `${lng - 0.01},${lat - 0.01},${lng + 0.01},${lat + 0.01}`,
-                    imageDisplay: '400,300,96', // Dummy display
-                    returnGeometry: false
-                });
-
-                const response = await fetch(`${url}/identify?${params.toString()}`);
-                const data = await response.json();
-
-                if (data.results && data.results.length > 0) {
-                    return data.results[0].attributes;
-                }
-                return null;
-            } catch (err) {
-                console.error(`Error querying ${url}:`, err);
-                return null;
-            }
-        };
-
-        try {
-            // Run parallel queries
-            const [dasData, banjirData, longsorData] = await Promise.all([
-                queryLayer(BNPB_CONFIG.DAS),     // Layer DAS
-                queryLayer(BNPB_CONFIG.BANJIR),  // Layer Banjir
-                queryLayer(BNPB_CONFIG.LONGSOR)  // Layer Longsor
-            ]);
-
-            setBnpbInfo({
-                loading: false,
-                das: dasData ? (dasData['NAMADAS'] || dasData['DAS'] || 'Terdeteksi') : 'Tidak Terdeteksi',
-                banjir: banjirData ? (banjirData['kelas_risiko'] || banjirData['gridcode'] || 'Ada Risiko') : 'Rendah / Aman',
-                longsor: longsorData ? (longsorData['kelas_risiko'] || longsorData['gridcode'] || 'Ada Risiko') : 'Rendah / Aman',
-                error: null
-            });
-
-            // Auto open sidebar to show info if closed
-            if (!showSidebar) setShowSidebar(true);
-
-        } catch (err) {
-            console.error("BNPB Query Error:", err);
-            setBnpbInfo({ loading: false, error: "Gagal mengambil data risiko." });
-        }
-    };
 
     // Aggregate statistics for ALL history items (Global View)
     // DEDUPLICATION: Only take the latest analysis for each unique filename
@@ -497,7 +686,8 @@ const MainLayout = (props) => {
         return Array.from(latestMap.values());
     }, [historyData]);
 
-    // Global Hotspot Aggregation for Dashboard
+    // Global Hotspot Aggregation for Dashboard (NASA FIRMS)
+    // Uses time series: 1 January - 31 December of current year
     useEffect(() => {
         const aggregateGlobalHotspots = async () => {
             if (!showChart || !showAllPins || uniqueHistoryData.length === 0) {
@@ -510,7 +700,12 @@ const MainLayout = (props) => {
             setIsHotspotsLoading(true);
             let grandTotal = 0;
 
-            console.log(`🔥 Aggregating hotspots for ${uniqueHistoryData.length} KPS...`);
+            // Use current year for global aggregation
+            const currentYear = new Date().getFullYear();
+            const startDate = `${currentYear}-01-01`;
+            const endDate = `${currentYear}-12-31`;
+
+            console.log(`🔥 Aggregating NASA FIRMS hotspots for ${uniqueHistoryData.length} KPS (${currentYear})...`);
 
             try {
                 // Fetch hotspots for each unique history item (KPS)
@@ -519,38 +714,55 @@ const MainLayout = (props) => {
                     if (!item.geo_data?.features?.[0]?.geometry) continue;
 
                     const geometry = item.geo_data.features[0].geometry;
-                    let rings = [];
+                    let allCoords = [];
+
                     if (geometry.type === 'Polygon') {
-                        rings = geometry.coordinates[0].map(([lng, lat]) => [lng, lat]);
+                        allCoords = geometry.coordinates[0];
                     } else if (geometry.type === 'MultiPolygon') {
-                        rings = geometry.coordinates[0][0].map(([lng, lat]) => [lng, lat]);
+                        geometry.coordinates.forEach(poly => {
+                            allCoords = allCoords.concat(poly[0]);
+                        });
                     }
 
-                    if (rings.length === 0) continue;
+                    if (allCoords.length === 0) continue;
+
+                    // Calculate bounding box
+                    const lngs = allCoords.map(c => c[0]);
+                    const lats = allCoords.map(c => c[1]);
+                    const bounds = {
+                        minLon: Math.min(...lngs),
+                        minLat: Math.min(...lats),
+                        maxLon: Math.max(...lngs),
+                        maxLat: Math.max(...lats)
+                    };
 
                     try {
-                        const esriGeometry = JSON.stringify({ rings: [rings] });
-                        const response = await fetch(`${API_URL}/proxy/bmkg/hotspot`, {
+                        const response = await fetch(NASA_FIRMS_CONFIG.PROXY_URL, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
-                                geometry: esriGeometry,
-                                geometryType: 'esriGeometryPolygon',
-                                spatialRel: 'esriSpatialRelIntersects'
+                                bounds: bounds,
+                                start_date: startDate,
+                                end_date: endDate,
+                                source: NASA_FIRMS_CONFIG.DEFAULT_SOURCE
                             })
                         });
 
                         if (response.ok) {
                             const result = await response.json();
-                            const count = result.features?.length || 0;
-                            grandTotal += count;
+                            // Filter to only points inside the polygon
+                            const insideCount = (result.features || []).filter(f => {
+                                if (!f.geometry?.coordinates) return false;
+                                return isPointInPolygon(f.geometry.coordinates, geometry);
+                            }).length;
+                            grandTotal += insideCount;
                         }
                     } catch (e) {
-                        console.error(`Error fetching hotspots for KPS ${item.filename}:`, e);
+                        console.error(`Error fetching NASA FIRMS for KPS ${item.filename}:`, e);
                     }
                 }
 
-                console.log(`🔥 Global Aggregation Complete: ${grandTotal} hotspots found`);
+                console.log(`🔥 Global Aggregation Complete: ${grandTotal} hotspots found (${currentYear})`);
                 setTotalGlobalHotspots(grandTotal);
             } catch (err) {
                 console.error("Global Hotspot Aggregation Failed:", err);
@@ -721,14 +933,44 @@ const MainLayout = (props) => {
         }
     }, [globalStats]);
 
+    // 📊 CALCULATE DYNAMIC OPACITY BASED ON TEMPORAL STATUS (NEW)
+    const layerOpacity = useMemo(() => {
+        if (!showTemporalStatus || !yearOpacityMap || Object.keys(yearOpacityMap).length === 0) {
+            // If temporal status disabled or no data, use original polygonOpacity
+            return polygonOpacity;
+        }
+
+        const yearOpacity = yearOpacityMap[selectedYear];
+        if (yearOpacity !== undefined) {
+            // Use temporal status opacity, but respect slider if it's lower
+            return Math.min(yearOpacity, polygonOpacity);
+        }
+
+        // Fallback to original opacity if year not found
+        return polygonOpacity;
+    }, [selectedYear, yearOpacityMap, polygonOpacity, showTemporalStatus]);
+    // END DYNAMIC OPACITY CALCULATION
+
     // Polygon style: Menambahkan fill transparan agar area lebih terlihat
-    const getPolygonStyle = (showOverlay) => ({
-        color: showOverlay ? '#ffffff' : '#10b981',  // Warna outline
-        weight: showOverlay ? 2 : 4,
-        fillColor: '#10b981',
-        fillOpacity: showOverlay ? 0.05 : 0.15, // Fill sangat tipis jika overlay aktif, agak tebal jika tidak
-        dashArray: showOverlay ? null : '5, 5'
-    });
+    const getPolygonStyle = (showOverlay, isSlopeActive = false) => {
+        // Saat slope aktif, tampilkan garis tebal agar batas inside/outside terlihat jelas
+        if (isSlopeActive) {
+            return {
+                color: '#ef4444',      // Merah terang untuk kontras dengan slope colors
+                weight: 4,             // Garis tebal
+                fillColor: 'transparent',
+                fillOpacity: 0,
+                dashArray: null
+            };
+        }
+        return {
+            color: showOverlay ? '#ffffff' : '#10b981',  // Warna outline
+            weight: showOverlay ? 2 : 4,
+            fillColor: '#10b981',
+            fillOpacity: showOverlay ? 0.05 : 0.15, // Fill sangat tipis jika overlay aktif, agak tebal jika tidak
+            dashArray: showOverlay ? null : '5, 5'
+        };
+    };
 
     const getConfidenceInterpretation = (confidence) => {
         if (!confidence) return null;
@@ -1300,7 +1542,14 @@ const MainLayout = (props) => {
                             <div className="px-4 py-3 flex items-center justify-between hover:bg-slate-50/50 transition-colors">
                                 <span className="text-[11px] font-bold text-slate-600">Overlay Analisis</span>
                                 <button
-                                    onClick={() => setShowOverlay(!showOverlay)}
+                                    onClick={() => {
+                                        const newOverlayState = !showOverlay;
+                                        setShowOverlay(newOverlayState);
+                                        // Auto turn off slope when overlay is enabled
+                                        if (newOverlayState) {
+                                            setShowSlopeLayer(false);
+                                        }
+                                    }}
                                     className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showOverlay ? 'bg-emerald-500' : 'bg-slate-200'}`}
                                 >
                                     <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${showOverlay ? 'translate-x-4' : 'translate-x-1'}`} />
@@ -1316,6 +1565,21 @@ const MainLayout = (props) => {
                                     <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${showRgb ? 'translate-x-4' : 'translate-x-1'}`} />
                                 </button>
                             </div>
+
+                            {/* 🔄 TEMPORAL STATUS TOGGLE (NEW) */}
+                            <div className="px-4 py-3 flex items-center justify-between bg-amber-50 border-y border-amber-100 hover:bg-amber-100/50 transition-colors">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[11px] font-bold text-amber-900">Status Temporal</span>
+                                    <span className="text-[9px] px-1.5 py-0.5 bg-amber-200 text-amber-800 rounded font-bold">GREY AREA</span>
+                                </div>
+                                <button
+                                    onClick={() => setShowTemporalStatus(!showTemporalStatus)}
+                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showTemporalStatus ? 'bg-amber-500' : 'bg-slate-200'}`}
+                                >
+                                    <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${showTemporalStatus ? 'translate-x-4' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+                            {/* END TEMPORAL STATUS TOGGLE */}
 
                             <div className="px-4 py-3 space-y-2 hover:bg-slate-50/50 transition-colors">
                                 <div className="flex justify-between items-center text-[10px] font-bold text-slate-50">
@@ -1500,6 +1764,32 @@ const MainLayout = (props) => {
                                 </div>
                             )}
 
+                            {/* 📋 TEMPORAL STATUS INFO PANEL (NEW) */}
+                            {temporalStatusData && selectedYear && (() => {
+                                const yearData = temporalStatusData.yearly_data?.find(d => d.year === selectedYear);
+                                if (!yearData) return null;
+
+                                const statusStyle = getTemporalStatusStyle(yearData.temporal_status);
+                                const opacity = getOpacityByTemporalStatus(yearData.temporal_status);
+
+                                return (
+                                    <div className="mt-2 p-3 bg-gradient-to-r from-amber-50 to-orange-50 rounded-lg border border-amber-200 space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <div className={`px-2 py-1 rounded text-[9px] font-bold whitespace-nowrap ${statusStyle.badgeColor}`}>
+                                                {statusStyle.label}
+                                            </div>
+                                            <div className="text-[10px] text-slate-600 leading-relaxed">
+                                                <p className="font-medium text-slate-700">{statusStyle.description}</p>
+                                                <p className="mt-1 text-[9px] text-slate-500">
+                                                    Opacity Peta: <span className="font-bold">{(opacity * 100).toFixed(0)}%</span>
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })()}
+                            {/* END TEMPORAL STATUS INFO PANEL */}
+
                             {/* METADATA SIDEBAR */}
                             {geoData && file && (
                                 <div className="mt-3 pt-3 border-t border-slate-200">
@@ -1627,8 +1917,8 @@ const MainLayout = (props) => {
                         <MapClickHandler onMapClick={(lat, lng) => {
                             console.log('🗺️ Map Click detected:', lat, lng);
 
-                            // Trigger BNPB Identify (REMOVED)
-                            // fetchBNPBData(lat, lng);
+
+
 
                             // Jangan tutup sidebar jika sedang ada file/SHP yang diload
                             // User ingin bisa geser peta tanpa menutup menu "Mulai Analisis"
@@ -1736,14 +2026,22 @@ const MainLayout = (props) => {
                                         zIndex={195}
                                     />
                                 )}
-
-                                {/* Top: Classification Map */}
                                 {mapUrl && (
                                     <DynamicTileLayer
                                         url={mapUrl}
                                         show={showOverlay}
-                                        opacity={polygonOpacity}
+                                        opacity={layerOpacity}
                                         zIndex={205}
+                                    />
+                                )}
+
+                                {/* Slope Analysis Layer */}
+                                {slopeMapUrl && (
+                                    <DynamicTileLayer
+                                        url={slopeMapUrl}
+                                        show={showSlopeLayer}
+                                        opacity={slopeOpacity}
+                                        zIndex={200}
                                     />
                                 )}
                             </>
@@ -1771,15 +2069,8 @@ const MainLayout = (props) => {
                             />
                         )}
 
-                        {/* BIG ADMINISTRATIVE BOUNDARIES (ArcGIS Dynamic Layers) */}
-                        <BigAdminLayer show={showBigNegara} layerType="NEGARA" opacity={bigNegaraOpacity} showLabels={showBigLabels} />
-                        <BigAdminLayer show={showBigProvinsi} layerType="PROVINSI" opacity={bigProvinsiOpacity} showLabels={showBigLabels} />
-                        <BigAdminLayer show={showBigKabKota} layerType="KABKOTA" opacity={bigKabKotaOpacity} showLabels={showBigLabels} />
-                        <BigAdminLayer show={showBigKecamatan} layerType="KECAMATAN" opacity={bigKecamatanOpacity} showLabels={showBigLabels} />
-                        <BigAdminLayer show={showBigDesa} layerType="DESA" opacity={bigDesaOpacity} showLabels={showBigLabels} />
-
-                        {/* BMKG HOTSPOT LAYER (Fire Points) */}
-                        {showBmkgHotspot && bmkgHotspotData.length > 0 && bmkgHotspotData.map((feature, idx) => {
+                        {/* NASA FIRMS HOTSPOT LAYER (Fire Points) */}
+                        {showNasaHotspot && nasaHotspotData.length > 0 && nasaHotspotData.map((feature, idx) => {
                             const coords = feature.geometry?.coordinates;
                             if (!coords) return null;
 
@@ -1790,6 +2081,10 @@ const MainLayout = (props) => {
 
                             const props = feature.properties || {};
 
+                            // Color based on confidence level
+                            const confidenceColor = props.confidence === 'high' ? '#dc2626' :
+                                props.confidence === 'nominal' ? '#f97316' : '#fbbf24';
+
                             return (
                                 <CircleMarker
                                     key={`hotspot-${idx}`}
@@ -1797,79 +2092,67 @@ const MainLayout = (props) => {
                                     radius={6}
                                     pathOptions={{
                                         color: '#dc2626',
-                                        fillColor: '#f97316',
+                                        fillColor: confidenceColor,
                                         fillOpacity: 0.8,
                                         weight: 2
                                     }}
                                 >
                                     <Popup>
-                                        <div className="text-xs space-y-1 min-w-[200px]">
+                                        <div className="text-xs space-y-1 min-w-[220px]">
                                             <div className="font-black text-orange-600 text-sm border-b pb-1 mb-2 flex justify-between items-center">
-                                                <span>🔥 Hotspot</span>
-                                                {(props.satelit || props.source) && (
-                                                    <span className="bg-orange-100 text-orange-700 px-1 rounded text-[10px] uppercase">
-                                                        {props.satelit || props.source}
-                                                    </span>
-                                                )}
+                                                <span>🔥 Hotspot NASA FIRMS</span>
+                                                <span className="bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded text-[9px] uppercase font-bold">
+                                                    {props.satellite === 'N' ? 'VIIRS-SNPP' : props.satellite === 'J1' ? 'VIIRS-NOAA20' : 'VIIRS'}
+                                                </span>
                                             </div>
 
                                             <div className="flex justify-between">
-                                                <span className="text-slate-500">Tanggal Detect:</span>
-                                                <span className="font-bold">{props.date || props.tgl || props.tanggal || '-'}</span>
+                                                <span className="text-slate-500">Tanggal Deteksi:</span>
+                                                <span className="font-bold">{props.acq_date || '-'}</span>
                                             </div>
-                                            {(props.time || props.waktu) && (
+                                            {props.acq_time && (
                                                 <div className="flex justify-between">
-                                                    <span className="text-slate-500">Waktu:</span>
-                                                    <span className="font-bold">{props.time || props.waktu} WIB</span>
+                                                    <span className="text-slate-500">Waktu (UTC):</span>
+                                                    <span className="font-bold">{props.acq_time.slice(0, 2)}:{props.acq_time.slice(2)}</span>
                                                 </div>
                                             )}
-                                            {props.region && (
-                                                <div className="flex justify-between">
-                                                    <span className="text-slate-500">Wilayah:</span>
-                                                    <span className="font-bold text-[10px]">{props.region}</span>
-                                                </div>
-                                            )}
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-500">Siang/Malam:</span>
+                                                <span className="font-bold">{props.daynight === 'D' ? '☀️ Siang' : '🌙 Malam'}</span>
+                                            </div>
 
                                             <div className="h-px bg-slate-100 my-1" />
 
                                             <div className="flex justify-between">
                                                 <span className="text-slate-500">Latitude:</span>
-                                                <span className="font-bold">{props.latitude || props.lat || lat.toFixed(5)}</span>
+                                                <span className="font-bold">{lat.toFixed(5)}</span>
                                             </div>
                                             <div className="flex justify-between">
                                                 <span className="text-slate-500">Longitude:</span>
-                                                <span className="font-bold">{props.longitude || props.lng || lng.toFixed(5)}</span>
+                                                <span className="font-bold">{lng.toFixed(5)}</span>
                                             </div>
 
                                             <div className="h-px bg-slate-100 my-1" />
 
-                                            {props.provinsi && (
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-500">Brightness (K):</span>
+                                                <span className="font-bold text-red-600">{props.brightness?.toFixed(1) || props.bright_ti4?.toFixed(1) || '-'}</span>
+                                            </div>
+                                            {props.frp > 0 && (
                                                 <div className="flex justify-between">
-                                                    <span className="text-slate-500">Provinsi:</span>
-                                                    <span className="font-bold uppercase text-[9px]">{props.provinsi}</span>
-                                                </div>
-                                            )}
-                                            {props.kabupaten && (
-                                                <div className="flex justify-between">
-                                                    <span className="text-slate-500">Kabupaten:</span>
-                                                    <span className="font-bold text-[9px]">{props.kabupaten}</span>
-                                                </div>
-                                            )}
-                                            {props.kecamatan && (
-                                                <div className="flex justify-between">
-                                                    <span className="text-slate-500">Kecamatan:</span>
-                                                    <span className="font-bold text-[9px]">{props.kecamatan}</span>
+                                                    <span className="text-slate-500">Fire Radiative Power:</span>
+                                                    <span className="font-bold">{props.frp?.toFixed(1)} MW</span>
                                                 </div>
                                             )}
 
-                                            {props.confidence && (
-                                                <div className="mt-2 pt-1 border-t flex justify-between items-center text-[10px]">
-                                                    <span className="text-slate-400">Confidence:</span>
-                                                    <span className={`font-bold ${props.confidence === 'High' ? 'text-red-500' : 'text-orange-500'}`}>
-                                                        {props.confidence}
-                                                    </span>
-                                                </div>
-                                            )}
+                                            <div className="mt-2 pt-1 border-t flex justify-between items-center text-[10px]">
+                                                <span className="text-slate-400">Confidence:</span>
+                                                <span className={`font-bold uppercase ${props.confidence === 'high' ? 'text-red-600' :
+                                                    props.confidence === 'nominal' ? 'text-orange-500' : 'text-yellow-500'
+                                                    }`}>
+                                                    {props.confidence || '-'}
+                                                </span>
+                                            </div>
                                         </div>
                                     </Popup>
                                 </CircleMarker>
@@ -1947,7 +2230,7 @@ const MainLayout = (props) => {
                                         }}
                                     />
                                 )}
-                                <GeoJSON key={`${file?.id || 'no-id'}-${selectedYear}-${showOverlay}-${polygonOpacity}-${dominantLandCover?.key}`} data={geoData} style={getPolygonStyle(showOverlay)} />
+                                <GeoJSON key={`${file?.id || 'no-id'}-${selectedYear}-${showOverlay}-${showSlopeLayer}-${polygonOpacity}-${dominantLandCover?.key}`} data={geoData} style={getPolygonStyle(showOverlay, showSlopeLayer)} />
                                 <MapRecenter data={vectorLayerData || geoData} uniqueKey={file ? (file.id || file.name) : (geoData ? 'geo' : 'none')} />
                             </>
                         )}
@@ -1977,12 +2260,10 @@ const MainLayout = (props) => {
                             </CircleMarker>
                         )}
 
-                        {/* 5. IDENTIFY HANDLER FOR SIGAP & BIG */}
                         <IdentifySigapFeatures
                             activeLayers={{
                                 hutan: showKawasanHutan,
-                                das: showDAS,
-                                big: showBigNegara || showBigProvinsi || showBigKabKota || showBigKecamatan || showBigDesa
+                                das: showDAS
                             }}
                             onResult={(latlng, features) => setIdentifyResult({ latlng, features })}
                         />
@@ -2163,39 +2444,79 @@ const MainLayout = (props) => {
                                         )}
                                     </div>
 
-                                    {/* BMKG Hotspot Layer (Fire Points) */}
+                                    <div className="flex flex-col gap-1">
+                                        <div
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                const newSlopeState = !showSlopeLayer;
+                                                setShowSlopeLayer(newSlopeState);
+                                                // Auto turn off tutupan lahan when slope is enabled
+                                                if (newSlopeState) {
+                                                    setShowOverlay(false);
+                                                }
+                                            }}
+                                            className="flex items-center justify-between cursor-pointer hover:bg-orange-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-orange-100 group"
+                                        >
+                                            <div className="flex items-center gap-2.5">
+                                                <div className={`w-4 h-4 rounded flex items-center justify-center border transition-colors ${showSlopeLayer ? 'bg-orange-500 border-orange-500' : 'bg-white border-slate-300'}`}>
+                                                    {showSlopeLayer && <CheckCircle2 size={10} className="text-white" />}
+                                                </div>
+                                                <span className={`text-[10px] font-bold transition-colors ${showSlopeLayer ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Analisis Kelerengan (Slope)</span>
+                                            </div>
+                                        </div>
+                                        {showSlopeLayer && (
+                                            <div className="px-2 pt-1 pb-1 animate-in slide-in-from-top-1">
+                                                <div className="flex items-center justify-between mb-1.5">
+                                                    <span className="text-[8px] text-slate-400 uppercase font-black tracking-wider">Opasitas</span>
+                                                    <span className="text-[9px] font-bold text-orange-600 bg-orange-50 px-1.5 rounded">
+                                                        {(slopeOpacity * 100).toFixed(0)}%
+                                                    </span>
+                                                </div>
+                                                <input
+                                                    type="range"
+                                                    min="0" max="1" step="0.1"
+                                                    value={slopeOpacity}
+                                                    onChange={(e) => setSlopeOpacity(parseFloat(e.target.value))}
+                                                    className="w-full h-1.5 bg-slate-100 rounded-full appearance-none cursor-pointer accent-orange-500 hover:accent-orange-400"
+                                                />
+                                                <SlopeLegend show={true} />
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* NASA FIRMS Hotspot Layer (Fire Points) */}
                                     {geoData && (
                                         <div className="flex flex-col gap-1 pt-2 border-t border-slate-100">
                                             <div className="text-[9px] font-bold text-orange-600 uppercase px-1 flex items-center gap-1">
-                                                🔥 Titik Panas
+                                                🔥 Titik Panas (NASA FIRMS)
                                             </div>
                                             <div
                                                 onClick={(e) => {
                                                     e.stopPropagation();
-                                                    setShowBmkgHotspot(!showBmkgHotspot);
+                                                    setShowNasaHotspot(!showNasaHotspot);
                                                 }}
                                                 className="flex items-center justify-between cursor-pointer hover:bg-orange-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-orange-100 group"
                                             >
                                                 <div className="flex items-center gap-2.5">
-                                                    <div className={`w-4 h-4 rounded flex items-center justify-center border transition-colors ${showBmkgHotspot ? 'bg-orange-500 border-orange-500' : 'bg-white border-slate-300'}`}>
-                                                        {showBmkgHotspot && <CheckCircle2 size={10} className="text-white" />}
+                                                    <div className={`w-4 h-4 rounded flex items-center justify-center border transition-colors ${showNasaHotspot ? 'bg-orange-500 border-orange-500' : 'bg-white border-slate-300'}`}>
+                                                        {showNasaHotspot && <CheckCircle2 size={10} className="text-white" />}
                                                     </div>
-                                                    <span className={`text-[10px] font-bold transition-colors ${showBmkgHotspot ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>
+                                                    <span className={`text-[10px] font-bold transition-colors ${showNasaHotspot ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>
                                                         Hotspot Kebakaran
                                                     </span>
                                                 </div>
-                                                {bmkgLoading && (
+                                                {nasaLoading && (
                                                     <div className="w-3 h-3 border-2 border-orange-300 border-t-orange-600 rounded-full animate-spin" />
                                                 )}
                                             </div>
-                                            {showBmkgHotspot && (
+                                            {showNasaHotspot && (
                                                 <div className="px-2 text-[9px] text-slate-500">
-                                                    {bmkgLoading ? (
-                                                        <span className="italic">Memuat data hotspot...</span>
-                                                    ) : bmkgError ? (
-                                                        <span className="text-red-500">{bmkgError}</span>
+                                                    {nasaLoading ? (
+                                                        <span className="italic">Memuat data NASA FIRMS...</span>
+                                                    ) : nasaError ? (
+                                                        <span className="text-red-500">{nasaError}</span>
                                                     ) : (
-                                                        <span>{bmkgHotspotData.length} titik ditemukan</span>
+                                                        <span>{nasaHotspotData.length} titik hotspot (1 Jan - 31 Des {selectedYear || new Date().getFullYear()})</span>
                                                     )}
                                                 </div>
                                             )}
@@ -2213,159 +2534,12 @@ const MainLayout = (props) => {
                                         </div>
                                     )}
 
-                                    {/* SECTION 3: BIG ADMINISTRATIVE BOUNDARIES (Reference Only) */}
-                                    <div className="flex flex-col gap-2 pt-3 border-t border-slate-100">
-                                        <div className="text-[9px] font-bold text-slate-500 uppercase px-1 flex items-center justify-between">
-                                            <div className="flex items-center gap-1.5">
-                                                <MapIcon size={11} className="text-slate-400" />
-                                                Batas Administrasi BIG
-                                            </div>
-                                            <span className="text-[7px] text-emerald-600 font-bold bg-emerald-50 px-1 rounded uppercase tracking-tighter">
-                                                💡 Klik peta untuk info wilayah
-                                            </span>
-                                        </div>
-                                        <div className="text-[8px] text-slate-400 px-1 leading-tight flex justify-between items-center">
-                                            <span>Layer referensi visual. Tidak mempengaruhi analisis.</span>
-                                            <button
-                                                onClick={() => setShowBigLabels(!showBigLabels)}
-                                                className={`px-1.5 py-0.5 rounded border transition-all text-[7px] font-bold ${showBigLabels ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-400 border-slate-200'}`}
-                                            >
-                                                LABEL: {showBigLabels ? 'ON' : 'OFF'}
-                                            </button>
-                                        </div>
+                                    {/* 🔄 TEMPORAL STATUS LEGEND (NEW - OPTIONAL STEP 8) */}
+                                    {showTemporalStatus && temporalStatusData && (
+                                        <TemporalStatusLegend show={true} />
+                                    )}
+                                    {/* END TEMPORAL STATUS LEGEND */}
 
-                                        <div className="flex flex-col gap-1.5 mt-1">
-                                            {/* NEGARA */}
-                                            <div className="flex flex-col">
-                                                <div
-                                                    onClick={(e) => { e.stopPropagation(); setShowBigNegara(!showBigNegara); }}
-                                                    className="flex items-center justify-between cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-slate-100 group"
-                                                >
-                                                    <div className="flex items-center gap-2.5">
-                                                        <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-colors ${showBigNegara ? 'bg-slate-900 border-slate-900' : 'bg-white border-slate-300'}`}>
-                                                            {showBigNegara && <CheckCircle2 size={9} className="text-white" />}
-                                                        </div>
-                                                        <span className={`text-[10px] font-bold transition-colors ${showBigNegara ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Batas Negara</span>
-                                                    </div>
-                                                    <div className="w-4 h-[2px] bg-slate-600" />
-                                                </div>
-                                                {showBigNegara && (
-                                                    <div className="px-2 pb-1 animate-in slide-in-from-top-1">
-                                                        <input
-                                                            type="range" min="0" max="1" step="0.1" value={bigNegaraOpacity}
-                                                            onChange={(e) => setBigNegaraOpacity(parseFloat(e.target.value))}
-                                                            className="w-full h-1 bg-slate-100 rounded-full appearance-none cursor-pointer accent-slate-800"
-                                                        />
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            {/* PROVINSI */}
-                                            <div className="flex flex-col">
-                                                <div
-                                                    onClick={(e) => { e.stopPropagation(); setShowBigProvinsi(!showBigProvinsi); }}
-                                                    className="flex items-center justify-between cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-slate-100 group"
-                                                >
-                                                    <div className="flex items-center gap-2.5">
-                                                        <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-colors ${showBigProvinsi ? 'bg-slate-700 border-slate-700' : 'bg-white border-slate-300'}`}>
-                                                            {showBigProvinsi && <CheckCircle2 size={9} className="text-white" />}
-                                                        </div>
-                                                        <span className={`text-[10px] font-bold transition-colors ${showBigProvinsi ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Batas Provinsi</span>
-                                                    </div>
-                                                    <div className="w-4 h-[1px] bg-slate-400" />
-                                                </div>
-                                                {showBigProvinsi && (
-                                                    <div className="px-2 pb-1 animate-in slide-in-from-top-1">
-                                                        <input
-                                                            type="range" min="0" max="1" step="0.1" value={bigProvinsiOpacity}
-                                                            onChange={(e) => setBigProvinsiOpacity(parseFloat(e.target.value))}
-                                                            className="w-full h-1 bg-slate-100 rounded-full appearance-none cursor-pointer accent-slate-600"
-                                                        />
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            {/* KABKOTA */}
-                                            <div className="flex flex-col">
-                                                <div
-                                                    onClick={(e) => { e.stopPropagation(); setShowBigKabKota(!showBigKabKota); }}
-                                                    className="flex items-center justify-between cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-slate-100 group"
-                                                >
-                                                    <div className="flex items-center gap-2.5">
-                                                        <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-colors ${showBigKabKota ? 'bg-slate-600 border-slate-600' : 'bg-white border-slate-300'}`}>
-                                                            {showBigKabKota && <CheckCircle2 size={9} className="text-white" />}
-                                                        </div>
-                                                        <span className={`text-[10px] font-bold transition-colors ${showBigKabKota ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Batas Kab / Kota</span>
-                                                    </div>
-                                                    <div className="w-4 h-[1px] border-b border-dashed border-slate-400" />
-                                                </div>
-                                                {showBigKabKota && (
-                                                    <div className="px-2 pb-1 animate-in slide-in-from-top-1">
-                                                        <input
-                                                            type="range" min="0" max="1" step="0.1" value={bigKabKotaOpacity}
-                                                            onChange={(e) => setBigKabKotaOpacity(parseFloat(e.target.value))}
-                                                            className="w-full h-1 bg-slate-100 rounded-full appearance-none cursor-pointer accent-slate-500"
-                                                        />
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            {/* KECAMATAN */}
-                                            <div className="flex flex-col">
-                                                <div
-                                                    onClick={(e) => { e.stopPropagation(); setShowBigKecamatan(!showBigKecamatan); }}
-                                                    className="flex items-center justify-between cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-slate-100 group"
-                                                >
-                                                    <div className="flex items-center gap-2.5">
-                                                        <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-colors ${showBigKecamatan ? 'bg-slate-500 border-slate-500' : 'bg-white border-slate-300'}`}>
-                                                            {showBigKecamatan && <CheckCircle2 size={9} className="text-white" />}
-                                                        </div>
-                                                        <span className={`text-[10px] font-bold transition-colors ${showBigKecamatan ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Batas Kecamatan</span>
-                                                    </div>
-                                                    <div className="w-4 h-[1px] border-b border-dotted border-slate-400" />
-                                                </div>
-                                                {showBigKecamatan && (
-                                                    <div className="px-2 pb-1 animate-in slide-in-from-top-1">
-                                                        <input
-                                                            type="range" min="0" max="1" step="0.1" value={bigKecamatanOpacity}
-                                                            onChange={(e) => setBigKecamatanOpacity(parseFloat(e.target.value))}
-                                                            className="w-full h-1 bg-slate-100 rounded-full appearance-none cursor-pointer accent-slate-400"
-                                                        />
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            {/* DESA */}
-                                            <div className="flex flex-col">
-                                                <div
-                                                    onClick={(e) => { e.stopPropagation(); setShowBigDesa(!showBigDesa); }}
-                                                    className="flex items-center justify-between cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors border border-transparent hover:border-slate-100 group"
-                                                >
-                                                    <div className="flex items-center gap-2.5">
-                                                        <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-colors ${showBigDesa ? 'bg-slate-400 border-slate-400' : 'bg-white border-slate-300'}`}>
-                                                            {showBigDesa && <CheckCircle2 size={9} className="text-white" />}
-                                                        </div>
-                                                        <span className={`text-[10px] font-bold transition-colors ${showBigDesa ? 'text-slate-800' : 'text-slate-500 group-hover:text-slate-700'}`}>Batas Desa / Kel.</span>
-                                                    </div>
-                                                    <div className="w-4 h-[1px] border-b border-slate-200" />
-                                                </div>
-                                                {showBigDesa && (
-                                                    <div className="px-2 pb-1 animate-in slide-in-from-top-1">
-                                                        <input
-                                                            type="range" min="0" max="1" step="0.1" value={bigDesaOpacity}
-                                                            onChange={(e) => setBigDesaOpacity(parseFloat(e.target.value))}
-                                                            className="w-full h-1 bg-slate-100 rounded-full appearance-none cursor-pointer accent-slate-300"
-                                                        />
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-
-                                        {/* Attribution (BIG) */}
-                                        <div className="text-[7px] text-slate-400 px-1 pt-1 italic">
-                                            Data © Badan Informasi Geospasial (BIG)
-                                        </div>
-                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -2498,6 +2672,18 @@ const MainLayout = (props) => {
                                                         >
                                                             <Activity size={12} /> Area Akumulatif
                                                         </button>
+
+                                                        {slopeDbSummary && (
+                                                            <button
+                                                                onClick={() => setChartTab('slope')}
+                                                                className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'slope'
+                                                                    ? 'bg-orange-50 text-orange-600 ring-1 ring-orange-100 shadow-sm'
+                                                                    : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
+                                                                    }`}
+                                                            >
+                                                                <TrendingUp size={12} /> Slope
+                                                            </button>
+                                                        )}
                                                     </div>
 
 
@@ -2509,6 +2695,62 @@ const MainLayout = (props) => {
                                                     {chartTab === 'summary' ? (
                                                         <div className="h-full overflow-y-auto pr-1">
                                                             <GlobalGridDashboard stats={globalStats} />
+                                                        </div>
+                                                    ) : chartTab === 'slope' ? (
+                                                        <div className="h-full overflow-y-auto pr-1 flex flex-col gap-4">
+                                                            <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest px-1">Statistik Kelerengan (Digital Elevation Model)</div>
+
+                                                            {/* Summary Comparison Card */}
+                                                            {slopeDbSummary && slopeDbSummaryOutside && (
+                                                                <div className="bg-gradient-to-r from-orange-50 to-blue-50 rounded-2xl p-4 border border-slate-100 shadow-sm">
+                                                                    <div className="flex items-center gap-2 mb-3">
+                                                                        <Info size={14} className="text-slate-500" />
+                                                                        <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">Ringkasan Perbandingan</span>
+                                                                    </div>
+                                                                    <div className="grid grid-cols-2 gap-4 text-center">
+                                                                        <div>
+                                                                            <div className="text-[9px] text-slate-400 uppercase font-bold">Dalam Kawasan</div>
+                                                                            <div className="text-lg font-black text-orange-600">{slopeDbSummary.avg_slope || 0}%</div>
+                                                                            <div className="text-[9px] text-slate-500">rerata kelerengan</div>
+                                                                        </div>
+                                                                        <div>
+                                                                            <div className="text-[9px] text-slate-400 uppercase font-bold">Buffer 2 KM</div>
+                                                                            <div className="text-lg font-black text-blue-600">{slopeDbSummaryOutside.avg_slope || 0}%</div>
+                                                                            <div className="text-[9px] text-slate-500">rerata kelerengan</div>
+                                                                        </div>
+                                                                    </div>
+                                                                    {(() => {
+                                                                        const diff = (Number(slopeDbSummary.avg_slope) || 0) - (Number(slopeDbSummaryOutside.avg_slope) || 0);
+                                                                        const isHigher = diff > 0;
+                                                                        return (
+                                                                            <div className="mt-3 pt-3 border-t border-slate-200/50 text-center">
+                                                                                <span className={`text-[10px] font-bold ${isHigher ? 'text-orange-600' : 'text-blue-600'}`}>
+                                                                                    Kawasan {isHigher ? 'lebih curam' : 'lebih landai'} {Math.abs(diff).toFixed(1)}% dari area buffer
+                                                                                </span>
+                                                                            </div>
+                                                                        );
+                                                                    })()}
+                                                                </div>
+                                                            )}
+
+                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                                <SlopeDataPanel summary={slopeDbSummary} title="Dalam Kawasan" variant="inside" />
+                                                                {slopeDbSummaryOutside ? (
+                                                                    <SlopeDataPanel summary={slopeDbSummaryOutside} title="Buffer 2 KM" variant="outside" />
+                                                                ) : (
+                                                                    <div className="bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-6 flex flex-col items-center justify-center text-center">
+                                                                        <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 mb-3">
+                                                                            <Info size={20} />
+                                                                        </div>
+                                                                        <div className="text-[10px] font-bold text-slate-500 uppercase">Buffer 2 KM</div>
+                                                                        <p className="text-[9px] text-slate-400 mt-1 max-w-[200px]">Data buffer belum tersedia untuk wilayah ini.</p>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+
+                                                            <div className="text-[9px] text-slate-400 italic text-center mt-2">
+                                                                Data slope diukur berdasarkan Topografi SRTM v3 dengan resolusi 30 meter.
+                                                            </div>
                                                         </div>
                                                     ) : (
                                                         <div className="flex flex-col md:flex-row gap-4 h-full">

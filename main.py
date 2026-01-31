@@ -8,6 +8,7 @@ import os
 import time
 import json
 import hashlib
+import math
 import asyncio
 import requests
 import numpy as np
@@ -24,7 +25,7 @@ import traceback
 import logging
 import base64
 import shapefile # pyshp
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response, Request, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -58,6 +59,10 @@ supabase: Optional[Client] = None
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
+        # Ensure trailing slash to avoid "Storage endpoint URL should have a trailing slash" warning
+        if not SUPABASE_URL.endswith("/"):
+            SUPABASE_URL += "/"
+            
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Supabase client initialized")
     except Exception as e:
@@ -86,12 +91,28 @@ def ensure_storage_ready():
     """Ensure the 'thumbnails' bucket exists in Supabase Storage."""
     if not supabase: return
     try:
-        buckets = supabase.storage.list_buckets()
-        exists = any(b.name == "thumbnails" for b in buckets)
+        # Check buckets
+        # Note: listing buckets might also fail with 403 if RLS denies it, 
+        # but usually it's allowed for authenticated users.
+        try:
+            buckets = supabase.storage.list_buckets()
+            exists = any(b.name == "thumbnails" for b in buckets)
+        except Exception:
+            # If listing fails, assume we need to try creating or just proceed
+            exists = False
+
         if not exists:
-            print("🚀 Creating 'thumbnails' bucket in Supabase Storage...")
-            supabase.storage.create_bucket("thumbnails", options={"public": True})
-            print("✅ 'thumbnails' bucket created.")
+            # print("🚀 Creating 'thumbnails' bucket in Supabase Storage...") 
+            try:
+                supabase.storage.create_bucket("thumbnails", options={"public": True})
+                print("✅ 'thumbnails' bucket created.")
+            except Exception as ce:
+                # 403 is expected if using Anon Key and RLS is set (production mode)
+                err_str = str(ce)
+                if "403" in err_str or "unauthorized" in err_str.lower():
+                    print("ℹ️ 'thumbnails' bucket creation skipped (managed via SQL/Dashboard).")
+                else:
+                    print(f"⚠️ Bucket creation error: {ce}")
         else:
             print("✅ 'thumbnails' bucket exists.")
     except Exception as e:
@@ -107,7 +128,17 @@ def save_image_persistence(data: Any, filename: str) -> Optional[str]:
     Always converts to WebP.
     """
     try:
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError as ie:
+            print("❌ CRITICAL: Pillow library not installed!")
+            print("   This is required for image conversion.")
+            print("   Quick fix options:")
+            print("   1. Run: pip install Pillow>=10.0.0")
+            print("   2. Or run: install_dependencies.bat (from project root)")
+            print("   After installation, restart the backend server.")
+            return None
+
         import io
         import base64
         
@@ -147,18 +178,30 @@ def save_image_persistence(data: Any, filename: str) -> Optional[str]:
             try:
                 bucket_name = "thumbnails"
                 # Check if bucket needs creation? We did at startup.
-                
+
                 # Upload with upsert
                 res = supabase.storage.from_(bucket_name).upload(
                     path=webp_filename,
                     file=image_bytes,
                     file_options={"content-type": "image/webp", "upsert": "true"}
                 )
-                
+
                 # Get Public URL
                 # NOTE: get_public_url returns URL without checking existence
                 public_url = supabase.storage.from_(bucket_name).get_public_url(webp_filename)
                 print(f"☁️ Uploaded to Cloud: {webp_filename}")
+                print(f"   Public URL: {public_url}")
+
+                # Validate URL is accessible (log only, don't fail)
+                try:
+                    head_check = requests.head(public_url, timeout=5)
+                    if head_check.status_code == 200:
+                        print(f"✅ URL is accessible")
+                    else:
+                        print(f"⚠️ URL returned status {head_check.status_code}")
+                except Exception as url_check_err:
+                    print(f"⚠️ Could not verify URL accessibility: {url_check_err}")
+
                 return public_url
             except Exception as se:
                 print(f"⚠️ Supabase Upload Error ({webp_filename}): {se}")
@@ -368,6 +411,7 @@ class YearlyData(BaseModel):
     tanah_kosong: float = 0       # Class 4: Bare Soil
     air: float = 0                # Class 5: Water
     lahan_terbangun: float = 0    # Class 6: Built-up
+    total_area: float = 0         # Total analyzed area
     # Legacy field for compatibility
     hutan: float = 0              # Sum of 1+2
     # Transition Metrics (Point 1, 2)
@@ -427,6 +471,233 @@ class ClassificationThresholds(BaseModel):
     builtup_ndvi_max: float = 0.3
 
 
+# ==============================================================================
+# NORMALISASI TUTUPAN LAHAN: 6 Kelas IPSDH Final
+# ==============================================================================
+# WAJIB: Sistem hanya menggunakan 6 kelas IPSDH untuk output
+# Database columns → Output classes (1:1 mapping - NO legacy columns):
+# 1. hutan_primer → Hutan Primer
+# 2. hutan_sekunder → Hutan Sekunder
+# 3. tanah_kering → Tanah Lahan Kering
+# 4. tanah_kosong → Tanah Kosong/Terbuka
+# 5. lahan_terbangun → Lahan Terbangun
+# 6. air → Air
+
+def normalize_land_cover_to_ipsdh(data_dict: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Return 6-class IPSDH format from database output.
+    (No aggregation needed - 6 columns match 6 IPSDH classes 1:1)
+
+    Args:
+        data_dict: Dictionary dengan 6 kolom tutupan lahan IPSDH
+
+    Returns:
+        Dictionary dengan 6 kelas IPSDH final
+    """
+    return {
+        'hutan_primer': float(data_dict.get('hutan_primer', 0) or 0),
+        'hutan_sekunder': float(data_dict.get('hutan_sekunder', 0) or 0),
+        'tanah_kering': float(data_dict.get('tanah_kering', 0) or 0),
+        'tanah_kosong': float(data_dict.get('tanah_kosong', 0) or 0),
+        'lahan_terbangun': float(data_dict.get('lahan_terbangun', 0) or 0),
+        'air': float(data_dict.get('air', 0) or 0),
+    }
+
+
+def normalize_analysis_results(analysis_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure analysis_results only include 6 IPSDH land cover classes.
+    (Database now has exactly 6 columns - no legacy columns to remove)
+
+    Args:
+        analysis_results: List of yearly analysis results from database
+
+    Returns:
+        List with only 6 IPSDH classes
+    """
+    if not isinstance(analysis_results, list):
+        return analysis_results
+
+    # If data has legacy columns (from cache/old data), filter them out
+    # Otherwise, data is already clean from database
+    normalized = []
+    for item in analysis_results:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+
+        # Filter out any legacy columns (defensive, shouldn't exist now)
+        normalized_item = {k: v for k, v in item.items() if k not in [
+            'semak_padang_rumput', 'lahan_pertanian', 'gambut', 'tanah_terbuka'
+        ]}
+
+        normalized.append(normalized_item)
+
+    return normalized
+
+
+# ==============================================================================
+# TEMPORAL STATUS & DOMINANT CLASS CALCULATION
+# Implements IPSDH 6-class system with grey area detection
+# ==============================================================================
+
+def calculate_dominant_class(yearly_data: Dict[str, Any]) -> str:
+    """
+    Menghitung kelas dominan dari 6 kelas IPSDH.
+
+    Args:
+        yearly_data: Dict dengan keys: hutan_primer, hutan_sekunder, tanah_kering,
+                     tanah_kosong, lahan_terbangun, air
+
+    Returns:
+        String nama kelas yang paling dominan
+    """
+    classes = {
+        'hutan_primer': float(yearly_data.get('hutan_primer', 0) or 0),
+        'hutan_sekunder': float(yearly_data.get('hutan_sekunder', 0) or 0),
+        'tanah_kering': float(yearly_data.get('tanah_kering', 0) or 0),
+        'tanah_kosong': float(yearly_data.get('tanah_kosong', 0) or 0),
+        'lahan_terbangun': float(yearly_data.get('lahan_terbangun', 0) or 0),
+        'air': float(yearly_data.get('air', 0) or 0)
+    }
+
+    # Return class with maximum value
+    max_class = max(classes.items(), key=lambda x: x[1])
+    return max_class[0] if max_class[1] > 0 else None
+
+
+def calculate_temporal_status(
+    prev_class: Optional[str],
+    current_class: str,
+    next_class: Optional[str],
+    prev_prev_class: Optional[str] = None
+) -> str:
+    """
+    Menghitung status temporal berdasarkan perbandingan kelas antar tahun.
+
+    Aturan:
+    - stable: Kelas sama dengan tahun sebelumnya
+    - transition_unconfirmed: Kelas berubah dari tahun sebelum (grey area)
+    - transition_confirmed: Perubahan konsisten ≥ 2 periode
+    - reverted_noise: Berubah lalu kembali lagi (noise/musiman)
+
+    Args:
+        prev_class: Kelas dominan tahun N-1 (bisa None untuk tahun pertama)
+        current_class: Kelas dominan tahun N (current)
+        next_class: Kelas dominan tahun N+1 (bisa None untuk tahun terakhir)
+        prev_prev_class: Kelas dominan tahun N-2 (untuk deteksi revert)
+
+    Returns:
+        String status: 'stable', 'transition_unconfirmed', 'transition_confirmed', 'reverted_noise'
+    """
+    # Tahun pertama selalu stable (tidak ada pembanding)
+    if prev_class is None:
+        return 'stable'
+
+    # A. STABLE: Kelas sama dengan tahun sebelumnya
+    if current_class == prev_class:
+        return 'stable'
+
+    # Ada perubahan dari tahun sebelumnya
+    # Cek apakah ini noise (kembali ke kondisi 2 tahun lalu)
+    if prev_prev_class and current_class == prev_prev_class:
+        # D. REVERTED_NOISE: Tahun N-2 → N-1 berubah → N kembali ke N-2
+        return 'reverted_noise'
+
+    # Cek apakah perubahan konsisten ke depan
+    if next_class:
+        if current_class == next_class:
+            # C. TRANSITION_CONFIRMED: Perubahan konsisten ≥ 2 periode
+            return 'transition_confirmed'
+
+    # B. TRANSITION_UNCONFIRMED: Perubahan baru terjadi 1 kali (grey area)
+    return 'transition_unconfirmed'
+
+
+async def update_temporal_status_for_history(history_id: str) -> bool:
+    """
+    Update temporal_status dan dominant_class untuk semua tahun dalam satu history.
+    Dipanggil setelah data yearly baru diinsert/update.
+
+    Args:
+        history_id: UUID dari analysis_history
+
+    Returns:
+        bool: True jika berhasil, False jika gagal
+    """
+    if not supabase:
+        print("⚠️ Supabase not initialized")
+        return False
+
+    try:
+        # 1. Ambil semua data yearly untuk history ini, sorted by year
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_yearly_data")
+                .select("*")
+                .eq("history_id", history_id)
+                .order("year")
+                .execute()
+        )
+
+        yearly_data_list = result.data
+        if not yearly_data_list or len(yearly_data_list) == 0:
+            print(f"⚠️ No yearly data found for history {history_id[:8]}")
+            return False
+
+        print(f"🔄 Updating temporal status for {len(yearly_data_list)} years in history {history_id[:8]}...")
+
+        # 2. Calculate dominant_class dan temporal_status untuk setiap tahun
+        updates = []
+        for i, year_data in enumerate(yearly_data_list):
+            # Calculate dominant class
+            dominant_class = calculate_dominant_class(year_data)
+
+            # Get prev, current, next classes
+            prev_class = None if i == 0 else calculate_dominant_class(yearly_data_list[i-1])
+            current_class = dominant_class
+            next_class = None if i == len(yearly_data_list) - 1 else calculate_dominant_class(yearly_data_list[i+1])
+            prev_prev_class = None if i < 2 else calculate_dominant_class(yearly_data_list[i-2])
+
+            # Calculate temporal status
+            temporal_status = calculate_temporal_status(
+                prev_class,
+                current_class,
+                next_class,
+                prev_prev_class
+            )
+
+            updates.append({
+                "id": year_data["id"],
+                "history_id": year_data["history_id"],  # ✅ INCLUDE history_id to prevent null constraint violation
+                "dominant_class": dominant_class,
+                "temporal_status": temporal_status
+            })
+
+        # 3. Batch update semua records
+        if updates:
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_yearly_data")
+                    .upsert(updates, on_conflict="id")
+                    .execute()
+            )
+
+            # Count status
+            status_counts = {}
+            for u in updates:
+                status = u["temporal_status"]
+                status_counts[status] = status_counts.get(status, 0) + 1
+
+            print(f"✅ Updated temporal status for history {history_id[:8]}: {status_counts}")
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Error updating temporal status for history {history_id[:8]}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 class ChangeDetectionRequest(BaseModel):
     """Request body untuk endpoint /change-detection."""
     geojson: Dict[str, Any] = Field(..., description="Objek geometri GeoJSON standar")
@@ -482,6 +753,12 @@ class AnalyzeResponse(BaseModel):
     audit_report: Dict[str, Any] = {}       # Required audit information
 
 
+
+class SlopeRequest(BaseModel):
+    """Request body untuk endpoint /map/slope."""
+    geo_data: Dict[str, Any] = Field(..., description="Objek geometri GeoJSON untuk analisis")
+
+
 class SaveHistoryRequest(BaseModel):
     """Request body untuk menyimpan riwayat analisis."""
     filename: str
@@ -492,6 +769,32 @@ class SaveHistoryRequest(BaseModel):
     mode: Optional[str] = "replace" # "replace" or "merge"
     transition_summary: Optional[Dict[str, Any]] = {}
     audit_report: Optional[Dict[str, Any]] = {}
+    # KPS Detection Fields
+    kps_id: Optional[str] = None  # Foreign key to master_kps.id_kps_api
+    non_kps_id: Optional[str] = None  # Foreign key to master_non_kps.id
+    link_method: Optional[str] = "NONE"  # 'NO_SK_METADATA', 'MANUAL', 'NONE'
+    analysis_scope: Optional[str] = "NON_KPS"  # 'KPS' or 'NON_KPS'
+
+
+# ==============================================================================
+# NON-KPS MODELS
+# ==============================================================================
+
+class CreateNonKpsRequest(BaseModel):
+    """Request untuk membuat master Non-KPS record."""
+    nama_areal: str
+    lahan_id: str  # UUID from master_lahan
+
+
+class NonKpsResponse(BaseModel):
+    """Response untuk Non-KPS record."""
+    id: str
+    nama_areal: str
+    lahan_id: str
+    area_ha: Optional[float] = None
+    centroid_lat: Optional[float] = None
+    centroid_lng: Optional[float] = None
+    created_at: datetime
 
 
 # ==============================================================================
@@ -812,6 +1115,523 @@ async def trigger_kps_sync(background_tasks: BackgroundTasks):
         "timestamp": datetime.utcnow().isoformat()
     }
 
+
+# ==============================================================================
+# DUPLICATE DETECTION ENDPOINT
+# ==============================================================================
+
+@app.post("/api/check-duplicate")
+async def check_duplicate(request: dict):
+    """
+    Check if geometry already exists in database before analysis.
+    Returns existing analysis info if found, allowing user to choose Update or Replace.
+    
+    Request body:
+        - geo_data: GeoJSON object
+    
+    Returns:
+        - is_duplicate: bool
+        - lahan_id: UUID (if duplicate)
+        - history_id: UUID (if has analysis)
+        - existing_filename: str
+        - existing_years: List[int] - years already analyzed
+        - kps_id: str (if linked to KPS)
+        - created_at: timestamp
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    geo_data = request.get("geo_data")
+    if not geo_data:
+        return {"is_duplicate": False, "error": "No geo_data provided"}
+    
+    try:
+        # Hash geometry for duplicate detection
+        geom_str = json.dumps(geo_data, sort_keys=True)
+        geom_hash = hashlib.md5(geom_str.encode()).hexdigest()
+        
+        print(f"🔍 Checking duplicate for geom_hash: {geom_hash[:12]}...")
+        
+        # Check master_lahan
+        lahan_res = await asyncio.to_thread(
+            lambda: supabase.table("master_lahan")
+            .select("id")
+            .eq("geom_hash", geom_hash)
+            .limit(1)
+            .execute()
+        )
+        
+        if not lahan_res.data or len(lahan_res.data) == 0:
+            print(f"   ✅ No duplicate found")
+            return {"is_duplicate": False}
+        
+        lahan_id = lahan_res.data[0]['id']
+        print(f"   ⚠️ Found existing lahan_id: {lahan_id}")
+        
+        # Get existing analysis history
+        history_res = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .select("id, filename, analysis_results, metadata, created_at, kps_id")
+            .eq("lahan_id", lahan_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        
+        if not history_res.data or len(history_res.data) == 0:
+            # Lahan exists but no analysis yet
+            print(f"   ℹ️ Lahan exists but no analysis history")
+            return {
+                "is_duplicate": True,
+                "lahan_id": lahan_id,
+                "has_analysis": False
+            }
+        
+        existing = history_res.data[0]
+        analysis_results = existing.get('analysis_results', [])
+        existing_years = sorted([r.get('year') for r in analysis_results if r.get('year')])
+        
+        # Get KPS info if linked
+        kps_info = None
+        if existing.get('kps_id'):
+            kps_res = await asyncio.to_thread(
+                lambda: supabase.table("master_kps")
+                .select("nama_kps, no_sk")
+                .eq("id_kps_api", existing['kps_id'])
+                .limit(1)
+                .execute()
+            )
+            if kps_res.data:
+                kps_info = kps_res.data[0]
+        
+        print(f"   📊 Existing analysis: {len(existing_years)} years ({existing_years})")
+        
+        return {
+            "is_duplicate": True,
+            "has_analysis": True,
+            "lahan_id": lahan_id,
+            "history_id": existing['id'],
+            "existing_filename": existing.get('filename'),
+            "existing_years": existing_years,
+            "kps_id": existing.get('kps_id'),
+            "kps_info": kps_info,
+            "created_at": existing.get('created_at'),
+            "metadata": existing.get('metadata', {})
+        }
+        
+    except Exception as e:
+        print(f"❌ Check duplicate error: {e}")
+        return {"is_duplicate": False, "error": str(e)}
+
+
+# ==============================================================================
+# KPS AUTO-DETECTION & SEARCH ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/kps/auto-detect")
+async def auto_detect_kps(no_sk: str):
+    """
+    Cari KPS di master_kps berdasarkan NO_SK dari metadata SHP.
+    Digunakan untuk auto-detection saat upload shapefile.
+    
+    Returns:
+        - status: 'found' | 'not_found' | 'error'
+        - kps: KPS data jika ditemukan
+        - method: 'exact' | 'partial' (jika found)
+    """
+    if not supabase:
+        return {"status": "error", "message": "Database not connected", "kps": None}
+    
+    if not no_sk or not no_sk.strip():
+        return {"status": "not_found", "kps": None}
+    
+    try:
+        # Normalisasi input (trim whitespace, remove potential problematic chars)
+        normalized_query = no_sk.strip()
+        
+        print(f"🔍 KPS Auto-detect START")
+        print(f"   Query (original): '{no_sk}'")
+        print(f"   Query (normalized): '{normalized_query}'")
+        
+        # 1. Search in master_kps
+        # We try to search in no_sk column (Standard)
+        # We use ilike for case-insensitive partial matching
+        res = await asyncio.to_thread(
+            lambda: supabase.table("master_kps")
+            .select("id_kps_api, nama_kps, no_sk, kps_type, nama_prov, nama_kab, luas_sk_ha")
+            .ilike("no_sk", f"%{normalized_query}%")
+            .limit(10)
+            .execute()
+        )
+        
+        results = res.data or []
+        print(f"   Database results: {len(results)} candidates found")
+        
+        # 2. Match Scoring Logic
+        if results:
+            query_upper = normalized_query.upper().replace("/", "").replace(".", "").replace(" ", "").replace("-", "")
+            print(f"   Query (fuzzy): '{query_upper}'")
+            
+            # Find best match
+            best_match = None
+            match_method = "partial"
+            
+            for idx, k in enumerate(results):
+                # Get the actual SK number from record
+                record_sk = str(k.get("no_sk") or "").strip()
+                record_upper = record_sk.upper()
+                record_fuzzy = record_upper.replace("/", "").replace(".", "").replace(" ", "").replace("-", "")
+                
+                print(f"   Candidate #{idx+1}:")
+                print(f"      DB value: '{record_sk}'")
+                print(f"      Fuzzy: '{record_fuzzy}'")
+                
+                # Check for absolute exact match (case-insensitive)
+                if record_upper == normalized_query.upper():
+                    best_match = k
+                    match_method = "exact"
+                    print(f"      ✅ EXACT MATCH (case-insensitive)")
+                    break
+                    
+                # Check for "fuzzy" exact match (ignoring separators)
+                if record_fuzzy == query_upper:
+                    best_match = k
+                    match_method = "exact" # Close enough to be considered exact for auto-detect
+                    print(f"      ✅ FUZZY EXACT MATCH (ignoring separators)")
+                    break
+                
+                print(f"      ❌ No exact match")
+            
+            # If no "exact" match found among candidates, pick the first one from DB
+            if not best_match:
+                best_match = results[0]
+                match_method = "partial"
+                print(f"   Using first partial match: '{best_match.get('no_sk')}'")
+                
+            print(f"✅ KPS Auto-detect: Found match for '{no_sk}' (Method: {match_method})")
+            print(f"   Selected: {best_match.get('nama_kps')} | {best_match.get('no_sk')}")
+            return {"status": "found", "kps": best_match, "method": match_method}
+        
+        print(f"ℹ️ KPS Auto-detect: No match found for NO_SK '{no_sk}'")
+        return {"status": "not_found", "kps": None}
+        
+    except Exception as e:
+        print(f"❌ KPS Auto-detect error: {e}")
+        return {"status": "error", "message": str(e), "kps": None}
+
+
+@app.get("/api/kps/search")
+async def search_kps(query: str, limit: int = 10):
+    """
+    Pencarian KPS untuk fitur manual search.
+    Mencari di nama_kps, no_sk, provinsi, dan kab_kota.
+    
+    Args:
+        query: Search term (minimum 2 characters)
+        limit: Maximum results to return (default 10)
+    
+    Returns:
+        - results: Array of matching KPS records
+    """
+    if not supabase:
+        return {"results": [], "error": "Database not connected"}
+    
+    if not query or len(query.strip()) < 2:
+        return {"results": []}
+    
+    try:
+        q = query.strip()
+        
+        # Search by name, no_sk, or location using OR filter
+        res = await asyncio.to_thread(
+            lambda: supabase.table("master_kps")
+            .select("id_kps_api, nama_kps, no_sk, kps_type, nama_prov, nama_kab, luas_sk_ha")
+            .or_(f"nama_kps.ilike.%{q}%,no_sk.ilike.%{q}%,nama_prov.ilike.%{q}%,nama_kab.ilike.%{q}%")
+            .limit(limit)
+            .execute()
+        )
+        
+        print(f"🔍 KPS Search '{q}': Found {len(res.data or [])} results")
+        return {"results": res.data or []}
+        
+    except Exception as e:
+        print(f"❌ KPS Search error: {e}")
+        return {"results": [], "error": str(e)}
+
+
+@app.get("/api/kps/debug")
+async def debug_kps_data(sample: int = 10, search: str = None):
+    """
+    Debug endpoint untuk melihat data aktual di master_kps.
+    Membantu diagnose masalah matching NO_SK.
+    
+    Args:
+        sample: Jumlah sample data (default 10)
+        search: Optional - cari NO_SK spesifik
+    
+    Returns:
+        Sample data dari master_kps dengan info kolom
+    """
+    if not supabase:
+        return {"error": "Database not connected"}
+    
+    try:
+        if search:
+            # Search for specific NO_SK
+            print(f"🔍 Debug search for: '{search}'")
+            
+            # Try multiple search strategies
+            results = {
+                "search_query": search,
+                "strategies": {}
+            }
+            
+            # 1. Exact ilike
+            res1 = await asyncio.to_thread(
+                lambda: supabase.table("master_kps")
+                .select("id_kps_api, nama_kps, no_sk, kps_type")
+                .ilike("no_sk", search)
+                .limit(5)
+                .execute()
+            )
+            results["strategies"]["exact_ilike"] = {
+                "count": len(res1.data or []),
+                "results": res1.data or []
+            }
+            
+            # 2. Partial ilike
+            res2 = await asyncio.to_thread(
+                lambda: supabase.table("master_kps")
+                .select("id_kps_api, nama_kps, no_sk, kps_type")
+                .ilike("no_sk", f"%{search}%")
+                .limit(5)
+                .execute()
+            )
+            results["strategies"]["partial_ilike"] = {
+                "count": len(res2.data or []),
+                "results": res2.data or []
+            }
+            
+            # 3. Contains specific parts (e.g., "2861")
+            if "/" in search or "." in search:
+                # Extract number part
+                import re
+                numbers = re.findall(r'\d+', search)
+                if numbers:
+                    main_num = numbers[0]
+                    res3 = await asyncio.to_thread(
+                        lambda: supabase.table("master_kps")
+                        .select("id_kps_api, nama_kps, no_sk, kps_type")
+                        .ilike("no_sk", f"%{main_num}%")
+                        .limit(10)
+                        .execute()
+                    )
+                    results["strategies"]["number_match"] = {
+                        "number_searched": main_num,
+                        "count": len(res3.data or []),
+                        "results": res3.data or []
+                    }
+            
+            return results
+        else:
+            # Get sample data
+            res = await asyncio.to_thread(
+                lambda: supabase.table("master_kps")
+                .select("id_kps_api, nama_kps, no_sk, kps_type")
+                .limit(sample)
+                .execute()
+            )
+            
+            data = res.data or []
+            
+            return {
+                "total_sample": len(data),
+                "samples": data,
+                "columns": list(data[0].keys()) if data else [],
+                "no_sk_examples": [item.get("no_sk") for item in data[:5]] if data else []
+            }
+    except Exception as e:
+        print(f"❌ Debug endpoint error: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/api/kps/link")
+async def link_kps_to_analysis(request: dict):
+    """
+    Link an existing analysis_history record to a KPS.
+    This updates the kps_id field and all related tables.
+    
+    Request body:
+        - history_id: UUID of the analysis_history record
+        - kps_id: id_kps_api from master_kps
+        - link_method: 'MANUAL' or 'NO_SK_METADATA'
+    
+    This endpoint updates:
+        1. analysis_history (kps_id, link_method, analysis_scope)
+        2. analysis_yearly_data (via history_id FK - no kps_id column there)
+        3. analysis_hotspots (kps_id if column exists)
+        4. analysis_slope_summary (kps_id if column exists)
+    
+    Views will automatically reflect the updated kps_id via joins.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    history_id = request.get("history_id")
+    kps_id = request.get("kps_id")
+    link_method = request.get("link_method", "MANUAL")
+    
+    if not history_id:
+        raise HTTPException(status_code=400, detail="history_id is required")
+    
+    try:
+        # 1. Update analysis_history (main record)
+        update_data = {
+            "kps_id": kps_id,
+            "link_method": link_method,
+            "analysis_scope": "KPS" if kps_id else "NON_KPS"
+        }
+        
+        res = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .update(update_data)
+            .eq("id", history_id)
+            .execute()
+        )
+        
+        if not res.data or len(res.data) == 0:
+            raise HTTPException(status_code=404, detail="History record not found")
+        
+        updated_history = res.data[0]
+        print(f"✅ Linked history {history_id[:8]} to KPS {kps_id}")
+        
+        # 2. Try to update analysis_hotspots if it has kps_id column
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_hotspots")
+                .update({"kps_id": kps_id})
+                .eq("history_id", history_id)
+                .execute()
+            )
+            print(f"   ✅ Updated analysis_hotspots for history {history_id[:8]}")
+        except Exception as e:
+            # Column might not exist, that's OK
+            print(f"   ℹ️ Skipped analysis_hotspots update: {e}")
+        
+        # 3. Try to update analysis_slope_summary if it has kps_id column
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_slope_summary")
+                .update({"kps_id": kps_id})
+                .eq("history_id", history_id)
+                .execute()
+            )
+            print(f"   ✅ Updated analysis_slope_summary for history {history_id[:8]}")
+        except Exception as e:
+            print(f"   ℹ️ Skipped analysis_slope_summary update: {e}")
+        
+        # Invalidate caches
+        invalidate_cache(f"history_detail_{history_id}")
+        invalidate_cache("history_list")
+        
+        return {
+            "status": "success", 
+            "message": f"Linked to KPS successfully",
+            "data": updated_history
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ KPS Link error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# NON-KPS MANAGEMENT ENDPOINTS
+# ==============================================================================
+
+@app.post("/api/non-kps/create", response_model=NonKpsResponse)
+async def create_non_kps(request: CreateNonKpsRequest):
+    """
+    Create a new Non-KPS master record.
+    Auto-called during Non-KPS analysis save workflow.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print(f"🏞️ Creating Non-KPS record: {request.nama_areal} (lahan_id: {request.lahan_id})")
+
+        # Fetch geometry details from master_lahan
+        lahan_res = await asyncio.to_thread(
+            lambda: supabase.table("master_lahan")
+            .select("area_ha, centroid_lat, centroid_lng")
+            .eq("id", request.lahan_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not lahan_res.data:
+            raise HTTPException(status_code=404, detail=f"Lahan ID {request.lahan_id} not found")
+
+        lahan = lahan_res.data[0]
+
+        # Insert into master_non_kps
+        res = await asyncio.to_thread(
+            lambda: supabase.table("master_non_kps").insert({
+                "nama_areal": request.nama_areal,
+                "lahan_id": request.lahan_id,
+                "area_ha": lahan.get("area_ha"),
+                "centroid_lat": lahan.get("centroid_lat"),
+                "centroid_lng": lahan.get("centroid_lng")
+            }).execute()
+        )
+
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Failed to create Non-KPS record")
+
+        record = res.data[0]
+        print(f"✅ Non-KPS created: ID {record['id']}")
+
+        return NonKpsResponse(**record)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error creating Non-KPS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/non-kps/search")
+async def search_non_kps(query: str = Query(..., min_length=2)):
+    """
+    Search Non-KPS by name (for future autocomplete/linking features).
+    Supports partial text matching.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print(f"🔍 Searching Non-KPS: '{query}'")
+
+        res = await asyncio.to_thread(
+            lambda: supabase.table("master_non_kps")
+            .select("*")
+            .ilike("nama_areal", f"%{query}%")
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+
+        results = res.data or []
+        print(f"✅ Found {len(results)} Non-KPS records")
+
+        return {"status": "success", "data": results, "count": len(results)}
+
+    except Exception as e:
+        print(f"❌ Error searching Non-KPS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==============================================================================
@@ -2062,16 +2882,7 @@ def classify_land_cover_advanced(image, geometry, year,
     bare_soil = ndvi.lt(thresholds.bare_soil_ndvi_max).And(builtup.Not()).And(water.Not())
     # 6. Saturated Soil / Mud / Wet Biomass (Class 7)
     # MNDWI positif tapi rendah (0 - 0.1) dan bukan air permanen
-    # Bisa juga mengindikasikan sawah basah atau pasca banjir
     mud = mndwi.gt(0.0).And(mndwi.lt(0.1)).And(ndvi.lt(0.4))
-    
-    # 7. New Flood Detection (Class 6) - Auto Check
-    # High probability water (MNDWI > 0.1) that coincides with SAR low backscatter
-    # Using slightly stricter threshold for auto-detection to avoid false positives
-    flood_prob = mndwi.gt(0.15)
-    if use_radar and s1_data:
-         # Water generally has low backscatter (< -16dB)
-         flood_prob = flood_prob.And(s1_data.select('VV').lt(-16))
 
     # --- Combine Classes ---
     # Prioritas: Air > Terbangun > Tanah > Hutan
@@ -2086,7 +2897,7 @@ def classify_land_cover_advanced(image, geometry, year,
     classification = classification.where(water, 5)    # Air (5)
 
     # Post-processing: Mask out detected Haze/Clouds to avoid false "Tanah Kering"
-    # If Blue > 0.25 and not Water/Flood/Builtup, it's likely cloud/haze.
+    # If Blue > 0.25 and not Water/Builtup, it's likely cloud/haze.
     # Built-up can be bright, but usually has high NDBI. Clouds have low NDBI.
     # We use a conservative mask to be safe.
     cloud_haze_mask = image.select('B2').gt(0.25).And(builtup.Not()).And(water.Not())
@@ -2204,41 +3015,55 @@ def get_rgb_thumb_url(image: ee.Image, geometry: ee.Geometry) -> str:
 
 async def download_and_save_locally(thumb_url: str, prefix: str = "thumb") -> Optional[str]:
     """Download thumbnail from GEE and save it to the VPS server.
-    
+
     Returns the web-accessible local URL (e.g., /storage/thumbnails/...).
     """
     if not thumb_url:
+        print(f"⚠️ No thumbnail URL provided")
         return None
-    
+
     try:
         # Download image from GEE with timeout
-        print(f"📥 Downloading thumbnail from GEE for local storage...")
+        print(f"📥 Downloading thumbnail from GEE: {thumb_url[:60]}...")
         response = await asyncio.to_thread(
             lambda: requests.get(thumb_url, timeout=30)
         )
-        
+
         if response.status_code != 200:
-            print(f"⚠️ Failed to download thumbnail: HTTP {response.status_code}")
+            print(f"❌ Failed to download thumbnail: HTTP {response.status_code}")
             return None
-        
+
+        # Validate content
+        if not response.content or len(response.content) == 0:
+            print(f"❌ Downloaded thumbnail is empty")
+            return None
+
+        print(f"   Size: {len(response.content) / 1024:.1f} KB")
+
         # Generate unique filename
         # Use content hash to avoid duplicates if same image is requested
         image_bytes = response.content
         content_hash = hashlib.md5(image_bytes).hexdigest()[:12]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{prefix}_{timestamp}_{content_hash}.png"
-        
+
         # Save locally using the helper
         local_url = save_local_image(image_bytes, filename)
-        
+
         if local_url:
             print(f"✅ Thumbnail saved locally: {local_url}")
             return local_url
-            
+        else:
+            print(f"❌ Failed to save thumbnail locally")
+            return None
+
+    except asyncio.TimeoutError:
+        print(f"❌ Thumbnail download timeout (>30s)")
         return None
-        
     except Exception as e:
-        print(f"⚠️ Thumbnail local save failed: {e}")
+        print(f"❌ Thumbnail local save failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -2246,166 +3071,6 @@ async def download_and_save_locally(thumb_url: str, prefix: str = "thumb") -> Op
 download_and_encode_thumbnail = download_and_save_locally
 
 
-async def analyze_flood(
-    geometry: ee.Geometry,
-    before_date: str,
-    after_date: str,
-    thresholds: ClassificationThresholds,
-    scale: int = 30,
-    use_radar: bool = True
-) -> YearlyData:
-    """
-    Analisis dampak banjir (Sebelum vs Sesudah) menggunakan SAR & Optik.
-    """
-    print(f"🌊 Menganalisis Dampak Banjir: {before_date} vs {after_date}")
-    
-    # helper to get imagery for a center date
-    def get_comp(c_date):
-        dt = datetime.strptime(c_date, "%Y-%m-%d")
-        start = (dt - timedelta(days=20)).strftime("%Y-%m-%d")
-        end = (dt + timedelta(days=20)).strftime("%Y-%m-%d")
-        
-        # Optical
-        coll = (ee.ImageCollection(SENTINEL2_COLLECTION)
-                .filterBounds(geometry)
-                .filterDate(start, end)
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
-                .map(mask_clouds_sentinel2)
-                .map(add_ndvi_qc_band))
-        
-        opt = coll.qualityMosaic('NDVI_QC').select(SENTINEL_BANDS).clip(geometry)
-        
-        # Radar
-        sar = None
-        if use_radar:
-             sar_coll = (ee.ImageCollection("COPERNICUS/S1_GRD")
-                        .filterBounds(geometry)
-                        .filterDate(start, end)
-                        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-                        .filter(ee.Filter.eq('instrumentMode', 'IW')))
-             sar = sar_coll.median().clip(geometry)
-             
-        return {"opt": opt, "sar": sar, "count": coll.size().getInfo(), "sar_count": sar_coll.size().getInfo() if sar else 0}
-
-    print(f"🔍 Fetching imagery for flood analysis...")
-    data_before = await asyncio.to_thread(lambda: get_comp(before_date))
-    print(f"   ✅ Before: {data_before['count']} optical, {data_before['sar_count']} radar scenes")
-    
-    data_after = await asyncio.to_thread(lambda: get_comp(after_date))
-    print(f"   ✅ After: {data_after['count']} optical, {data_after['sar_count']} radar scenes")
-    
-    # 1. Spectral Indices
-    before_idx = calculate_indices(data_before["opt"])
-    after_idx = calculate_indices(data_after["opt"])
-    
-    ndvi_before = before_idx.select('NDVI')
-    ndvi_after = after_idx.select('NDVI')
-    mndwi_before = before_idx.select('MNDWI')
-    mndwi_after = after_idx.select('MNDWI')
-    
-    # 2. SAR Logic
-    flood_sar = ee.Image(0)
-    if use_radar and data_before["sar"] and data_after["sar"]:
-        vv_before = data_before["sar"].select('VV')
-        vv_after = data_after["sar"].select('VV')
-        # Banjir biasanya membuat backscatter VV turun drastis (permukaan air tenang)
-        # Threshold: VV_After < -20dB DAN (VV_After < VV_Before - 3dB)
-        flood_sar = vv_after.lt(-18).And(vv_after.lt(vv_before.subtract(3)))
-
-    # 3. Optical Logic
-    # Genangan baru: MNDWI naik signifikan dan positif
-    flood_opt = mndwi_after.gt(0.1).And(mndwi_before.lt(0.1))
-    
-    # Damage: NDVI turun drastis di area yang tadinya hutan
-    forest_before = ndvi_before.gt(0.6)
-    veg_damage = forest_before.And(ndvi_after.lt(ndvi_before.subtract(0.2)))
-    
-    # Saturated Soil / Mud: MNDWI tinggi tapi tidak banjir total, atau NDVI rendah pasca banjir
-    mud = mndwi_after.gt(0.0).And(mndwi_after.lt(0.1)).And(mndwi_before.lt(0.0))
-
-    # Combine into special classification
-    # 4: Air Permanen, 6: Banjir Baru, 7: Lumpur/Basah, 8: Rusak, 1: Hutan Aman, 3: Daratan lain
-    flood_class = ee.Image(3).updateMask(data_after["opt"].select(0).mask())
-    
-    # Step-by-step assembly
-    flood_class = flood_class.where(ndvi_after.gt(0.6), 1) # Hutan Aman
-    flood_class = flood_class.where(veg_damage, 8) # Lahan Rusak
-    flood_class = flood_class.where(mud, 7) # Lumpur/Basah
-    flood_class = flood_class.where(mndwi_after.gt(0.1).And(mndwi_before.gt(0.1)), 4) # Air Permanen
-    
-    # Final layer: Banjir (priority over mud/damage)
-    is_flood = flood_sar.Or(flood_opt)
-    flood_class = flood_class.where(is_flood, 6) # Genangan Banjir Baru
-    
-    flood_class = flood_class.focal_mode(radius=1.5, kernelType='circle', units='pixels').clip(geometry)
-    
-    # Area Stats
-    area_image = ee.Image.pixelArea().divide(10000).rename('area')
-    # Force band order: area (weighted) first, then classification (group)
-    combined_stats = area_image.addBands(flood_class.rename('class')).select(['area', 'class'])
-    
-    stats = combined_stats.reduceRegion(
-        reducer=ee.Reducer.sum().group(groupField=1, groupName='class'),
-        geometry=geometry, scale=scale, maxPixels=1e10, bestEffort=True
-    ).getInfo()
-    
-    groups = stats.get('groups', [])
-    raw_areas = {int(item['class']): item['sum'] for item in groups if item['class'] > 0}
-    
-    # Map & Thumbs
-    # Map & Thumbs
-    # Fix: Mask out unused classes (2, 3, 5) instead of using transparent hex
-    # Keep only: 1 (Forest), 4 (Water), 6 (Flood), 7 (Mud), 8 (Damage)
-    display_mask = flood_class.eq(1).Or(flood_class.eq(4)).Or(flood_class.eq(6)).Or(flood_class.eq(7)).Or(flood_class.eq(8))
-    floods_visual = flood_class.updateMask(display_mask)
-
-    flood_vis = {
-        "min": 1, 
-        "max": 8, 
-        "palette": [
-            "#228B22",   # 1: Forest
-            "black",     # 2: Unused (Masked out)
-            "black",     # 3: Unused (Masked out)
-            "#1E90FF",   # 4: Water
-            "black",     # 5: Unused (Masked out)
-            "#00FFFF",   # 6: Flood (Cyan)
-            "#8B4513",   # 7: Mud (Brown)
-            "#FF4500"    # 8: Damage (Red)
-        ]
-    }
-    
-    map_id = floods_visual.visualize(**flood_vis).getMapId()
-    map_url = f"https://earthengine.googleapis.com/v1/projects/earthengine-legacy/maps/{map_id['mapid']}/tiles/{{z}}/{{x}}/{{y}}"
-    
-    rgb_url = await asyncio.to_thread(lambda: get_rgb_map_url(data_after["opt"]))
-    
-    # Thumbnails
-    gee_thumb_url = floods_visual.visualize(**flood_vis).getThumbURL({
-        'region': geometry, 'dimensions': 512, 'format': 'png'
-    })
-    thumb_url = await download_and_encode_thumbnail(gee_thumb_url)
-    
-    return YearlyData(
-        year="Dampak Banjir",
-        hutan=raw_areas.get(1, 0),
-        tanah_kering=0,
-        tanah_kosong=raw_areas.get(3, 0),
-        air=raw_areas.get(4, 0),
-        lahan_terbangun=0,
-        banjir_baru=raw_areas.get(6, 0),
-        tanah_basah=raw_areas.get(7, 0),
-        lahan_rusak=raw_areas.get(8, 0),
-        map_url=map_url,
-        rgb_url=rgb_url,
-        thumb_url=thumb_url,
-        detailed={
-            "banjir_baru": raw_areas.get(6, 0),
-            "tanah_basah": raw_areas.get(7, 0),
-            "lahan_rusak": raw_areas.get(8, 0),
-            "air_permanen": raw_areas.get(4, 0),
-            "vegetasi_aman": raw_areas.get(1, 0)
-        }
-    )
 
 
 async def analyze_land_cover(
@@ -2747,10 +3412,7 @@ async def analyze_land_cover(
                     tanah_kosong=round(raw_areas.get(4, 0), 2),
                     air=round(raw_areas.get(5, 0), 2),
                     lahan_terbangun=round(raw_areas.get(6, 0), 2),
-                    # Disasters REMOVED
-                    banjir_baru=0,
-                    tanah_basah=0,
-                    lahan_rusak=0,
+                    total_area=round(sum([raw_areas.get(i, 0) for i in range(1, 7)]), 2),
                     map_url=map_url,
                     rgb_url=rgb_url,
                     thumb_url=thumb_url,
@@ -3071,13 +3733,17 @@ class ExportRequest(BaseModel):
 async def export_geojson(request: ExportRequest):
     """
     Export hasil analisis sebagai GeoJSON dengan properti tutupan lahan.
+    HANYA 6 kelas IPSDH final yang di-export.
     """
     try:
         features = []
         input_geojson = request.geojson
-        
+
+        # Normalisasi data ke 6 kelas IPSDH final
+        normalized_data = normalize_analysis_results(request.data)
+
         # Wrap the geometry with analysis data properties
-        for year_data in request.data:
+        for year_data in normalized_data:
             feature = {
                 "type": "Feature",
                 "geometry": input_geojson.get("geometry") or input_geojson,
@@ -3096,10 +3762,7 @@ async def export_geojson(request: ExportRequest):
                         year_data.get("tanah_kering", 0),
                         year_data.get("tanah_kosong", 0),
                         year_data.get("air", 0),
-                        year_data.get("lahan_terbangun", 0),
-                        year_data.get("banjir_baru", 0),
-                        year_data.get("tanah_basah", 0),
-                        year_data.get("lahan_rusak", 0)
+                        year_data.get("lahan_terbangun", 0)
                     ])
                 }
             }
@@ -3122,15 +3785,19 @@ async def export_geojson(request: ExportRequest):
 async def export_kml(request: ExportRequest):
     """
     Export hasil analisis sebagai KML untuk Google Earth.
+    HANYA 6 kelas IPSDH final yang di-export.
     """
     try:
         from xml.etree.ElementTree import Element, SubElement, tostring
-        
+
+        # Normalisasi data ke 6 kelas IPSDH final
+        normalized_data = normalize_analysis_results(request.data)
+
         kml = Element('kml', xmlns="http://www.opengis.net/kml/2.2")
         document = SubElement(kml, 'Document')
         SubElement(document, 'name').text = "GeoAnalyzer Land Cover Analysis"
         SubElement(document, 'description').text = f"Generated: {datetime.now().isoformat()}"
-        
+
         # Add styles for each class
         style_colors = {
             'hutan_primer': 'ff006400',
@@ -3140,15 +3807,15 @@ async def export_kml(request: ExportRequest):
             'air': 'ffFF901E',
             'lahan_terbangun': 'ff708090'
         }
-        
+
         for class_name, color in style_colors.items():
             style = SubElement(document, 'Style', id=f"style_{class_name}")
             poly_style = SubElement(style, 'PolyStyle')
             SubElement(poly_style, 'color').text = color
             SubElement(poly_style, 'fill').text = '1'
-        
+
         # Add placemarks for each year
-        for year_data in request.data:
+        for year_data in normalized_data:
             placemark = SubElement(document, 'Placemark')
             SubElement(placemark, 'name').text = f"Tahun {year_data.get('year')}"
             
@@ -3447,11 +4114,139 @@ async def detect_changes(request: ChangeDetectionRequest):
         raise HTTPException(status_code=500, detail=f"Deteksi perubahan gagal: {str(e)}")
 
 
+
+@app.post("/map/slope")
+async def get_slope_analysis(request: SlopeRequest):
+    """
+    Generate Slope Analysis Layer & Statistics (Live).
+    Returns MapID and Summary Stats for Inside/Outside 2km.
+    Uses NASADEM (SRTM) for elevation data.
+    """
+    try:
+        print("📐 Starting Slope Analysis (Live)...")
+        
+        # 1. Parse Geometry
+        geometry = geojson_to_ee_geometry(request.geo_data)
+        
+        # 2. Scope Definitions
+        # Scope 1: Inside (The Geometry itself) (Label: WILAYAH)
+        # Scope 2: Outside (Buffer 2km diff Geometry) (Label: BUFFER 2KM)
+        buffer_mask = geometry.buffer(2000)
+        outside_mask = buffer_mask.difference(geometry)
+        
+        # 3. Load NASADEM (SRTM)
+        # Use existing NASA DEM which is standard for global coverage
+        dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation')
+        
+        # 4. Calculate Slope (Radians -> Degrees -> Percent?)
+        # ee.Terrain.slope returns DEGREES.
+        slope_deg = ee.Terrain.slope(dem)
+        
+        # Calculate Percent Slope for classification: tan(deg) * 100
+        # Formula: Percent = tan(radians(slope_in_degrees)) * 100
+        slope_pct = slope_deg.multiply(math.pi).divide(180).tan().multiply(100).rename('slope_pct')
+        
+        # 5. Create Visualization Map (KLHK Standard)
+        # 0-8% (Datar), 8-15% (Landai), 15-25% (Agak Curam), 25-45% (Curam), >45% (Sangat Curam)
+        sld_intervals = (
+            '<RasterSymbolizer>'
+            '<ColorMap type="intervals" extended="false">'
+            '<ColorMapEntry color="#31a354" quantity="8" label="0-8% Datar" />'
+            '<ColorMapEntry color="#addd8e" quantity="15" label="8-15% Landai" />'
+            '<ColorMapEntry color="#fee391" quantity="25" label="15-25% Agak Curam" />'
+            '<ColorMapEntry color="#fec44f" quantity="45" label="25-45% Curam" />'
+            '<ColorMapEntry color="#cc4c02" quantity="1000" label=">45% Sangat Curam" />'
+            '</ColorMap>'
+            '</RasterSymbolizer>'
+        )
+        
+        # Visualize for the buffer area (covers both inside + outside context)
+        # We clip to buffer_mask so the user sees the AOI + surrounding 2km
+        viz_image = slope_pct.clip(buffer_mask).sldStyle(sld_intervals)
+        map_url = viz_image.getMapId()['tile_fetcher'].url_format
+        
+        # 6. Calculate Statistics Helper
+        def calc_slope_stats(geom, scope_name):
+            # Calculate pixel area in Ha
+            area_img = ee.Image.pixelArea().divide(10000).rename('area')
+            
+            # Create masks according to KLHK classes
+            # 1: 0-8% (Datar)
+            # 2: 8-15% (Landai)
+            # 3: 15-25% (Agak Curam)
+            # 4: 25-45% (Curam)
+            # 5: >45% (Sangat Curam)
+
+            class_img = ee.Image(0).rename('class')
+            class_img = class_img.where(slope_pct.lte(8), 1)
+            class_img = class_img.where(slope_pct.gt(8).And(slope_pct.lte(15)), 2)
+            class_img = class_img.where(slope_pct.gt(15).And(slope_pct.lte(25)), 3)
+            class_img = class_img.where(slope_pct.gt(25).And(slope_pct.lte(45)), 4)
+            class_img = class_img.where(slope_pct.gt(45), 5)
+            
+            # Combine area and class
+            combined = area_img.addBands(class_img)
+            
+            # Grouped reduction
+            result = combined.reduceRegion(
+                reducer=ee.Reducer.sum().group(groupField=1, groupName='class'),
+                geometry=geom,
+                scale=30,
+                maxPixels=1e9,
+                bestEffort=True
+            ).getInfo()
+            
+            groups = result.get('groups', [])
+            mapped_res = {int(item['class']): item['sum'] for item in groups}
+            
+            # Populate stats with defaults (KLHK Standard: 25-45%, >45%)
+            # Note: Field names match DB columns for consistency
+            stats = {}
+            stats["slope_0_8"] = mapped_res.get(1, 0)       # Datar: 0-8%
+            stats["slope_8_15"] = mapped_res.get(2, 0)      # Landai: 8-15%
+            stats["slope_15_25"] = mapped_res.get(3, 0)     # Agak Curam: 15-25%
+            stats["slope_25_40"] = mapped_res.get(4, 0)     # Curam: 25-45% (KLHK)
+            stats["slope_above_40"] = mapped_res.get(5, 0)  # Sangat Curam: >45% (KLHK)
+            
+            # Average Slope (Percentage)
+            avg_res = slope_pct.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=30,
+                maxPixels=1e9,
+                bestEffort=True
+            ).getInfo()
+
+            stats["avg_slope"] = round(avg_res.get('slope_pct', 0), 1)
+            stats["scope"] = scope_name
+            
+            return stats
+
+        print("   📊 Computing stats for INSIDE...")
+        summary_inside = calc_slope_stats(geometry, "INSIDE")
+        
+        print("   📊 Computing stats for OUTSIDE (2km)...")
+        summary_outside = calc_slope_stats(outside_mask, "OUTSIDE")
+        
+        return {
+            "status": "success",
+            "map_url": map_url,
+            "db_summary": [summary_inside, summary_outside]
+        }
+        
+    except Exception as e:
+        print(f"❌ Slope Analysis Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/history")
-async def save_history(request: SaveHistoryRequest):
+async def save_history(request: SaveHistoryRequest, background_tasks: BackgroundTasks):
     """
     Simpan riwayat analisis dengan pola Relational Database.
     Geometri disimpan di master_lahan (unik berdasarkan hash), history merujuk ke sana.
+    Hotspot data di-populate secara background untuk views KPS.
     """
     if not supabase:
         raise HTTPException(status_code=503, detail="Supabase client not configured")
@@ -3634,6 +4429,82 @@ async def save_history(request: SaveHistoryRequest):
             print(f"⚠️ Cleanup failed (ignored): {e}")
 
         # 3. Simpan SEBAGAI BARU (Insert)
+        # Determine analysis_scope based on kps_id
+        effective_scope = "KPS" if request.kps_id else (request.analysis_scope or "NON_KPS")
+
+        # --- AUTO-CREATE NON-KPS MASTER RECORD IF NEEDED ---
+        non_kps_id = None
+        if effective_scope == "NON_KPS" and lahan_id:
+            try:
+                print(f"🏞️ Processing Non-KPS master record for lahan_id: {lahan_id}")
+
+                # Extract nama_areal from filename (remove extensions)
+                nama_areal = request.filename
+                for ext in ['.shp', '.geojson', '.zip', '.json']:
+                    nama_areal = nama_areal.replace(ext, '')
+
+                # Check if Non-KPS already exists for this geometry
+                existing_non_kps = await asyncio.to_thread(
+                    lambda: supabase.table("master_non_kps")
+                    .select("id, nama_areal")
+                    .eq("lahan_id", lahan_id)
+                    .limit(1)
+                    .execute()
+                )
+
+                if existing_non_kps.data and len(existing_non_kps.data) > 0:
+                    # Reuse existing Non-KPS record
+                    non_kps_id = existing_non_kps.data[0]["id"]
+                    existing_name = existing_non_kps.data[0].get("nama_areal", "")
+                    print(f"♻️ Reusing existing Non-KPS record: {non_kps_id} ('{existing_name}')")
+                else:
+                    # Create new Non-KPS record
+                    print(f"📝 Creating new Non-KPS record: '{nama_areal}'")
+
+                    # Fetch geometry details from master_lahan
+                    lahan_data = await asyncio.to_thread(
+                        lambda: supabase.table("master_lahan")
+                        .select("area_ha, centroid_lat, centroid_lng")
+                        .eq("id", lahan_id)
+                        .limit(1)
+                        .execute()
+                    )
+
+                    if lahan_data.data:
+                        lahan = lahan_data.data[0]
+                        non_kps_res = await asyncio.to_thread(
+                            lambda: supabase.table("master_non_kps").insert({
+                                "nama_areal": nama_areal,
+                                "lahan_id": lahan_id,
+                                "area_ha": lahan.get("area_ha"),
+                                "centroid_lat": lahan.get("centroid_lat"),
+                                "centroid_lng": lahan.get("centroid_lng")
+                            }).execute()
+                        )
+
+                        if non_kps_res.data:
+                            non_kps_id = non_kps_res.data[0]["id"]
+                            print(f"✅ Created new Non-KPS record: {non_kps_id}")
+                        else:
+                            print(f"⚠️ Non-KPS creation returned no data")
+                    else:
+                        print(f"⚠️ Could not fetch lahan data for Non-KPS creation")
+
+            except Exception as non_kps_err:
+                # Non-fatal: Log error but continue with analysis save
+                print(f"⚠️ Non-KPS creation failed (non-fatal): {non_kps_err}")
+                non_kps_id = None
+
+        # Extract Transition Summary for Top-Level Columns
+        ts = request.transition_summary or {}
+        defor_val = float(ts.get("total_deforestation_ha", 0) or 0)
+        refor_val = float(ts.get("total_reforestation_ha", 0) or 0)
+        net_change = float(ts.get("net_forest_change_ha", 0) or 0)
+        
+        trend_val = "STABLE"
+        if net_change < -0.5: trend_val = "DECREASING"
+        elif net_change > 0.5: trend_val = "INCREASING"
+
         new_history = {
             "filename": request.filename,
             "file_size": request.file_size,
@@ -3646,7 +4517,16 @@ async def save_history(request: SaveHistoryRequest):
                 "processed_at": datetime.now().isoformat()
             },
             "analysis_results": updated_analysis_results,
-            "lahan_id": lahan_id
+            "lahan_id": lahan_id,
+            # Top-Level Transition Metrics (Added 2026-02-01)
+            "deforestation_ha": defor_val,
+            "reforestation_ha": refor_val,
+            "trend_type": trend_val,
+            # KPS Detection Fields
+            "kps_id": request.kps_id,
+            "non_kps_id": non_kps_id,  # Link to master_non_kps if NON_KPS analysis
+            "link_method": request.link_method or "NONE",
+            "analysis_scope": effective_scope
         }
         
         # Retry logic for database insertion (handle transient DNS/connection issues)
@@ -3666,8 +4546,78 @@ async def save_history(request: SaveHistoryRequest):
         if hist_res is not None and hasattr(hist_res, 'data') and hist_res.data and len(hist_res.data) > 0:
              # Invalidate list cache on successful save
              invalidate_cache("history_list")
-             
-             return {"status": "success", "data": hist_res.data[0]}
+
+             saved_history = hist_res.data[0]
+             history_id = saved_history.get("id")
+             analysis_results = request.analysis_results or []
+
+             # === SAVE TO analysis_yearly_data TABLE ===
+             yearly_records = []
+             for item in analysis_results:
+                 year = item.get("year")
+                 if not year:
+                     continue
+
+                 # ===================================================================
+                 # SAVE ANALYSIS DATA: 6 Kelas IPSDH Final
+                 # ===================================================================
+                 # Database now has exactly 6 columns (legacy columns removed)
+                 # Direct 1:1 mapping from classification results
+
+                 record = {
+                     "history_id": history_id,
+                     "year": year,
+                     # 6 Kelas IPSDH dari classification:
+                     "hutan_primer": float(item.get("hutan_primer", 0) or 0),
+                     "hutan_sekunder": float(item.get("hutan_sekunder", 0) or 0),
+                     "tanah_kering": float(item.get("tanah_kering", 0) or 0),
+                     "tanah_kosong": float(item.get("tanah_kosong", 0) or 0),
+                     "lahan_terbangun": float(item.get("lahan_terbangun", 0) or 0),
+                     "air": float(item.get("air", 0) or 0),
+                     "total_area": float(item.get("total_area", 0) or 0)
+                 }
+                 yearly_records.append(record)
+
+             if yearly_records:
+                 try:
+                     await asyncio.to_thread(
+                         lambda: supabase.table("analysis_yearly_data")
+                             .upsert(yearly_records, on_conflict="history_id,year")
+                             .execute()
+                     )
+                     print(f"📊 Saved {len(yearly_records)} yearly records for history {history_id[:8]}")
+                 except Exception as e:
+                     print(f"⚠️ Error saving yearly data: {e}")
+
+             # === POPULATE HOTSPOTS IN BACKGROUND ===
+             years = [item.get("year") for item in analysis_results if item.get("year")]
+             if history_id and years and request.geo_data:
+                 background_tasks.add_task(
+                     save_hotspots_for_analysis,
+                     history_id,
+                     request.geo_data,
+                     years
+                 )
+                 print(f"🔥 Scheduled hotspot population for history {history_id[:8]} ({len(years)} years)")
+
+             # === CALCULATE AND SAVE SLOPE ANALYSIS IN BACKGROUND ===
+             if history_id and request.geo_data:
+                 background_tasks.add_task(
+                     save_slope_analysis,
+                     history_id,
+                     request.geo_data
+                 )
+                 print(f"📐 Scheduled slope analysis for history {history_id[:8]}")
+
+             # === UPDATE TEMPORAL STATUS (GREY AREA DETECTION) IN BACKGROUND ===
+             if history_id and len(yearly_records) > 0:
+                 background_tasks.add_task(
+                     update_temporal_status_for_history,
+                     history_id
+                 )
+                 print(f"🔄 Scheduled temporal status calculation for history {history_id[:8]}")
+
+             return {"status": "success", "data": saved_history}
         else:
              raise Exception("Insert analysis_history failed after retries.")
 
@@ -3820,26 +4770,30 @@ async def get_history():
         data = []
         for item in res.data:
             # 1. Hilangkan GeoJSON Geometri (Terlalu berat untuk list)
-            item['geo_data'] = None 
-            
-            # 2. Bersihkan Analysis Results
+            item['geo_data'] = None
+
+            # 2. Normalisasi Analysis Results ke 6 kelas IPSDH final
+            if 'analysis_results' in item:
+                item['analysis_results'] = normalize_analysis_results(item['analysis_results'])
+
+            # 3. Bersihkan Analysis Results
             results = item.get('analysis_results', [])
             if isinstance(results, list) and results:
-                # Kita hanya butuh statistik (untuk grafik trend) 
+                # Kita hanya butuh statistik (untuk grafik trend)
                 # dan thumbnail terbaru (untuk preview card)
                 results.sort(key=lambda x: int(x.get('year', 0)), reverse=True)
-                
+
                 latest_year = results[0]
                 for idx, r in enumerate(results):
                     # ALWAYS remove massive vector data
                     if 'vector_geojson' in r: del r['vector_geojson']
                     if 'rgb_thumb_url' in r: del r['rgb_thumb_url']
-                    
+
                     # Hilangkan thumbnail kecuali untuk tahun TERBARU
                     # (Frontend butuh preview thumb di card, tapi cukup 1)
                     if idx > 0:
                         if 'thumb_url' in r: del r['thumb_url']
-            
+
             data.append(item)
             
         return data # Hilangkan caching sementara untuk data live murni
@@ -3887,16 +4841,128 @@ async def get_history_detail(history_id: str):
             
         if 'master_lahan' in item:
             del item['master_lahan']
-            
+
         item['geo_data'] = geo_data
-        
+
+        # Normalisasi Analysis Results ke 6 kelas IPSDH final
+        if 'analysis_results' in item:
+            item['analysis_results'] = normalize_analysis_results(item['analysis_results'])
+
+        # Fetch slope summary data if available
+        try:
+            slope_res = await asyncio.to_thread(
+                lambda: supabase.table("analysis_slope_summary")
+                    .select("*")
+                    .eq("history_id", history_id)
+                    .execute()
+            )
+            if slope_res.data:
+                slope_summary = []
+                for record in slope_res.data:
+                    slope_summary.append({
+                        "scope": record.get("scope"),
+                        "avg_slope": record.get("avg_slope"),
+                        "slope_0_8": record.get("slope_0_8"),
+                        "slope_8_15": record.get("slope_8_15"),
+                        "slope_15_25": record.get("slope_15_25"),
+                        "slope_25_40": record.get("slope_25_40"),      # KLHK: 25-45%
+                        "slope_above_40": record.get("slope_above_40"), # KLHK: >45%
+                    })
+                item['slope_summary'] = slope_summary
+        except Exception as slope_err:
+            print(f"⚠️ Could not fetch slope summary: {slope_err}")
+            item['slope_summary'] = None
+
+        # Fetch hotspot count summary
+        try:
+            hotspot_res = await asyncio.to_thread(
+                lambda: supabase.table("analysis_hotspots")
+                    .select("year, id", count="exact")
+                    .eq("history_id", history_id)
+                    .execute()
+            )
+            if hotspot_res.count is not None:
+                item['hotspot_count'] = hotspot_res.count
+        except Exception as hotspot_err:
+            print(f"⚠️ Could not fetch hotspot count: {hotspot_err}")
+            item['hotspot_count'] = 0
+
         # Store in cache (permanent - no TTL)
         cache_file(CACHE_KEY, item)
-        
+
         return item
         
     except Exception as e:
         print(f"❌ Error fetching history detail: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/history/{history_id}/hotspots")
+async def get_history_hotspots(history_id: str, year: int = None):
+    """
+    Get hotspot data for a specific analysis history.
+    Optionally filter by year.
+    Returns GeoJSON FeatureCollection.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        query = supabase.table("analysis_hotspots").select("*").eq("history_id", history_id)
+
+        if year:
+            query = query.eq("year", year)
+
+        result = await asyncio.to_thread(lambda: query.order("acq_date", desc=True).execute())
+
+        if not result.data:
+            return {
+                "type": "FeatureCollection",
+                "features": [],
+                "total": 0
+            }
+
+        # Convert to GeoJSON
+        features = []
+        for row in result.data:
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(row['longitude']), float(row['latitude'])]
+                },
+                "properties": {
+                    "year": row.get('year'),
+                    "acq_date": row.get('acq_date'),
+                    "confidence": row.get('confidence'),
+                    "confidence_level": row.get('confidence_level'),
+                    "brightness": row.get('brightness'),
+                    "frp": row.get('frp'),
+                    "source": row.get('source')
+                }
+            }
+            features.append(feature)
+
+        # Aggregate by year
+        yearly_stats = {}
+        for row in result.data:
+            y = row.get('year')
+            if y not in yearly_stats:
+                yearly_stats[y] = {"total": 0, "high": 0, "nominal": 0, "low": 0}
+            yearly_stats[y]["total"] += 1
+            conf = row.get('confidence_level', '').lower()
+            if conf in yearly_stats[y]:
+                yearly_stats[y][conf] += 1
+
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "total": len(features),
+            "yearly_stats": yearly_stats
+        }
+
+    except Exception as e:
+        print(f"⚠️ Error getting hotspots: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3936,10 +5002,7 @@ def calculate_carbon_stock(area_data: Dict[str, float]) -> Dict[str, Any]:
         'tanah_kering': 2,
         'tanah_kosong': 3,
         'air': 4,
-        'lahan_terbangun': 5,
-        'banjir_baru': 6,
-        'tanah_basah': 7,
-        'lahan_rusak': 8
+        'lahan_terbangun': 5
     }
     
     total_carbon = 0.0
@@ -4142,10 +5205,7 @@ async def analyze_carbon_timeseries(request: CarbonTimeSeriesRequest):
                 'tanah_kering': result.get('tanah_kering', 0),
                 'tanah_kosong': result.get('tanah_kosong', 0),
                 'air': result.get('air', 0),
-                'lahan_terbangun': result.get('lahan_terbangun', 0),
-                'banjir_baru': result.get('banjir_baru', 0),
-                'tanah_basah': result.get('tanah_basah', 0),
-                'lahan_rusak': result.get('lahan_rusak', 0),
+                'lahan_terbangun': result.get('lahan_terbangun', 0)
             }
             
             carbon_result = calculate_carbon_stock(area_data)
@@ -4390,11 +5450,14 @@ async def generate_pdf_report(request: PDFReportRequest, base_url: str = "https:
     """
     try:
         import base64
-        
+
+        # Normalisasi data ke 6 kelas IPSDH final
+        normalized_data = normalize_analysis_results(request.data)
+
         # Calculate totals
-        total_years = len(request.data)
+        total_years = len(normalized_data)
         if total_years > 0:
-            latest = request.data[-1]
+            latest = normalized_data[-1]
             total_area = sum([
                 latest.get('hutan_primer', 0),
                 latest.get('hutan_sekunder', 0),
@@ -4452,9 +5515,9 @@ async def generate_pdf_report(request: PDFReportRequest, base_url: str = "https:
         # Prepare trend calculation
         trend_label = "Stabil"
         trend_class = "trend-neutral"
-        if len(request.data) > 1:
-            start_total_forest = (request.data[0].get('hutan_primer', 0) or 0) + (request.data[0].get('hutan_sekunder', 0) or 0)
-            end_total_forest = (request.data[-1].get('hutan_primer', 0) or 0) + (request.data[-1].get('hutan_sekunder', 0) or 0)
+        if len(normalized_data) > 1:
+            start_total_forest = (normalized_data[0].get('hutan_primer', 0) or 0) + (normalized_data[0].get('hutan_sekunder', 0) or 0)
+            end_total_forest = (normalized_data[-1].get('hutan_primer', 0) or 0) + (normalized_data[-1].get('hutan_sekunder', 0) or 0)
             diff = end_total_forest - start_total_forest
             if diff > 1:
                 trend_label = f"Peningkatan Hutan (+{diff:.1f} Ha)"
@@ -4465,7 +5528,7 @@ async def generate_pdf_report(request: PDFReportRequest, base_url: str = "https:
 
         # Prepare Multitemporal Map Series HTML
         html_items = []
-        for y in request.data:
+        for y in normalized_data:
             # Resolusi Path Lokal & Sinkronisasi Klasifikasi
             t_url = resolve_report_url(y.get('thumb_url'), base_url)
             
@@ -4483,16 +5546,13 @@ async def generate_pdf_report(request: PDFReportRequest, base_url: str = "https:
         map_series_html = "".join(html_items)
 
         # Generate interactive charts data strings
-        years_label_str = ",".join([f"'{y.get('year')}'" for y in request.data])
-        hprimer_data_str = ",".join([str(y.get('hutan_primer', 0)) for y in request.data])
-        hsekunder_data_str = ",".join([str(y.get('hutan_sekunder', 0)) for y in request.data])
-        tkering_data_str = ",".join([str(y.get('tanah_kering', 0)) for y in request.data])
-        tkosong_data_str = ",".join([str(y.get('tanah_kosong', 0)) for y in request.data])
-        terbangun_data_str = ",".join([str(y.get('lahan_terbangun', 0)) for y in request.data])
-        air_data_str = ",".join([str(y.get('air', 0)) for y in request.data])
-        banjir_data_str = ",".join([str(y.get('banjir_baru', 0)) for y in request.data])
-        lumpur_data_str = ",".join([str(y.get('tanah_basah', 0)) for y in request.data])
-        rusak_data_str = ",".join([str(y.get('lahan_rusak', 0)) for y in request.data])
+        years_label_str = ",".join([f"'{y.get('year')}'" for y in normalized_data])
+        hprimer_data_str = ",".join([str(y.get('hutan_primer', 0)) for y in normalized_data])
+        hsekunder_data_str = ",".join([str(y.get('hutan_sekunder', 0)) for y in normalized_data])
+        tkering_data_str = ",".join([str(y.get('tanah_kering', 0)) for y in normalized_data])
+        tkosong_data_str = ",".join([str(y.get('tanah_kosong', 0)) for y in normalized_data])
+        terbangun_data_str = ",".join([str(y.get('lahan_terbangun', 0)) for y in normalized_data])
+        air_data_str = ",".join([str(y.get('air', 0)) for y in normalized_data])
 
         # Generate HTML report
         html = f"""
@@ -4695,7 +5755,7 @@ async def generate_pdf_report(request: PDFReportRequest, base_url: str = "https:
                             <td>{y.get('lahan_terbangun', 0):,.2f}</td>
                             <td>{y.get('air', 0):,.2f}</td>
                         </tr>
-                        ''' for y in request.data]) }
+                        ''' for y in normalized_data]) }
                     </tbody>
                 </table>
             </div>
@@ -5184,6 +6244,90 @@ async def regenerate_visuals(history_id: str):
         raise HTTPException(status_code=500, detail=f"Regeneration failed: {str(e)}")
 
 
+@app.get("/health/thumbnails")
+async def check_thumbnail_health():
+    """
+    Validates thumbnail URLs accessibility.
+    Helps diagnose loading issues.
+    """
+    if not supabase:
+        return {
+            "status": "error",
+            "message": "Supabase not configured",
+            "checks": {}
+        }
+
+    try:
+        results = {
+            "supabase_bucket": "unknown",
+            "local_storage": "unknown",
+            "sample_urls": {}
+        }
+
+        # 1. Check Supabase bucket
+        try:
+            buckets = supabase.storage.list_buckets()
+            thumb_bucket = next((b for b in buckets if b.name == "thumbnails"), None)
+            if thumb_bucket:
+                results["supabase_bucket"] = "✅ exists"
+                # Try to get a public URL
+                test_url = supabase.storage.from_("thumbnails").get_public_url("test.webp")
+                results["sample_urls"]["supabase"] = test_url
+            else:
+                results["supabase_bucket"] = "❌ not found"
+        except Exception as e:
+            results["supabase_bucket"] = f"❌ error: {str(e)[:50]}"
+
+        # 2. Check local storage
+        try:
+            if os.path.exists(THUMBNAIL_DIR):
+                files = os.listdir(THUMBNAIL_DIR)
+                results["local_storage"] = f"✅ exists ({len(files)} files)"
+                if files:
+                    results["sample_urls"]["local"] = f"/storage/thumbnails/{files[0]}"
+            else:
+                results["local_storage"] = "❌ directory not found"
+        except Exception as e:
+            results["local_storage"] = f"❌ error: {str(e)[:50]}"
+
+        # 3. Validate a sample thumbnail from database
+        try:
+            res = await asyncio.to_thread(
+                lambda: supabase.table("analysis_history")
+                .select("id, analysis_results")
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                item = res.data[0]
+                analysis = item.get('analysis_results', [])
+                if analysis and analysis[0].get('thumb_url'):
+                    thumb_url = analysis[0]['thumb_url']
+                    results["sample_urls"]["database"] = thumb_url[:80] + "..." if len(thumb_url) > 80 else thumb_url
+
+                    # Test URL accessibility
+                    try:
+                        test_response = requests.head(thumb_url, timeout=5)
+                        results["sample_urls"]["database_status"] = f"HTTP {test_response.status_code}"
+                    except Exception as url_err:
+                        results["sample_urls"]["database_status"] = f"error: {str(url_err)[:40]}"
+        except Exception as e:
+            results["sample_database_check"] = f"error: {str(e)[:50]}"
+
+        return {
+            "status": "ok",
+            "checks": results
+        }
+
+    except Exception as e:
+        print(f"❌ Health check failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "checks": {}
+        }
+
+
 # ==============================================================================
 # MAIN ENTRY POINT
 # ==============================================================================
@@ -5267,90 +6411,976 @@ async def proxy_sigap(path: str, request: Request):
 
 
 # ==============================================================================
-# BMKG HOTSPOT PROXY (Bypass CORS for Frontend)
+# NASA FIRMS HOTSPOT PROXY (Fire Information for Resource Management System)
 # ==============================================================================
-class BmkgHotspotRequest(BaseModel):
-    """Request body for BMKG hotspot query."""
-    geometry: str  # ESRI JSON geometry string
-    geometryType: str = "esriGeometryPolygon"
-    spatialRel: str = "esriSpatialRelIntersects"
+class NasaFirmsRequest(BaseModel):
+    """Request body for NASA FIRMS hotspot query."""
+    bounds: dict  # {minLon, minLat, maxLon, maxLat}
+    start_date: str = None  # Format: YYYY-MM-DD (optional, for time series)
+    end_date: str = None    # Format: YYYY-MM-DD (optional, for time series)
+    source: str = "VIIRS_SNPP_NRT"  # VIIRS_SNPP_NRT, VIIRS_NOAA20_NRT, MODIS_NRT
 
-@app.post("/proxy/bmkg/hotspot")
-async def proxy_bmkg_hotspot(request: BmkgHotspotRequest):
-    """
-    Proxy endpoint to query BMKG Hotspot FeatureServer.
-    Frontend sends polygon geometry, backend forwards to BMKG and returns GeoJSON.
-    """
-    BMKG_URL = "https://datacuaca.bmkg.go.id/arcgis/rest/services/production/geohotspot/FeatureServer/0/query"
-    
+
+def generate_bbox_key(bounds: dict, year: int, source: str) -> str:
+    """Generate a unique key for bounding box + year + source combination."""
+    bbox_str = f"{bounds['minLon']:.4f},{bounds['minLat']:.4f},{bounds['maxLon']:.4f},{bounds['maxLat']:.4f}"
+    key_str = f"{bbox_str}_{year}_{source}"
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+async def save_hotspots_to_db(features: list, bbox_key: str, source: str):
+    """Save hotspot features to database."""
+    if not supabase or not features:
+        return 0
+
+    saved_count = 0
+    batch_size = 100
+
     try:
-        # --- CACHE IMPLEMENTATION ---
-        # Create unique hash based on request geometry
+        # Prepare records for upsert
+        records = []
+        for f in features:
+            props = f.get("properties", {})
+            coords = f.get("geometry", {}).get("coordinates", [0, 0])
+            acq_date = props.get("acq_date", "")
+
+            if not acq_date:
+                continue
+
+            # Extract year from acq_date
+            try:
+                year = int(acq_date.split("-")[0])
+            except:
+                year = datetime.now().year
+
+            record = {
+                "latitude": coords[1],
+                "longitude": coords[0],
+                "acq_date": acq_date,
+                "acq_time": props.get("acq_time", ""),
+                "year": year,
+                "satellite": props.get("satellite", ""),
+                "source": source,
+                "confidence": props.get("confidence", ""),
+                "brightness": props.get("brightness") or props.get("bright_ti4"),
+                "bright_ti5": props.get("bright_ti5"),
+                "frp": props.get("frp"),
+                "scan": props.get("scan"),
+                "track": props.get("track"),
+                "daynight": props.get("daynight", ""),
+                "version": props.get("version", ""),
+                "bbox_key": bbox_key
+            }
+            records.append(record)
+
+        # Batch upsert to database
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            try:
+                await asyncio.to_thread(
+                    lambda b=batch: supabase.table("nasa_firms_hotspot_cache")
+                        .upsert(b, on_conflict="latitude,longitude,acq_date,acq_time,source")
+                        .execute()
+                )
+                saved_count += len(batch)
+            except Exception as e:
+                print(f"⚠️ Batch upsert error: {e}")
+                continue
+
+        print(f"💾 Saved {saved_count}/{len(records)} hotspots to database")
+        return saved_count
+
+    except Exception as e:
+        print(f"⚠️ Error saving hotspots to DB: {e}")
+        return 0
+
+
+async def get_hotspots_from_db(bounds: dict, year: int, source: str) -> list:
+    """Query hotspots from database within bounding box and year."""
+    if not supabase:
+        return []
+
+    try:
+        # Query by bounding box and year
+        result = await asyncio.to_thread(
+            lambda: supabase.table("nasa_firms_hotspot_cache")
+                .select("*")
+                .eq("year", year)
+                .eq("source", source)
+                .gte("latitude", bounds['minLat'])
+                .lte("latitude", bounds['maxLat'])
+                .gte("longitude", bounds['minLon'])
+                .lte("longitude", bounds['maxLon'])
+                .execute()
+        )
+
+        if result.data:
+            # Convert to GeoJSON features
+            features = []
+            for row in result.data:
+                feature = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(row['longitude']), float(row['latitude'])]
+                    },
+                    "properties": {
+                        "brightness": row.get('brightness'),
+                        "scan": row.get('scan'),
+                        "track": row.get('track'),
+                        "acq_date": row.get('acq_date'),
+                        "acq_time": row.get('acq_time'),
+                        "satellite": row.get('satellite'),
+                        "confidence": row.get('confidence'),
+                        "version": row.get('version'),
+                        "bright_ti4": row.get('brightness'),
+                        "bright_ti5": row.get('bright_ti5'),
+                        "frp": row.get('frp'),
+                        "daynight": row.get('daynight'),
+                        "from_cache": True
+                    }
+                }
+                features.append(feature)
+
+            print(f"📦 Found {len(features)} hotspots in database for year {year}")
+            return features
+
+        return []
+
+    except Exception as e:
+        print(f"⚠️ Error querying hotspots from DB: {e}")
+        return []
+
+
+async def save_hotspots_for_analysis(history_id: str, geo_data: dict, years: list):
+    """
+    Fetch and save hotspot data for a specific analysis history.
+    This populates the analysis_hotspots table for KPS views.
+    """
+    if not supabase or not geo_data:
+        return 0
+
+    try:
+        # Extract bounding box from GeoJSON
+        geometry = geo_data.get("features", [{}])[0].get("geometry", {})
+        if not geometry:
+            return 0
+
+        all_coords = []
+        if geometry.get("type") == "Polygon":
+            all_coords = geometry.get("coordinates", [[]])[0]
+        elif geometry.get("type") == "MultiPolygon":
+            for poly in geometry.get("coordinates", []):
+                all_coords.extend(poly[0] if poly else [])
+
+        if not all_coords:
+            return 0
+
+        lngs = [c[0] for c in all_coords]
+        lats = [c[1] for c in all_coords]
+        bounds = {
+            "minLon": min(lngs),
+            "minLat": min(lats),
+            "maxLon": max(lngs),
+            "maxLat": max(lats)
+        }
+
+        total_saved = 0
+        NASA_MAP_KEY = os.getenv("NASA_FIRMS_MAP_KEY", "")
+
+        for year in years:
+            start_date = f"{year}-01-01"
+            end_date = f"{year}-12-31"
+            bbox = f"{bounds['minLon']},{bounds['minLat']},{bounds['maxLon']},{bounds['maxLat']}"
+
+            base_url = "https://firms.modaps.eosdis.nasa.gov/api/area"
+            source = "VIIRS_SNPP_NRT"
+
+            if NASA_MAP_KEY:
+                url = f"{base_url}/csv/{NASA_MAP_KEY}/{source}/{bbox}/{start_date},{end_date}"
+            else:
+                url = f"{base_url}/csv/public/{source}/{bbox}/10"  # Limited without API key
+
+            try:
+                resp = requests.get(url, timeout=60)
+                if resp.status_code == 200:
+                    import csv
+                    from io import StringIO
+
+                    csv_reader = csv.DictReader(StringIO(resp.text))
+                    records = []
+
+                    for row in csv_reader:
+                        try:
+                            lat = float(row['latitude'])
+                            lng = float(row['longitude'])
+
+                            # Check if point is inside polygon (simple bbox for now)
+                            if not (bounds['minLat'] <= lat <= bounds['maxLat'] and
+                                    bounds['minLon'] <= lng <= bounds['maxLon']):
+                                continue
+
+                            # Map confidence to level
+                            conf = row.get('confidence', '').lower()
+                            conf_level = conf if conf in ['low', 'nominal', 'high'] else None
+
+                            record = {
+                                "history_id": history_id,
+                                "year": year,
+                                "latitude": lat,
+                                "longitude": lng,
+                                "acq_date": row.get('acq_date', ''),
+                                "confidence": int(float(row.get('confidence', 0))) if row.get('confidence', '').isdigit() else None,
+                                "confidence_level": conf_level,
+                                "brightness": float(row.get('bright_ti4', row.get('brightness', 0)) or 0),
+                                "frp": float(row.get('frp', 0) or 0),
+                                "source": "NASA_FIRMS"
+                            }
+                            records.append(record)
+                        except:
+                            continue
+
+                    # Batch insert
+                    if records:
+                        await asyncio.to_thread(
+                            lambda r=records: supabase.table("analysis_hotspots")
+                                .insert(r)
+                                .execute()
+                        )
+                        total_saved += len(records)
+                        print(f"🔥 Saved {len(records)} hotspots for history {history_id[:8]} year {year}")
+
+            except Exception as e:
+                print(f"⚠️ Error fetching hotspots for year {year}: {e}")
+                continue
+
+        # Update hotspot_count in analysis_history
+        if total_saved > 0:
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_history")
+                    .update({"hotspot_count": total_saved})
+                    .eq("id", history_id)
+                    .execute()
+            )
+
+        return total_saved
+
+    except Exception as e:
+        print(f"⚠️ Error in save_hotspots_for_analysis: {e}")
+        return 0
+
+
+# ==============================================================================
+# SLOPE ANALYSIS - Klasifikasi Kemiringan Lereng
+# ==============================================================================
+
+def calculate_slope_statistics(ee_geometry, scale: int = 30):
+    """
+    Menghitung statistik kemiringan lereng menggunakan NASA DEM.
+
+    Klasifikasi KLHK:
+    - Datar: 0-8%
+    - Landai: 8-15%
+    - Agak Curam: 15-25%
+    - Curam: 25-45%
+    - Sangat Curam: >45%
+
+    Returns dict dengan avg_slope dan luas tiap kelas dalam hektar.
+    """
+    try:
+        # Load NASA DEM dan hitung slope dalam derajat
+        dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation')
+        slope_deg = ee.Terrain.slope(dem).clip(ee_geometry)
+
+        # Konversi derajat ke persen: tan(slope_deg) * 100
+        slope_pct = slope_deg.multiply(math.pi / 180).tan().multiply(100)
+
+        # Hitung rata-rata slope
+        avg_slope_result = slope_pct.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=ee_geometry,
+            scale=scale,
+            maxPixels=1e9
+        ).getInfo()
+        avg_slope = avg_slope_result.get('slope', 0) or 0
+
+        # Pixel area dalam meter persegi
+        pixel_area = ee.Image.pixelArea()
+
+        # Klasifikasi slope (KLHK Standard)
+        slope_0_8 = slope_pct.lt(8)
+        slope_8_15 = slope_pct.gte(8).And(slope_pct.lt(15))
+        slope_15_25 = slope_pct.gte(15).And(slope_pct.lt(25))
+        slope_25_45 = slope_pct.gte(25).And(slope_pct.lt(45))
+        slope_above_45 = slope_pct.gte(45)
+
+        # Hitung luas tiap kelas (dalam hektar)
+        def calc_area_ha(mask):
+            area_m2 = mask.multiply(pixel_area).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=ee_geometry,
+                scale=scale,
+                maxPixels=1e9
+            ).getInfo()
+            # Konversi m² ke hektar
+            return round((area_m2.get('slope', 0) or 0) / 10000, 2)
+
+        # Note: DB columns are slope_25_40/slope_above_40 but data uses KLHK thresholds (25-45%, >45%)
+        return {
+            'avg_slope': round(avg_slope, 2),
+            'slope_0_8': calc_area_ha(slope_0_8),
+            'slope_8_15': calc_area_ha(slope_8_15),
+            'slope_15_25': calc_area_ha(slope_15_25),
+            'slope_25_40': calc_area_ha(slope_25_45),      # KLHK: Curam 25-45%
+            'slope_above_40': calc_area_ha(slope_above_45) # KLHK: Sangat Curam >45%
+        }
+
+    except Exception as e:
+        print(f"⚠️ Error calculating slope statistics: {e}")
+        return None
+
+
+async def save_slope_analysis(history_id: str, geo_data: dict):
+    """
+    Menghitung dan menyimpan analisis slope untuk area INSIDE dan OUTSIDE 2km buffer.
+    Disimpan ke tabel analysis_slope_summary.
+    """
+    if not supabase or not geo_data:
+        return False
+
+    try:
+        # Extract geometry dari GeoJSON
+        geometry = geo_data.get("features", [{}])[0].get("geometry", {})
+        if not geometry:
+            geometry = geo_data.get("geometry", {})
+        if not geometry:
+            print(f"⚠️ No geometry found for slope analysis")
+            return False
+
+        # Konversi ke EE Geometry
+        ee_geometry = geojson_to_ee_geometry({"type": "Feature", "geometry": geometry})
+
+        # === 1. Hitung untuk INSIDE ===
+        print(f"📐 Calculating slope statistics for INSIDE area...")
+        inside_stats = await asyncio.to_thread(
+            lambda: calculate_slope_statistics(ee_geometry)
+        )
+
+        if inside_stats:
+            inside_record = {
+                "history_id": history_id,
+                "scope": "INSIDE",
+                **inside_stats
+            }
+
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_slope_summary")
+                    .upsert(inside_record, on_conflict="history_id,scope")
+                    .execute()
+            )
+            print(f"✅ Saved INSIDE slope analysis: avg={inside_stats['avg_slope']}%")
+
+        # === 2. Hitung untuk OUTSIDE 2km buffer ===
+        print(f"📐 Calculating slope statistics for OUTSIDE 2km buffer...")
+        # Buat buffer 2km dan subtract geometry asli
+        buffer_2km = ee_geometry.buffer(2000)  # 2000 meters = 2km
+        outside_geometry = buffer_2km.difference(ee_geometry)
+
+        outside_stats = await asyncio.to_thread(
+            lambda: calculate_slope_statistics(outside_geometry)
+        )
+
+        if outside_stats:
+            outside_record = {
+                "history_id": history_id,
+                "scope": "OUTSIDE_2KM",
+                **outside_stats
+            }
+
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_slope_summary")
+                    .upsert(outside_record, on_conflict="history_id,scope")
+                    .execute()
+            )
+            print(f"✅ Saved OUTSIDE_2KM slope analysis: avg={outside_stats['avg_slope']}%")
+
+        # === 3. Generate Visual Map URL (Fixed Opacity: 100% Inside, 70% Outside) ===
+        try:
+            print(f"🎨 Generating Slope Map Visual URL...")
+
+            # Load DEM and Calculate Slope
+            dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation')
+            slope_deg = ee.Terrain.slope(dem)
+            slope_pct = slope_deg.multiply(math.pi / 180).tan().multiply(100)
+
+            # Palette (KLHK Standard)
+            # 0-8 (Green), 8-15 (Light Green), 15-25 (Yellow), 25-45 (Orange), >45 (Red)
+            palette = ['00FF00', '80FF00', 'FFFF00', 'FFA500', 'FF0000', '8B0000']
+
+            # Combine Masks into a single Alpha Channel
+            # Inside Area = 100% Opacity, Outside 2km Buffer = 70% Opacity
+            # Start with 0 opacity everywhere
+            alpha_channel = ee.Image(0).float()
+            # Paint outside with 0.7
+            alpha_channel = alpha_channel.where(ee.Image(1).clip(buffer_2km), 0.7)
+            # Paint inside with 1.0 (overwriting the buffer/overlap)
+            alpha_channel = alpha_channel.where(ee.Image(1).clip(ee_geometry), 1.0)
+
+            # Apply mask to slope (keep as single-band)
+            slope_masked = slope_pct.updateMask(alpha_channel).clip(buffer_2km)
+
+            # Visualize with palette (only at final step)
+            vis_params = {
+                'min': 0,
+                'max': 100,
+                'palette': palette
+            }
+
+            # Generate URL using getMapId directly
+            map_id = await asyncio.to_thread(lambda: slope_masked.getMapId(vis_params))
+            map_url = map_id['tile_fetcher'].url_format
+            
+            # Save URL to history metadata or slope table
+            # Since analysis_slope_summary is strictly stats, we might save this in analysis_history metadata
+            # Or add a column. For now, let's update analysis_history metadata as it's the easiest place for visual URLs
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_history")
+                    .update({"slope_map_url": map_url})
+                    .eq("id", history_id)
+                    .execute()
+            )
+            print(f"✅ Slope Map URL generated: {map_url}")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to generate slope map URL: {e}")
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Error in save_slope_analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+@app.post("/history/{history_id}/analyze-slope")
+async def analyze_slope_for_history(history_id: str, background_tasks: BackgroundTasks):
+    """
+    Menghitung dan menyimpan analisis slope untuk history yang sudah ada.
+    Berguna untuk backfill data lama yang belum memiliki analisis slope.
+
+    Output disimpan ke tabel analysis_slope_summary dengan klasifikasi:
+    - Datar (<8%)
+    - Landai (8-15%)
+    - Agak Curam (15-25%)
+    - Curam (25-40%)
+    - Sangat Curam (>40%)
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        # Get history data dengan geo_data
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+                .select("id, geo_data, lahan_id")
+                .eq("id", history_id)
+                .single()
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="History not found")
+
+        history = result.data
+        geo_data = history.get("geo_data")
+
+        # Jika geo_data tidak ada di history, coba ambil dari master_lahan
+        if not geo_data and history.get("lahan_id"):
+            lahan_result = await asyncio.to_thread(
+                lambda: supabase.table("master_lahan")
+                    .select("geojson")
+                    .eq("id", history.get("lahan_id"))
+                    .single()
+                    .execute()
+            )
+            if lahan_result.data:
+                geo_data = lahan_result.data.get("geojson")
+
+        if not geo_data:
+            raise HTTPException(status_code=400, detail="No geometry data found for this history")
+
+        # Schedule slope analysis in background
+        background_tasks.add_task(save_slope_analysis, history_id, geo_data)
+
+        return {
+            "status": "success",
+            "message": f"Slope analysis scheduled for history {history_id[:8]}...",
+            "history_id": history_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error scheduling slope analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to schedule slope analysis: {str(e)}")
+
+
+@app.get("/history/{history_id}/slope")
+async def get_slope_analysis(history_id: str):
+    """
+    Mengambil hasil analisis slope untuk history tertentu.
+
+    Returns:
+    - INSIDE: Statistik slope di dalam batas geometri
+    - OUTSIDE_2KM: Statistik slope di buffer 2km luar geometri
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_slope_summary")
+                .select("*")
+                .eq("history_id", history_id)
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Slope analysis not found for this history")
+
+        # Format response (KLHK Standard: 25-45%, >45%)
+        slope_data = {}
+        for record in result.data:
+            scope = record.get("scope", "UNKNOWN")
+            slope_data[scope] = {
+                "avg_slope": record.get("avg_slope"),
+                "klasifikasi": {
+                    "datar_0_8": record.get("slope_0_8"),
+                    "landai_8_15": record.get("slope_8_15"),
+                    "agak_curam_15_25": record.get("slope_15_25"),
+                    "curam_25_45": record.get("slope_25_40"),        # DB: slope_25_40, KLHK: 25-45%
+                    "sangat_curam_45_plus": record.get("slope_above_40") # DB: slope_above_40, KLHK: >45%
+                },
+                "created_at": record.get("created_at")
+            }
+
+        return {
+            "status": "success",
+            "history_id": history_id,
+            "slope_analysis": slope_data
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching slope analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch slope analysis: {str(e)}")
+
+
+@app.post("/history/{history_id}/calculate-temporal-status")
+async def calculate_temporal_status_for_history(history_id: str, background_tasks: BackgroundTasks):
+    """
+    Calculate and update temporal status (grey area detection) for all years in a history.
+
+    This endpoint:
+    1. Calculates dominant_class for each year (from 6 IPSDH classes)
+    2. Determines temporal_status based on year-to-year comparison:
+       - stable: No change from previous year
+       - transition_unconfirmed: Changed once (grey area)
+       - transition_confirmed: Change persisted 2+ years
+       - reverted_noise: Changed but reverted back
+
+    Useful for:
+    - Backfilling existing data with temporal status
+    - Recalculating after data corrections
+    - Manual trigger for grey area analysis
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        # Verify history exists
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+                .select("id")
+                .eq("id", history_id)
+                .single()
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="History not found")
+
+        # Schedule temporal status calculation in background
+        background_tasks.add_task(update_temporal_status_for_history, history_id)
+
+        return {
+            "status": "success",
+            "message": f"Temporal status calculation scheduled for history {history_id[:8]}...",
+            "history_id": history_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error scheduling temporal status calculation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to schedule calculation: {str(e)}")
+
+
+@app.get("/history/{history_id}/temporal-status")
+async def get_temporal_status(history_id: str):
+    """
+    Get temporal status analysis for all years in a history.
+
+    Returns:
+    - Year-by-year breakdown with dominant_class and temporal_status
+    - Summary statistics (count by status)
+    - Grey area years (transition_unconfirmed)
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_yearly_data")
+                .select("year, dominant_class, temporal_status, hutan_primer, hutan_sekunder, tanah_kering, tanah_kosong, lahan_terbangun, air")
+                .eq("history_id", history_id)
+                .order("year")
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No yearly data found for this history")
+
+        yearly_data = result.data
+
+        # Calculate summary statistics
+        status_counts = {
+            "stable": 0,
+            "transition_unconfirmed": 0,
+            "transition_confirmed": 0,
+            "reverted_noise": 0
+        }
+
+        grey_area_years = []
+
+        for year_record in yearly_data:
+            status = year_record.get("temporal_status", "stable")
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+            if status == "transition_unconfirmed":
+                grey_area_years.append({
+                    "year": year_record.get("year"),
+                    "dominant_class": year_record.get("dominant_class")
+                })
+
+        return {
+            "status": "success",
+            "history_id": history_id,
+            "yearly_data": yearly_data,
+            "summary": {
+                "total_years": len(yearly_data),
+                "status_counts": status_counts,
+                "grey_area_years": grey_area_years
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching temporal status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch temporal status: {str(e)}")
+
+
+@app.post("/history/{history_id}/populate-hotspots")
+async def populate_hotspots_for_history(history_id: str, background_tasks: BackgroundTasks):
+    """
+    Populate hotspot data for a specific analysis history.
+    Fetches NASA FIRMS data for all years in the analysis and saves to analysis_hotspots table.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        # Get history data
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+                .select("id, geo_data, analysis_results")
+                .eq("id", history_id)
+                .single()
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="History not found")
+
+        history = result.data
+        geo_data = history.get("geo_data")
+        analysis_results = history.get("analysis_results", [])
+
+        # Extract years from analysis_results
+        years = [item.get("year") for item in analysis_results if item.get("year")]
+        if not years:
+            years = list(range(2019, datetime.now().year + 1))
+
+        # Run in background
+        background_tasks.add_task(save_hotspots_for_analysis, history_id, geo_data, years)
+
+        return {
+            "status": "started",
+            "message": f"Populating hotspots for {len(years)} years",
+            "years": years
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/proxy/nasa/hotspot")
+async def proxy_nasa_hotspot(request: NasaFirmsRequest):
+    """
+    Proxy endpoint to query NASA FIRMS Hotspot data.
+    Supports time series queries from January 1 to December 31 for any year.
+    Data is cached in database for faster subsequent queries.
+    Returns GeoJSON format.
+    """
+    NASA_MAP_KEY = os.getenv("NASA_FIRMS_MAP_KEY", "")
+    bounds = request.bounds
+
+    if not NASA_MAP_KEY:
+        print("⚠️ NASA_FIRMS_MAP_KEY not set. Using public access (limited to 10 days).")
+
+    try:
+        # Determine year from date range
+        target_year = datetime.now().year
+        if request.start_date:
+            try:
+                target_year = int(request.start_date.split("-")[0])
+            except:
+                pass
+
+        # Generate cache key for this bbox + year + source
+        bbox_key = generate_bbox_key(bounds, target_year, request.source)
+
+        # --- STEP 1: Try to get from Database first ---
+        if supabase and request.start_date and request.end_date:
+            db_features = await get_hotspots_from_db(bounds, target_year, request.source)
+
+            if db_features:
+                print(f"🚀 NASA FIRMS DB HIT: {len(db_features)} hotspots for {target_year}")
+                return {
+                    "type": "FeatureCollection",
+                    "features": db_features,
+                    "source": "database",
+                    "year": target_year
+                }
+
+        # --- STEP 2: Check file cache ---
         req_dump = json.dumps(request.dict(), sort_keys=True)
         req_hash = hashlib.md5(req_dump.encode()).hexdigest()
-        cache_key = f"bmkg_hotspot_{req_hash}"
-        
-        # 1. Check Cache
+        cache_key = f"nasa_firms_{req_hash}"
+
         cached_data = get_cached(cache_key)
         if cached_data:
-            print(f"🚀 BMKG Proxy HIT: {cache_key}")
+            print(f"🚀 NASA FIRMS File Cache HIT: {cache_key}")
             return cached_data
-            
-        print(f"🔄 BMKG Proxy MISS: Fetching upstream...")
-        print(f"   Shape: {request.geometry[:100]}...")
-        
-        params = {
-            "geometry": request.geometry,
-            "geometryType": request.geometryType,
-            "spatialRel": request.spatialRel,
-            "inSR": "4326",
-            "outFields": "*",
-            "outSR": "4326",
-            "f": "geojson"
-        }
-        
-        def fetch_bmkg():
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json, */*",
-                "Referer": "https://datacuaca.bmkg.go.id/"
-            }
+
+        # --- STEP 3: Fetch from NASA FIRMS API ---
+        print(f"🔄 NASA FIRMS: Fetching from NASA API for {target_year}...")
+
+        bbox = f"{bounds['minLon']},{bounds['minLat']},{bounds['maxLon']},{bounds['maxLat']}"
+
+        if request.start_date and request.end_date:
+            date_param = f"{request.start_date},{request.end_date}"
+            print(f"📅 Time Series Query: {date_param}")
+        else:
+            date_param = "10"
+            print(f"📅 Default Query: Last {date_param} days")
+
+        base_url = "https://firms.modaps.eosdis.nasa.gov/api/area"
+
+        if NASA_MAP_KEY:
+            url = f"{base_url}/csv/{NASA_MAP_KEY}/{request.source}/{bbox}/{date_param}"
+        else:
+            url = f"{base_url}/csv/public/{request.source}/{bbox}/{date_param}"
+
+        def fetch_nasa_firms():
             try:
-                # Use POST to handle large geometries (ArcGIS supports POST for /query)
-                resp = requests.post(BMKG_URL, data=params, headers=headers, timeout=30, verify=False)
-                print(f"🔥 BMKG Response Status (POST): {resp.status_code}")
-                
+                print(f"🔥 Fetching: {url}")
+                resp = requests.get(url, timeout=60)
+                print(f"🔥 NASA FIRMS Response Status: {resp.status_code}")
+
                 if resp.status_code == 200:
-                    try:
-                        return resp.json()
-                    except:
-                        # Sometimes ArcGIS returns HTML error even with 200
-                        print(f"❌ BMKG: Invalid JSON response: {resp.text[:300]}")
-                        return {"type": "FeatureCollection", "features": []}
+                    import csv
+                    from io import StringIO
+
+                    features = []
+                    csv_reader = csv.DictReader(StringIO(resp.text))
+
+                    for row in csv_reader:
+                        try:
+                            feature = {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [float(row['longitude']), float(row['latitude'])]
+                                },
+                                "properties": {
+                                    "brightness": float(row.get('bright_ti4', row.get('brightness', 0)) or 0),
+                                    "scan": float(row.get('scan', 0) or 0),
+                                    "track": float(row.get('track', 0) or 0),
+                                    "acq_date": row.get('acq_date', ''),
+                                    "acq_time": row.get('acq_time', ''),
+                                    "satellite": row.get('satellite', ''),
+                                    "confidence": row.get('confidence', ''),
+                                    "version": row.get('version', ''),
+                                    "bright_ti4": float(row.get('bright_ti4', row.get('brightness', 0)) or 0),
+                                    "bright_ti5": float(row.get('bright_ti5', 0) or 0) if row.get('bright_ti5') else None,
+                                    "frp": float(row.get('frp', 0) or 0),
+                                    "daynight": row.get('daynight', '')
+                                }
+                            }
+                            features.append(feature)
+                        except Exception as parse_err:
+                            print(f"⚠️ Parse error for row: {parse_err}")
+                            continue
+
+                    print(f"✅ Parsed {len(features)} hotspot features from NASA FIRMS")
+                    return {
+                        "type": "FeatureCollection",
+                        "features": features
+                    }
                 else:
-                    print(f"❌ BMKG API Error {resp.status_code}: {resp.text[:300]}")
+                    print(f"❌ NASA FIRMS API Error {resp.status_code}: {resp.text[:300]}")
                     return {"type": "FeatureCollection", "features": []}
             except Exception as e:
-                print(f"❌ BMKG Fetch Error: {e}")
+                print(f"❌ NASA FIRMS Fetch Error: {e}")
+                import traceback
+                traceback.print_exc()
                 return {"type": "FeatureCollection", "features": []}
-        
-        result = await asyncio.to_thread(fetch_bmkg)
-        
+
+        result = await asyncio.to_thread(fetch_nasa_firms)
+
         feature_count = len(result.get("features", []))
-        print(f"🔥 BMKG Proxy: Returning {feature_count} hotspot features")
-        
-        # 2. Save to Cache (Expire 1 hour = 3600s)
-        # Only cache if we got a valid JSON response (even if empty features)
+        print(f"🔥 NASA FIRMS Proxy: Returning {feature_count} hotspot features")
+
+        # --- STEP 4: Save to Database (for time series queries) ---
+        if supabase and request.start_date and feature_count > 0:
+            asyncio.create_task(save_hotspots_to_db(result["features"], bbox_key, request.source))
+
+        # --- STEP 5: Save to File Cache ---
+        cache_expire = 86400 if request.start_date else 3600
         if result and "features" in result:
-             cache_file(cache_key, result, expire=3600)
-        
+            cache_file(cache_key, result, expire=cache_expire)
+
+        result["source"] = "nasa_api"
+        result["year"] = target_year
         return result
-        
+
     except Exception as e:
-        print(f"⚠️ BMKG Proxy Error: {e}")
-        # Return empty collection on any error
+        print(f"⚠️ NASA FIRMS Proxy Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {"type": "FeatureCollection", "features": []}
+
+
+@app.get("/hotspot/stats")
+async def get_hotspot_stats():
+    """
+    Get hotspot statistics from database cache.
+    Returns yearly counts and confidence breakdown.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        # Get total count
+        total_result = await asyncio.to_thread(
+            lambda: supabase.table("nasa_firms_hotspot_cache")
+                .select("id", count="exact")
+                .execute()
+        )
+
+        # Get yearly stats using raw query via RPC or manual aggregation
+        years_result = await asyncio.to_thread(
+            lambda: supabase.table("nasa_firms_hotspot_cache")
+                .select("year, confidence")
+                .execute()
+        )
+
+        # Aggregate in Python
+        yearly_stats = {}
+        confidence_stats = {"high": 0, "nominal": 0, "low": 0}
+
+        if years_result.data:
+            for row in years_result.data:
+                year = row.get("year")
+                conf = row.get("confidence", "").lower()
+
+                if year:
+                    if year not in yearly_stats:
+                        yearly_stats[year] = {"total": 0, "high": 0, "nominal": 0, "low": 0}
+                    yearly_stats[year]["total"] += 1
+
+                    if conf in ["high", "nominal", "low"]:
+                        yearly_stats[year][conf] += 1
+                        confidence_stats[conf] += 1
+
+        return {
+            "total_cached": total_result.count or 0,
+            "yearly_breakdown": dict(sorted(yearly_stats.items(), reverse=True)),
+            "confidence_summary": confidence_stats,
+            "source": "nasa_firms_hotspot_cache"
+        }
+
+    except Exception as e:
+        print(f"⚠️ Hotspot stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/hotspot/cache")
+async def clear_hotspot_cache(year: int = None):
+    """
+    Clear hotspot cache from database.
+    If year is provided, only clear that year. Otherwise clear all.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        if year:
+            result = await asyncio.to_thread(
+                lambda: supabase.table("nasa_firms_hotspot_cache")
+                    .delete()
+                    .eq("year", year)
+                    .execute()
+            )
+            message = f"Cleared hotspot cache for year {year}"
+        else:
+            result = await asyncio.to_thread(
+                lambda: supabase.table("nasa_firms_hotspot_cache")
+                    .delete()
+                    .neq("id", "00000000-0000-0000-0000-000000000000")  # Delete all
+                    .execute()
+            )
+            message = "Cleared all hotspot cache"
+
+        deleted_count = len(result.data) if result.data else 0
+        print(f"🗑️ {message}: {deleted_count} records")
+
+        return {
+            "success": True,
+            "message": message,
+            "deleted_count": deleted_count
+        }
+
+    except Exception as e:
+        print(f"⚠️ Clear cache error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/history/{history_id}/export-excel")
@@ -5375,21 +7405,21 @@ async def export_excel_history(history_id: str):
             raise HTTPException(status_code=404, detail="Data tidak ditemukan")
             
         data = res.data
-        results = data.get('analysis_results', [])
+        results = normalize_analysis_results(data.get('analysis_results', []))
         raw_filename = data.get('filename', 'analysis').replace('.shp', '').replace('.zip', '').replace('.geojson', '')
-        
+
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
         import io
-        
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Analisis Tutupan Lahan"
-        
-        # Header
-        headers = ['Tahun', 'H.Primer (Ha)', 'H.Sekunder (Ha)', 'Hutan Total (Ha)', 'Tanah Kering (Ha)', 'Tanah Terbuka (Ha)', 'Lahan Terbangun (Ha)', 'Badan Air (Ha)', 'Banjir (Ha)', 'Lumpur (Ha)', 'Lahan Rusak (Ha)', 'Total (Ha)']
+
+        # Header - HANYA 6 kelas IPSDH final
+        headers = ['Tahun', 'Hutan Primer (Ha)', 'Hutan Sekunder (Ha)', 'Tanah Lahan Kering (Ha)', 'Tanah Kosong/Terbuka (Ha)', 'Lahan Terbangun (Ha)', 'Air/Badan Air (Ha)', 'Total Area (Ha)']
         ws.append(headers)
-        
+
         # Style Header
         header_fill = PatternFill(start_color="10b981", end_color="10b981", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF")
@@ -5397,33 +7427,25 @@ async def export_excel_history(history_id: str):
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
-            
-        # Rows
+
+        # Rows - HANYA 6 kelas IPSDH final
         for r in results:
             hp = r.get('hutan_primer', 0)
             hs = r.get('hutan_sekunder', 0)
-            ht = r.get('hutan', 0)
             tk = r.get('tanah_kering', 0)
             tt = r.get('tanah_kosong', 0)
             lt = r.get('lahan_terbangun', 0)
             a = r.get('air', 0)
-            bj = r.get('banjir_baru', 0)
-            lm = r.get('tanah_basah', 0)
-            lr = r.get('lahan_rusak', 0)
-            total = hp + hs + tk + tt + lt + a + bj + lm + lr
-            
+            total = hp + hs + tk + tt + lt + a
+
             ws.append([
                 r.get('year'),
                 round(hp, 2),
                 round(hs, 2),
-                round(ht, 2),
                 round(tk, 2),
                 round(tt, 2),
                 round(lt, 2),
                 round(a, 2),
-                round(bj, 2),
-                round(lm, 2),
-                round(lr, 2),
                 round(total, 2)
             ])
             
@@ -5477,7 +7499,7 @@ async def export_excel_direct(request: Request):
         ws.title = "Analisis Tutupan Lahan"
         
         # Header
-        headers = ['Tahun', 'H.Primer (Ha)', 'H.Sekunder (Ha)', 'Hutan Total (Ha)', 'Tanah Kering (Ha)', 'Tanah Terbuka (Ha)', 'Lahan Terbangun (Ha)', 'Badan Air (Ha)', 'Banjir (Ha)', 'Lumpur (Ha)', 'Lahan Rusak (Ha)', 'Total (Ha)']
+        headers = ['Tahun', 'H.Primer (Ha)', 'H.Sekunder (Ha)', 'Hutan Total (Ha)', 'Tanah Kering (Ha)', 'Tanah Terbuka (Ha)', 'Lahan Terbangun (Ha)', 'Badan Air (Ha)', 'Lumpur (Ha)', 'Lahan Rusak (Ha)', 'Total (Ha)']
         ws.append(headers)
         
         # Style Header
@@ -5497,10 +7519,9 @@ async def export_excel_direct(request: Request):
             tt = r.get('tanah_kosong', 0)
             lt = r.get('lahan_terbangun', 0)
             a = r.get('air', 0)
-            bj = r.get('banjir_baru', 0)
             lm = r.get('tanah_basah', 0)
             lr = r.get('lahan_rusak', 0)
-            total = hp + hs + tk + tt + lt + a + bj + lm + lr
+            total = hp + hs + tk + tt + lt + a + lm + lr
             
             ws.append([
                 r.get('year'),
@@ -5511,7 +7532,6 @@ async def export_excel_direct(request: Request):
                 round(tt, 2),
                 round(lt, 2),
                 round(a, 2),
-                round(bj, 2),
                 round(lm, 2),
                 round(lr, 2),
                 round(total, 2)
@@ -5586,6 +7606,61 @@ async def worker_bulk_regenerate():
         print("✅ Bulk Regeneration Worker Completed.")
     except Exception as e:
         print(f"❌ Worker Failed: {e}")
+
+@app.get("/admin/migration/temporal-status")
+async def get_migration_instructions():
+    """
+    Get migration SQL for temporal_status implementation.
+    Use this to check schema and get instructions for applying the migration.
+    """
+    try:
+        migration_file = os.path.join(os.path.dirname(__file__), "supabase_migration_temporal_status.sql")
+
+        if not os.path.exists(migration_file):
+            return {
+                "status": "error",
+                "message": "Migration file not found"
+            }
+
+        with open(migration_file, "r") as f:
+            migration_sql = f.read()
+
+        # Check if columns already exist
+        if supabase:
+            try:
+                await asyncio.to_thread(
+                    lambda: supabase.table("analysis_yearly_data")
+                        .select("temporal_status, dominant_class")
+                        .limit(1)
+                        .execute()
+                )
+                columns_exist = True
+            except:
+                columns_exist = False
+        else:
+            columns_exist = False
+
+        return {
+            "status": "success",
+            "columns_exist": columns_exist,
+            "migration_sql": migration_sql,
+            "instructions": [
+                "1. Go to https://app.supabase.com",
+                "2. Select your project",
+                "3. Click 'SQL Editor' on the left menu",
+                "4. Click 'New query'",
+                "5. Copy-paste the migration_sql from this response",
+                "6. Click 'Run'",
+                "7. Once done, temporal_status endpoints will work"
+            ]
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error: {e}"
+        }
+
 
 @app.post("/admin/regenerate-all-thumbnails")
 async def admin_regenerate_all(background_tasks: BackgroundTasks):
@@ -5664,6 +7739,73 @@ async def self_healing_daemon():
         except Exception as e:
             print(f"❌ Self-Healing Crashed: {e}. Restarting in 1 min...")
             await asyncio.sleep(60)
+
+@app.post("/map/slope")
+async def get_slope_mapid(request: Request):
+    """
+    Generate GEE MapID for Slope layer based on geometry.
+    Palette uses standard Indonesian color ranking for slope.
+    """
+    if not ee_initialized:
+        raise HTTPException(status_code=503, detail="GEE not initialized")
+    
+    try:
+        body = await request.json()
+        geo_data = body.get("geo_data")
+        history_id = body.get("history_id")
+
+        # Prioritize GeoData, fallback to History DB
+        if not geo_data and history_id and supabase:
+            h_res = await asyncio.to_thread(lambda: supabase.table("analysis_history").select("geo_data").eq("id", history_id).execute())
+            if h_res and h_res.data:
+                geo_data = h_res.data[0].get("geo_data")
+
+        if not geo_data:
+            raise HTTPException(status_code=400, detail="Missing geo_data or history_id")
+            
+        geometry = geo_data.get("features", [{}])[0].get("geometry", {})
+        if not geometry:
+            geometry = geo_data.get("geometry", {})
+            
+        ee_geometry = geojson_to_ee_geometry({"type": "Feature", "geometry": geometry})
+        
+        # Get DEM and calculate Slope
+        dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation').clip(ee_geometry)
+        slope = ee.Terrain.slope(dem)
+        
+        # Visualize Slope in Degrees (0 - 45+)
+        # Palette: Green (0-8), Yellow (8-15), Orange (15-25), Red (25-45), Dark Red (>45)
+        viz_params = {
+            'min': 0,
+            'max': 60,
+            'palette': [
+                '#31a354', # 0-8 (Datar)
+                '#addd8e', # 8-15 (Landai)
+                '#fee391', # 15-25 (Agak Curam)
+                '#fec44f', # 25-40 (Curam)
+                '#ec7014', # 40-60 (Sangat Curam)
+                '#662506'  # > 60 (Ekstrem)
+            ]
+        }
+        
+        map_id_dict = slope.getMapId(viz_params)
+        
+        # Optional: Fetch summary from DB if history_id provided
+        db_summary = None
+        if history_id and supabase:
+            s_res = await asyncio.to_thread(lambda: supabase.table("analysis_slope_summary").select("*").eq("history_id", history_id).execute())
+            if s_res and s_res.data:
+                db_summary = s_res.data
+
+        return {
+            "status": "success",
+            "map_url": map_id_dict['tile_fetcher'].url_format,
+            "db_summary": db_summary
+        }
+    except Exception as e:
+        print(f"❌ Map Slope Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
