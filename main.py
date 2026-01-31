@@ -668,18 +668,25 @@ async def update_temporal_status_for_history(history_id: str) -> bool:
 
             updates.append({
                 "id": year_data["id"],
-                "history_id": year_data["history_id"],  # ✅ INCLUDE history_id to prevent null constraint violation
+                "history_id": year_data["history_id"],  # ✅ Preserve required fields
+                "year": year_data["year"],              # ✅ Preserve year (NOT NULL)
                 "dominant_class": dominant_class,
                 "temporal_status": temporal_status
             })
 
-        # 3. Batch update semua records
+        # 3. Update records individually (UPDATE only modifies specified columns)
         if updates:
-            await asyncio.to_thread(
-                lambda: supabase.table("analysis_yearly_data")
-                    .upsert(updates, on_conflict="id")
-                    .execute()
-            )
+            for update_data in updates:
+                rid = update_data["id"]
+                dom = update_data["dominant_class"]
+                ts = update_data["temporal_status"]
+                await asyncio.to_thread(
+                    lambda r=rid, d=dom, t=ts:
+                        supabase.table("analysis_yearly_data")
+                            .update({"dominant_class": d, "temporal_status": t})
+                            .eq("id", r)
+                            .execute()
+                )
 
             # Count status
             status_counts = {}
