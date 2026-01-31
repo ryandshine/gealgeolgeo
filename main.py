@@ -34,6 +34,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 import pathlib
 
+from pkps_sync import run_sync_process
+
 from dotenv import load_dotenv
 import requests
 from supabase import create_client, Client
@@ -792,6 +794,24 @@ async def startup_event():
     """Inisialisasi GEE dan cek kesehatan database saat aplikasi startup."""
     initialize_gee()
     await check_database_health()
+
+
+@app.post("/api/sync/kps")
+async def trigger_kps_sync(background_tasks: BackgroundTasks):
+    """
+    Trigger manual synchronization of master_kps from external PKPS APIs.
+    Runs in background.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not connected")
+        
+    background_tasks.add_task(run_sync_process, supabase)
+    return {
+        "status": "queued",
+        "message": "PKPS synchronization started in background",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 
 
 # ==============================================================================
