@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet-side-by-side';
-import { SIGAP_CONFIG, BIG_ADMIN_CONFIG } from './constants';
+import { SIGAP_CONFIG } from './constants';
 // Map Components
 // Map Components
 export const MapRecenter = ({ data, uniqueKey }) => {
@@ -56,11 +56,43 @@ export const MapRecenter = ({ data, uniqueKey }) => {
     return null;
 };
 
+// ⚡ PERFORMANCE OPTIMIZATION: Add GPU acceleration styles for smooth zoom
+// This injected CSS ensures Leaflet containers use hardware acceleration
+const injectMapPerformanceStyles = () => {
+    if (typeof document !== 'undefined' && !document.getElementById('leaflet-perf-styles')) {
+        const style = document.createElement('style');
+        style.id = 'leaflet-perf-styles';
+        style.textContent = `
+            .leaflet-container {
+                will-change: transform;
+                transform: translateZ(0);
+                backface-visibility: hidden;
+            }
+            .leaflet-pane {
+                will-change: transform;
+                transform: translateZ(0);
+            }
+            .leaflet-tile-pane {
+                will-change: transform;
+            }
+            .leaflet-tile {
+                backface-visibility: hidden;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+};
+
 // Dynamic TileLayer that responds to opacity changes
 // Updated to strictly recreate layer on URL change to prevent "stacking" of old tiles
 export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIndex = 10 }) => {
     const map = useMap();
     const layerRef = useRef(null);
+
+    // Inject performance styles once
+    React.useEffect(() => {
+        injectMapPerformanceStyles();
+    }, []);
 
     // 1. Manage Layer Lifecycle (Create / Destroy)
     useEffect(() => {
@@ -75,6 +107,7 @@ export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIn
             zIndex: zIndex,
             maxNativeZoom: 20, // GEE usually supports high zoom, let it try
             maxZoom: 24,       // Allow over-zooming
+            keepBuffer: 4,     // Keep extra tiles for smoother panning
         });
 
         layer.addTo(map);
@@ -279,10 +312,6 @@ export const IdentifySigapFeatures = ({ activeLayers, onResult }) => {
 
             // Helper to fetch identification
             const identify = async (baseUrl, titlePrefix, isSigap = true) => {
-                // Use proxy for SIGAP, but direct or proxy for BIG?
-                // BIG endpoint: https://geoservices.big.go.id/rbi/rest/services/BATASWILAYAH/BATAS_WILAYAH/MapServer
-                // Since we're in the browser, let's see if BIG supports CORS.
-                // Usually it does. If not, we might need another proxy.
                 const url = `${baseUrl}/identify?${params.toString()}`;
                 try {
                     const response = await fetch(url);
@@ -292,19 +321,6 @@ export const IdentifySigapFeatures = ({ activeLayers, onResult }) => {
                     if (json && json.results) {
                         return json.results.map(r => {
                             let displayName = r.value;
-                            // For BIG areas, extract name from common field variations
-                            if (!isSigap && r.attributes) {
-                                const attr = r.attributes;
-                                // Try common BIG field names (case-insensitive search)
-                                const findAttr = (keys) => {
-                                    const foundKey = Object.keys(attr).find(k => keys.includes(k.toLowerCase()));
-                                    return foundKey ? attr[foundKey] : null;
-                                };
-
-                                const name = findAttr(['namobj', 'wiadpr', 'wiadkk', 'wiadkc', 'wiadkd', 'wadmpr', 'wadmkk', 'wadmkc', 'wadmkd']);
-                                if (name) displayName = name;
-                            }
-
                             return {
                                 ...r,
                                 layerName: `${titlePrefix}: ${r.layerName}`,
@@ -327,76 +343,10 @@ export const IdentifySigapFeatures = ({ activeLayers, onResult }) => {
                 results.push(...(dasRes || []));
             }
 
-            // 2. BIG Administrative Identification
-            if (activeLayers.big) {
-                // Remove '/export' to get base MapServer URL for identify
-                const bigBaseUrl = BIG_ADMIN_CONFIG.EXPORT_URL.replace('/export', '');
-                const bigRes = await identify(bigBaseUrl, 'Batas Administrasi', false);
-                results.push(...(bigRes || []));
-            }
-
             if (results.length > 0) {
                 onResult(e.latlng, results);
             }
         }
     });
-    return null;
-};
-
-// BIG Administrative Boundaries Layer Component
-// Uses ArcGIS Dynamic Map Service export - Reference Layer ONLY
-export const BigAdminLayer = ({ show, layerType = 'PROVINSI', opacity = 0.8, showLabels = false }) => {
-    const map = useMap();
-    const layerRef = useRef(null);
-
-    useEffect(() => {
-        if (layerRef.current) {
-            map.removeLayer(layerRef.current);
-            layerRef.current = null;
-        }
-
-        if (!show) return;
-
-        const layerConfig = BIG_ADMIN_CONFIG.LAYERS[layerType];
-        if (!layerConfig) return;
-
-        const layer = L.tileLayer('', {
-            opacity: opacity,
-            zIndex: 50,
-            maxNativeZoom: 18,
-            maxZoom: 24,
-            attribution: '© BIG'
-        });
-
-        layer.getTileUrl = function (coords) {
-            const tileSize = 256;
-            const nwPoint = coords.scaleBy(L.point(tileSize, tileSize));
-            const sePoint = nwPoint.add(L.point(tileSize, tileSize));
-            const nw = map.unproject(nwPoint, coords.z);
-            const se = map.unproject(sePoint, coords.z);
-            const bbox = `${nw.lng},${se.lat},${se.lng},${nw.lat}`;
-
-            // Construct layer logic: always show geometry ID, optionally show label ID
-            let layerIds = [layerConfig.id];
-            if (showLabels && layerConfig.labelId !== undefined) {
-                layerIds.push(layerConfig.labelId);
-            }
-
-            const params = new URLSearchParams({
-                bbox, bboxSR: 4326, imageSR: 4326, size: `${tileSize},${tileSize}`,
-                format: 'png32', transparent: true, layers: `show:${layerIds.join(',')}`, f: 'image'
-            });
-            return `${BIG_ADMIN_CONFIG.EXPORT_URL}?${params.toString()}`;
-        };
-
-        layer.on('tileerror', () => console.warn(`BigAdminLayer: Error loading ${layerType}`));
-        layer.addTo(map);
-        layerRef.current = layer;
-
-        return () => { if (layerRef.current) map.removeLayer(layerRef.current); };
-    }, [show, layerType, map, showLabels]);
-
-    useEffect(() => { if (layerRef.current) layerRef.current.setOpacity(opacity); }, [opacity]);
-
     return null;
 };

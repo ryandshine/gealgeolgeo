@@ -1894,7 +1894,15 @@ const MainLayout = (props) => {
 
                 {/* MAP AREA */}
                 <div className="flex-1 relative w-full h-full overflow-hidden bg-slate-900">
-                    <MapContainer center={[-2.5, 118.0]} zoom={5} className="w-full h-full" zoomControl={false} maxZoom={24}>
+                    <MapContainer
+                        center={[-2.5, 118.0]}
+                        zoom={5}
+                        className="w-full h-full"
+                        zoomControl={false}
+                        maxZoom={24}
+                        preferCanvas={true}
+                        attributionControl={false}
+                    >
                         {/* 1. LAYER DASAR (BASEMAP) */}
                         {((mapType === 'SENTINEL_RGB' && rgbMapUrl) || MAP_TILES[mapType].url) && (
                             <TileLayer
