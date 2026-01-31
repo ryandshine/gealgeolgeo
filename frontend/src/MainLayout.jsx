@@ -1535,7 +1535,7 @@ const MainLayout = (props) => {
                         </div>
 
                         {/* SECTION 2: VISUALIZATION SETTINGS (Now Secondary) */}
-                        <div className="bg-white rounded-2xl border border-slate-200/60 shadow-sm divide-y divide-slate-100 overflow-hidden">
+                        <div className="relative z-20 bg-white rounded-2xl border border-slate-200/60 shadow-md divide-y divide-slate-100 overflow-hidden">
                             <div className="bg-slate-50/50 px-4 py-2 border-b border-slate-100">
                                 <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Kontrol Visual</span>
                             </div>
@@ -1567,14 +1567,14 @@ const MainLayout = (props) => {
                             </div>
 
                             {/* 🔄 TEMPORAL STATUS TOGGLE (NEW) */}
-                            <div className="px-4 py-3 flex items-center justify-between bg-amber-50 border-y border-amber-100 hover:bg-amber-100/50 transition-colors">
+                            <div className="relative z-30 px-4 py-3 flex items-center justify-between bg-amber-50 border-y border-amber-100 hover:bg-amber-100/50 transition-colors">
                                 <div className="flex items-center gap-2">
                                     <span className="text-[11px] font-bold text-amber-900">Status Temporal</span>
                                     <span className="text-[9px] px-1.5 py-0.5 bg-amber-200 text-amber-800 rounded font-bold">GREY AREA</span>
                                 </div>
                                 <button
                                     onClick={() => setShowTemporalStatus(!showTemporalStatus)}
-                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showTemporalStatus ? 'bg-amber-500' : 'bg-slate-200'}`}
+                                    className={`relative z-30 inline-flex h-5 w-9 items-center rounded-full transition-colors ${showTemporalStatus ? 'bg-amber-500' : 'bg-slate-200'}`}
                                 >
                                     <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${showTemporalStatus ? 'translate-x-4' : 'translate-x-1'}`} />
                                 </button>
