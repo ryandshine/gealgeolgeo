@@ -1501,12 +1501,18 @@ const MainLayout = (props) => {
                                 </label>
 
                                 {/* Bulk Upload Button */}
-                                <div
-                                    onClick={() => setShowBulkUploadDialog(true)}
+                                <button
+                                    type="button"
+                                    onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        if (setShowBulkUploadDialog) {
+                                            setShowBulkUploadDialog(true);
+                                        } else {
+                                            console.error('setShowBulkUploadDialog is not defined');
+                                        }
+                                    }}
                                     className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-blue-50 hover:border-blue-400 transition-all cursor-pointer bg-slate-50/50 flex flex-col items-center justify-center gap-1"
-                                    role="button"
-                                    tabIndex={0}
-                                    onKeyDown={(e) => e.key === 'Enter' && setShowBulkUploadDialog(true)}
                                 >
                                     <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-blue-500 transition-colors pointer-events-none">
                                         <Upload size={16} />
@@ -1514,7 +1520,7 @@ const MainLayout = (props) => {
                                     <span className="text-[10px] font-bold uppercase tracking-wide mt-1 text-slate-400 group-hover:text-blue-600 pointer-events-none">
                                         Bulk Upload
                                     </span>
-                                </div>
+                                </button>
                             </div>
 
                             {/* Year Range */}
