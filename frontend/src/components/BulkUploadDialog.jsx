@@ -8,6 +8,7 @@ import { API_URL } from '../constants';
 const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
     const [files, setFiles] = useState([]);
     const [validationResults, setValidationResults] = useState(null);
+    const [bulkFileItems, setBulkFileItems] = useState(null);
     const [loading, setLoading] = useState(false);
     const [progress, setProgress] = useState({ current: 0, total: 0, message: '' });
     const [dragActive, setDragActive] = useState(false);
@@ -160,6 +161,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
             });
 
             setValidationResults(response.data);
+            setBulkFileItems(bulkFileItems);
             onValidationComplete(response.data, bulkFileItems);
 
         } catch (error) {
@@ -298,7 +300,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                     </button>
                     {validationResults && (
                         <button
-                            onClick={() => onValidationComplete(validationResults)}
+                            onClick={() => onValidationComplete(validationResults, bulkFileItems)}
                             className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600"
                         >
                             Next
