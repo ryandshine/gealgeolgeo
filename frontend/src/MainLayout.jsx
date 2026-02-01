@@ -386,6 +386,15 @@ const MainLayout = (props) => {
         setShowBulkUploadDialog
     } = props;
 
+    // Debug: Verify bulk upload prop is available
+    useEffect(() => {
+        if (setShowBulkUploadDialog) {
+            console.log('✓ Bulk Upload feature initialized');
+        } else {
+            console.warn('⚠ setShowBulkUploadDialog is undefined');
+        }
+    }, [setShowBulkUploadDialog]);
+
     // Local State for SIGAP Panel Visibility
     const [showSigapPanel, setShowSigapPanel] = useState(false);
 
