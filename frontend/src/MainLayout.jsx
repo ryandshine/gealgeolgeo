@@ -1488,9 +1488,9 @@ const MainLayout = (props) => {
 
                             {/* Upload Area */}
                             <div className="flex gap-3">
-                                <div className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 hover:border-emerald-400 transition-all cursor-pointer relative bg-slate-50/50">
-                                    <input type="file" accept=".zip,.shp,.shx,.dbf,.prj,.cpg,.geojson" multiple onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
-                                    <div className="flex flex-col items-center gap-1 pointer-events-none">
+                                <label className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 hover:border-emerald-400 transition-all cursor-pointer relative bg-slate-50/50">
+                                    <input type="file" accept=".zip,.shp,.shx,.dbf,.prj,.cpg,.geojson" multiple onChange={handleFileChange} className="hidden" />
+                                    <div className="flex flex-col items-center gap-1">
                                         <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-emerald-500 transition-colors">
                                             <Upload size={16} />
                                         </div>
@@ -1498,17 +1498,20 @@ const MainLayout = (props) => {
                                             {file ? file.name : "Upload KPS / GeoJSON"}
                                         </span>
                                     </div>
-                                </div>
+                                </label>
 
                                 {/* Bulk Upload Button */}
                                 <div
                                     onClick={() => setShowBulkUploadDialog(true)}
                                     className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-blue-50 hover:border-blue-400 transition-all cursor-pointer bg-slate-50/50 flex flex-col items-center justify-center gap-1"
+                                    role="button"
+                                    tabIndex={0}
+                                    onKeyDown={(e) => e.key === 'Enter' && setShowBulkUploadDialog(true)}
                                 >
-                                    <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-blue-500 transition-colors">
+                                    <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-blue-500 transition-colors pointer-events-none">
                                         <Upload size={16} />
                                     </div>
-                                    <span className="text-[10px] font-bold uppercase tracking-wide mt-1 text-slate-400 group-hover:text-blue-600">
+                                    <span className="text-[10px] font-bold uppercase tracking-wide mt-1 text-slate-400 group-hover:text-blue-600 pointer-events-none">
                                         Bulk Upload
                                     </span>
                                 </div>
