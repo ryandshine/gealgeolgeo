@@ -1555,6 +1555,353 @@ async def link_kps_to_analysis(request: dict):
 
 
 # ==============================================================================
+# BULK UPLOAD ENDPOINTS
+# ==============================================================================
+
+class BulkFileItem(BaseModel):
+    """Single file validation item"""
+    filename: str
+    geo_data: Dict[str, Any]
+    no_sk: Optional[str] = None
+
+class BulkValidationRequest(BaseModel):
+    """Request for bulk validation"""
+    files: List[BulkFileItem]
+
+class BulkValidationResult(BaseModel):
+    """Result for single file"""
+    filename: str
+    no_sk: Optional[str] = None
+    status: str  # "valid", "needs_manual", "non_kps"
+    duplicate_lahan_id: Optional[str] = None
+    kps_id: Optional[str] = None
+    kps_name: Optional[str] = None
+    kps_no_sk: Optional[str] = None
+    error: Optional[str] = None
+
+@app.post("/api/bulk/validate", response_model=List[BulkValidationResult])
+async def bulk_validate_files(request: BulkValidationRequest):
+    """
+    Validate multiple SHP files from single ZIP.
+    For each file: check duplicate, auto-detect KPS
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not connected")
+
+    results = []
+    max_concurrent = 3
+
+    async def validate_file(item: BulkFileItem) -> BulkValidationResult:
+        try:
+            # 1. Hash geometry for duplicate check
+            geom_str = json.dumps(item.geo_data, sort_keys=True)
+            geom_hash = hashlib.md5(geom_str.encode()).hexdigest()
+
+            # 2. Check if geometry already exists
+            lahan_res = await asyncio.to_thread(
+                lambda: supabase.table("master_lahan")
+                .select("id")
+                .eq("geom_hash", geom_hash)
+                .limit(1)
+                .execute()
+            )
+
+            duplicate_lahan_id = None
+            if lahan_res.data and len(lahan_res.data) > 0:
+                duplicate_lahan_id = lahan_res.data[0]['id']
+                print(f"   ⚠️ {item.filename}: Duplicate geometry found (lahan_id: {duplicate_lahan_id})")
+
+            # 3. Auto-detect KPS from NO_SK
+            kps_id = None
+            kps_name = None
+            kps_no_sk = None
+            status = "valid"
+
+            if item.no_sk and item.no_sk.strip():
+                normalized_query = item.no_sk.strip()
+                kps_res = await asyncio.to_thread(
+                    lambda: supabase.table("master_kps")
+                    .select("id_kps_api, nama_kps, no_sk")
+                    .ilike("no_sk", f"%{normalized_query}%")
+                    .limit(1)
+                    .execute()
+                )
+
+                if kps_res.data and len(kps_res.data) > 0:
+                    kps_match = kps_res.data[0]
+                    kps_id = kps_match.get('id_kps_api')
+                    kps_name = kps_match.get('nama_kps')
+                    kps_no_sk = kps_match.get('no_sk')
+                    status = "valid"
+                    print(f"   ✅ {item.filename}: Found KPS {kps_name}")
+                else:
+                    status = "needs_manual"
+                    print(f"   ⚠️ {item.filename}: NO_SK not found, needs manual search")
+            else:
+                status = "non_kps"
+                print(f"   ℹ️ {item.filename}: No NO_SK, will be Non-KPS")
+
+            return BulkValidationResult(
+                filename=item.filename,
+                no_sk=item.no_sk,
+                status=status,
+                duplicate_lahan_id=duplicate_lahan_id,
+                kps_id=kps_id,
+                kps_name=kps_name,
+                kps_no_sk=kps_no_sk,
+                error=None
+            )
+
+        except Exception as e:
+            print(f"   ❌ {item.filename}: Validation error - {e}")
+            return BulkValidationResult(
+                filename=item.filename,
+                no_sk=item.no_sk,
+                status="error",
+                error=str(e)
+            )
+
+    # Run validations with max concurrency
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def validate_with_semaphore(item: BulkFileItem):
+        async with semaphore:
+            return await validate_file(item)
+
+    results = await asyncio.gather(*[validate_with_semaphore(f) for f in request.files])
+
+    print(f"\n📊 Bulk Validation Summary:")
+    print(f"   Total: {len(results)} files")
+    print(f"   Valid: {sum(1 for r in results if r.status == 'valid')} files")
+    print(f"   Needs Manual: {sum(1 for r in results if r.status == 'needs_manual')} files")
+    print(f"   Non-KPS: {sum(1 for r in results if r.status == 'non_kps')} files")
+    print(f"   Errors: {sum(1 for r in results if r.status == 'error')} files")
+
+    return results
+
+
+class BulkSaveItem(BaseModel):
+    """Single file to save"""
+    filename: str
+    file_size: int
+    metadata: Dict[str, Any]
+    analysis_results: List[Dict[str, Any]]
+    geo_data: Dict[str, Any]
+    mode: Optional[str] = "replace"
+    transition_summary: Optional[Dict[str, Any]] = {}
+    audit_report: Optional[Dict[str, Any]] = {}
+    kps_id: Optional[str] = None
+    non_kps_id: Optional[str] = None
+    link_method: Optional[str] = "NONE"
+    analysis_scope: Optional[str] = "NON_KPS"
+
+class BulkSaveRequest(BaseModel):
+    """Request for bulk save"""
+    items: List[BulkSaveItem]
+
+class BulkSaveResult(BaseModel):
+    """Result of saving single file"""
+    filename: str
+    success: bool
+    history_id: Optional[str] = None
+    lahan_id: Optional[str] = None
+    error: Optional[str] = None
+
+@app.post("/api/bulk/save", response_model=List[BulkSaveResult])
+async def bulk_save_files(request: BulkSaveRequest, background_tasks: BackgroundTasks):
+    """
+    Batch save multiple validated files to database.
+    Sequential save to maintain database consistency.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not configured")
+
+    results = []
+
+    for idx, item in enumerate(request.items, 1):
+        try:
+            print(f"\n💾 Saving [{idx}/{len(request.items)}] {item.filename}...")
+
+            # Use existing save_history logic
+            save_request = SaveHistoryRequest(
+                filename=item.filename,
+                file_size=item.file_size,
+                metadata=item.metadata,
+                analysis_results=item.analysis_results,
+                geo_data=item.geo_data,
+                mode=item.mode,
+                transition_summary=item.transition_summary,
+                audit_report=item.audit_report,
+                kps_id=item.kps_id,
+                non_kps_id=item.non_kps_id,
+                link_method=item.link_method,
+                analysis_scope=item.analysis_scope
+            )
+
+            # Call save_history directly (reuse existing logic)
+            # We'll extract the core save logic to avoid duplication
+            history_id, lahan_id = await _save_history_internal(save_request, background_tasks)
+
+            results.append(BulkSaveResult(
+                filename=item.filename,
+                success=True,
+                history_id=history_id,
+                lahan_id=lahan_id,
+                error=None
+            ))
+            print(f"   ✅ Saved successfully")
+
+        except Exception as e:
+            print(f"   ❌ Save error: {e}")
+            results.append(BulkSaveResult(
+                filename=item.filename,
+                success=False,
+                error=str(e)
+            ))
+
+    print(f"\n📊 Bulk Save Summary:")
+    print(f"   Total: {len(results)} files")
+    print(f"   Success: {sum(1 for r in results if r.success)} files")
+    print(f"   Failed: {sum(1 for r in results if not r.success)} files")
+
+    return results
+
+
+async def _save_history_internal(request: SaveHistoryRequest, background_tasks: BackgroundTasks = None) -> tuple:
+    """
+    Internal function to save history (extracted from save_history endpoint).
+    Returns (history_id, lahan_id)
+    """
+    # 1. Hash GeoJSON
+    geom_str = json.dumps(request.geo_data, sort_keys=True)
+    geom_hash = hashlib.md5(geom_str.encode()).hexdigest()
+
+    lahan_id = None
+
+    # 2. Check if geometry exists
+    res = await asyncio.to_thread(
+        lambda: supabase.table("master_lahan")
+        .select("id")
+        .eq("geom_hash", geom_hash)
+        .limit(1)
+        .execute()
+    )
+
+    if res.data and len(res.data) > 0:
+        lahan_id = res.data[0]['id']
+    else:
+        # Create new master_lahan
+        new_lahan = {
+            "geom_geojson": request.geo_data,
+            "geom_hash": geom_hash
+        }
+        ins = await asyncio.to_thread(
+            lambda: supabase.table("master_lahan").insert(new_lahan).execute()
+        )
+
+        if ins.data and len(ins.data) > 0:
+            lahan_id = ins.data[0]['id']
+        else:
+            raise Exception("Insert master_lahan returned no data")
+
+    # 3. Process analysis results (simplified - no thumbnail processing for bulk)
+    # Bulk uploads assume analysis_results are already prepared
+    updated_analysis_results = request.analysis_results
+
+    # 4. Save to analysis_history
+    mode = request.mode or "replace"
+
+    if mode == "merge":
+        # Get old results
+        old_res = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .select("id, analysis_results")
+            .eq("lahan_id", lahan_id)
+            .limit(1)
+            .execute()
+        )
+
+        if old_res.data:
+            old_history = old_res.data[0]
+            old_results = old_history.get('analysis_results', [])
+            merged_map = {r['year']: r for r in old_results}
+
+            for new_r in updated_analysis_results:
+                merged_map[new_r['year']] = new_r
+
+            updated_analysis_results = list(merged_map.values())
+    else:
+        # Replace mode - delete old
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_history")
+                .delete()
+                .eq("lahan_id", lahan_id)
+                .execute()
+            )
+        except:
+            pass
+
+    # Insert new history
+    history_data = {
+        "lahan_id": lahan_id,
+        "filename": request.filename,
+        "file_size": request.file_size,
+        "analysis_scope": request.analysis_scope,
+        "link_method": request.link_method,
+        "kps_id": request.kps_id,
+        "non_kps_id": request.non_kps_id,
+        "metadata": request.metadata,
+        "analysis_results": updated_analysis_results,
+        "transition_summary": request.transition_summary,
+        "audit_report": request.audit_report,
+        "status": "COMPLETE"
+    }
+
+    history_res = await asyncio.to_thread(
+        lambda: supabase.table("analysis_history").insert(history_data).execute()
+    )
+
+    if not history_res.data or len(history_res.data) == 0:
+        raise Exception("Insert analysis_history returned no data")
+
+    history_id = history_res.data[0]['id']
+
+    # 5. Save yearly breakdown
+    yearly_data = []
+    for result in updated_analysis_results:
+        year = result.get('year')
+        if year:
+            yearly_item = {
+                "history_id": history_id,
+                "year": year,
+                "hutan_primer": result.get('hutan_primer', 0),
+                "hutan_sekunder": result.get('hutan_sekunder', 0),
+                "tanah_kering": result.get('tanah_kering', 0),
+                "tanah_kosong": result.get('tanah_kosong', 0),
+                "lahan_terbangun": result.get('lahan_terbangun', 0),
+                "air": result.get('air', 0),
+                "dominant_class": result.get('dominant_class'),
+                "temporal_status": result.get('temporal_status', 'stable')
+            }
+            yearly_data.append(yearly_item)
+
+    if yearly_data:
+        await asyncio.to_thread(
+            lambda: supabase.table("analysis_yearly_data").insert(yearly_data).execute()
+        )
+
+    # Queue background tasks
+    # Note: For bulk uploads, we skip background processing since actual analysis happens in main flow
+    # if request.analysis_scope == "KPS" and request.kps_id:
+    #     background_tasks.add_task(populate_kps_hotspots, history_id, request.kps_id)
+
+    invalidate_cache("history_list")
+
+    return (history_id, lahan_id)
+
+
+# ==============================================================================
 # NON-KPS MANAGEMENT ENDPOINTS
 # ==============================================================================
 
@@ -1638,6 +1985,141 @@ async def search_non_kps(query: str = Query(..., min_length=2)):
 
     except Exception as e:
         print(f"❌ Error searching Non-KPS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# CUSTOM PINS API ENDPOINTS
+# ==============================================================================
+
+class CustomPinCreate(BaseModel):
+    lat: float
+    lng: float
+    label: str = ""
+
+class CustomPinUpdate(BaseModel):
+    label: str
+
+@app.get("/api/pins")
+async def get_all_pins():
+    """
+    Get all custom pins from database.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print("📍 Fetching all custom pins...")
+
+        res = await asyncio.to_thread(
+            lambda: supabase.table("custom_pins")
+            .select("*")
+            .order("created_at", desc=False)
+            .execute()
+        )
+
+        pins = res.data or []
+        print(f"✅ Found {len(pins)} custom pins")
+
+        return {"status": "success", "data": pins, "count": len(pins)}
+
+    except Exception as e:
+        print(f"❌ Error fetching custom pins: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/pins")
+async def create_pin(pin: CustomPinCreate):
+    """
+    Create a new custom pin.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print(f"📍 Creating new pin: {pin.label} at ({pin.lat}, {pin.lng})")
+
+        pin_data = {
+            "lat": pin.lat,
+            "lng": pin.lng,
+            "label": pin.label
+        }
+
+        res = await asyncio.to_thread(
+            lambda: supabase.table("custom_pins")
+            .insert(pin_data)
+            .execute()
+        )
+
+        created_pin = res.data[0] if res.data else None
+
+        if not created_pin:
+            raise HTTPException(status_code=500, detail="Failed to create pin")
+
+        print(f"✅ Pin created with ID: {created_pin['id']}")
+
+        return {"status": "success", "data": created_pin}
+
+    except Exception as e:
+        print(f"❌ Error creating pin: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/pins/{pin_id}")
+async def update_pin(pin_id: str, pin: CustomPinUpdate):
+    """
+    Update an existing custom pin.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print(f"📍 Updating pin {pin_id}: {pin.label}")
+
+        update_data = {"label": pin.label}
+
+        res = await asyncio.to_thread(
+            lambda: supabase.table("custom_pins")
+            .update(update_data)
+            .eq("id", pin_id)
+            .execute()
+        )
+
+        updated_pin = res.data[0] if res.data else None
+
+        if not updated_pin:
+            raise HTTPException(status_code=404, detail="Pin not found")
+
+        print(f"✅ Pin updated: {pin_id}")
+
+        return {"status": "success", "data": updated_pin}
+
+    except Exception as e:
+        print(f"❌ Error updating pin: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/pins/{pin_id}")
+async def delete_pin(pin_id: str):
+    """
+    Delete a custom pin.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    try:
+        print(f"📍 Deleting pin: {pin_id}")
+
+        res = await asyncio.to_thread(
+            lambda: supabase.table("custom_pins")
+            .delete()
+            .eq("id", pin_id)
+            .execute()
+        )
+
+        print(f"✅ Pin deleted: {pin_id}")
+
+        return {"status": "success", "message": "Pin deleted successfully"}
+
+    except Exception as e:
+        print(f"❌ Error deleting pin: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3630,12 +4112,20 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
             )
         
         print(f"🔍 DEBUG: analyze_land_cover returned {len(results)} results")
-        
+
+        # Validate all results have thumbnails
+        results_dicts = [r.dict() for r in results]
+        with_thumb = sum(1 for r in results_dicts if r.get('thumb_url'))
+        without_thumb = len(results_dicts) - with_thumb
+        print(f"🎬 Thumbnail Status: {with_thumb}/{len(results_dicts)} years have thumbnails")
+        if without_thumb > 0:
+            print(f"⚠️  {without_thumb} years missing thumbnails - will be backfilled from GeoJSON")
+
         # Prepare response
         response_data = {
             "status": "sukses",
             "message": f"Analisis selesai untuk {len(results)} tahun",
-            "data": [r.dict() for r in results],
+            "data": results_dicts,
             "map_url": results[-1].map_url if results else None,
             "transition_summary": transition_summary,
             "audit_report": audit_report
@@ -4167,11 +4657,14 @@ async def get_slope_analysis(request: SlopeRequest):
             '</RasterSymbolizer>'
         )
         
-        # Visualize for the buffer area (covers both inside + outside context)
-        # We clip to buffer_mask so the user sees the AOI + surrounding 2km
-        viz_image = slope_pct.clip(buffer_mask).sldStyle(sld_intervals)
-        map_url = viz_image.getMapId()['tile_fetcher'].url_format
-        
+        # Visualize INSIDE area (only the geometry)
+        viz_image_inside = slope_pct.clip(geometry).sldStyle(sld_intervals)
+        map_url_inside = viz_image_inside.getMapId()['tile_fetcher'].url_format
+
+        # Visualize OUTSIDE area (buffer 2km excluding geometry)
+        viz_image_outside = slope_pct.clip(outside_mask).sldStyle(sld_intervals)
+        map_url_outside = viz_image_outside.getMapId()['tile_fetcher'].url_format
+
         # 6. Calculate Statistics Helper
         def calc_slope_stats(geom, scope_name):
             # Calculate pixel area in Ha
@@ -4231,13 +4724,14 @@ async def get_slope_analysis(request: SlopeRequest):
 
         print("   📊 Computing stats for INSIDE...")
         summary_inside = calc_slope_stats(geometry, "INSIDE")
-        
+
         print("   📊 Computing stats for OUTSIDE (2km)...")
         summary_outside = calc_slope_stats(outside_mask, "OUTSIDE")
-        
+
         return {
             "status": "success",
-            "map_url": map_url,
+            "map_url_inside": map_url_inside,
+            "map_url_outside": map_url_outside,
             "db_summary": [summary_inside, summary_outside]
         }
         
@@ -4298,14 +4792,17 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
         import base64
         import requests
         
-        print("🔄 Processing thumbnails for persistence...")
-        
-        for item in request.analysis_results:
+        print(f"🔄 Processing thumbnails for persistence... ({len(request.analysis_results)} years)")
+
+        for idx, item in enumerate(request.analysis_results, 1):
             new_item = item.copy()
+            year = new_item.get('year', 'unknown')
             url = new_item.get("thumb_url")
-            
-            # --- LOGI K PERSISTENSI VEKTOR & THUMBNAIL ---
-            
+
+            print(f"   📅 [{idx}/{len(request.analysis_results)}] Processing Year {year}...")
+
+            # --- LOGIK PERSISTENSI VEKTOR & THUMBNAIL ---
+
             # 1. Konversi EE Geometry sekali saja untuk efisiensi
             if 'ee_geometry_cache' not in locals():
                  ee_geometry_cache = geojson_to_ee_geometry(request.geo_data)
@@ -4313,12 +4810,12 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
             # 2. Generate Vector GeoJSON (Wajib ada untuk PDF)
             if not new_item.get('vector_geojson'):
                 try:
-                    print(f"   📐 Generating vector for {new_item.get('year')}...")
-                    classified = get_classified_image(ee_geometry_cache, new_item.get('year'))
+                    print(f"      📐 Generating vector for {year}...")
+                    classified = get_classified_image(ee_geometry_cache, year)
                     if classified:
                         # Use scale from metadata if provided, fallback to 30
                         vector_scale = request.metadata.get('scale', 30)
-                        print(f"      📍 Using vector scale: {vector_scale}m")
+                        print(f"         📍 Using vector scale: {vector_scale}m")
                         vectors_fc = classified.reduceToVectors(
                             geometry=ee_geometry_cache,
                             scale=vector_scale,
@@ -4330,43 +4827,56 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                             bestEffort=True
                         )
                         vector_data = await asyncio.to_thread(lambda: vectors_fc.getInfo())
-                        
+
                         # Simplify properties
                         if vector_data and 'features' in vector_data:
                             for f in vector_data['features']:
                                 f['properties'] = {'class': f['properties']['class']}
                             new_item['vector_geojson'] = vector_data
-                            print(f"   ✅ Vector Generated.")
+                            print(f"         ✅ Vector Generated ({len(vector_data['features'])} polygons).")
                 except Exception as ve:
-                    print(f"   ⚠️ Failed to generate vector during save: {ve}")
+                    print(f"         ⚠️ Failed to generate vector during save: {ve}")
 
             # 3. Persistent Thumbnail (Cloud Storage)
-            # Replace temporary GEE URLs with permanent Supabase Storage URLs
+            # Replace temporary GEE URLs with permanent Local Storage URLs
             thumb_url = new_item.get("thumb_url")
             if thumb_url and ("earthengine.googleapis.com" in thumb_url or "googleapis.com" in thumb_url):
                 try:
-                    print(f"   ☁️ Persisting thumbnail for {new_item.get('year')}...")
+                    print(f"         ☁️ Persisting thumbnail...")
                     # Function is async, await directly
                     perm_url = await download_and_save_locally(thumb_url, f"history_{lahan_id}")
                     if perm_url:
                         new_item["thumb_url"] = perm_url
-                        print(f"   ✅ Thumbnail persisted: {perm_url}")
+                        print(f"         ✅ Thumbnail persisted: {perm_url}")
+                    else:
+                        print(f"         ⚠️ Failed to persist (returned None), keeping original URL")
                 except Exception as e:
-                    print(f"   ⚠️ Failed to persist thumbnail: {e}")
-            
+                    print(f"         ❌ Failed to persist thumbnail: {e}")
+                    # Keep original URL as fallback
+            elif thumb_url:
+                print(f"         ℹ️ Thumbnail already local: {thumb_url[:50]}...")
+
             # 4. Persistent RGB Thumbnail (Cloud Storage)
             rgb_url = new_item.get("rgb_thumb_url")
             if rgb_url and ("earthengine.googleapis.com" in rgb_url or "googleapis.com" in rgb_url):
                 try:
-                    print(f"   ☁️ Persisting RGB thumbnail for {new_item.get('year')}...")
+                    print(f"         ☁️ Persisting RGB thumbnail...")
                     perm_rgb = await download_and_save_locally(rgb_url, f"history_{lahan_id}_rgb")
                     if perm_rgb:
                         new_item["rgb_thumb_url"] = perm_rgb
-                        print(f"   ✅ RGB Thumbnail persisted: {perm_rgb}")
+                        print(f"         ✅ RGB Thumbnail persisted: {perm_rgb}")
+                    else:
+                        print(f"         ⚠️ Failed to persist RGB (returned None), keeping original URL")
                 except Exception as e:
-                    print(f"   ⚠️ Failed to persist RGB thumbnail: {e}")
+                    print(f"         ❌ Failed to persist RGB thumbnail: {e}")
+                    # Keep original URL as fallback
+            elif rgb_url:
+                print(f"         ℹ️ RGB thumbnail already local: {rgb_url[:50]}...")
 
+            print(f"      ✅ Year {year} processed successfully")
             updated_analysis_results.append(new_item)
+
+        print(f"✅ All {len(updated_analysis_results)} years processed for thumbnail persistence")
             
         # --- LOGIKA PENYIMPANAN: Replace vs Merge (Request User) ---
         mode = getattr(request, 'mode', 'replace')
@@ -4765,14 +5275,15 @@ async def get_history():
         
     try:
         # Optimasi: Ambil data esensial saja. Hilangkan geom_geojson.
+        # Include kps_id untuk ambil nama KPS dari master_kps
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("id, filename, file_size, created_at, metadata, analysis_results")
+            .select("id, filename, file_size, created_at, metadata, analysis_results, kps_id")
             .order("created_at", desc=True)
-            .limit(50) 
+            .limit(50)
             .execute()
         )
-        
+
         # Pruning Agresif untuk List View (Prevent 524 Timeout)
         data = []
         for item in res.data:
@@ -4796,10 +5307,32 @@ async def get_history():
                     if 'vector_geojson' in r: del r['vector_geojson']
                     if 'rgb_thumb_url' in r: del r['rgb_thumb_url']
 
-                    # Hilangkan thumbnail kecuali untuk tahun TERBARU
-                    # (Frontend butuh preview thumb di card, tapi cukup 1)
-                    if idx > 0:
-                        if 'thumb_url' in r: del r['thumb_url']
+                    # Keep thumbnail URLs for all years in list view
+                    # (Detail view needs them for time series display)
+                    # Only compress by keeping essential stats and first thumbnail for UI preview
+
+            # 4. Ambil nama KPS dari master_kps jika ada kps_id
+            if item.get('kps_id'):
+                try:
+                    kps_res = await asyncio.to_thread(
+                        lambda: supabase.table("master_kps")
+                        .select("nama_kps")
+                        .eq("id_kps_api", item['kps_id'])
+                        .single()
+                        .execute()
+                    )
+                    if kps_res.data and kps_res.data.get('nama_kps'):
+                        # Gunakan nama KPS sebagai display name
+                        item['display_name'] = kps_res.data['nama_kps']
+                    else:
+                        # Fallback ke filename jika KPS tidak ditemukan
+                        item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
+                except Exception as kps_err:
+                    print(f"⚠️ Failed to fetch KPS name for {item.get('kps_id')}: {kps_err}")
+                    item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
+            else:
+                # Tidak ada kps_id, gunakan filename
+                item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
 
             data.append(item)
             

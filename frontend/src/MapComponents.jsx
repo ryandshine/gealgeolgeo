@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { useMap, useMapEvents } from 'react-leaflet';
+import { useMap, useMapEvents, Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet-side-by-side';
 import { SIGAP_CONFIG } from './constants';
@@ -105,9 +105,11 @@ export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIn
             opacity: opacity, // Initial opacity
             pane: pane,
             zIndex: zIndex,
-            maxNativeZoom: 20, // GEE usually supports high zoom, let it try
-            maxZoom: 24,       // Allow over-zooming
-            keepBuffer: 4,     // Keep extra tiles for smoother panning
+            maxNativeZoom: 18,
+            maxZoom: 18,
+            keepBuffer: 3,     // Optimal buffer for smooth zoom
+            updateWhenZooming: false, // Don't update tiles during zoom animation
+            updateWhenIdle: true,     // Update tiles after zoom completes
         });
 
         layer.addTo(map);
@@ -156,8 +158,8 @@ export const SwipeMapControl = ({ leftUrl, rightUrl, show }) => {
         }
 
         // Create layers
-        const left = L.tileLayer(leftUrl, { maxNativeZoom: 20, maxZoom: 24 }).addTo(map);
-        const right = L.tileLayer(rightUrl, { maxNativeZoom: 20, maxZoom: 24 }).addTo(map);
+        const left = L.tileLayer(leftUrl, { maxNativeZoom: 18, maxZoom: 18 }).addTo(map);
+        const right = L.tileLayer(rightUrl, { maxNativeZoom: 18, maxZoom: 18 }).addTo(map);
 
         // Create control
         const sbs = L.control.sideBySide(left, right);
@@ -349,4 +351,136 @@ export const IdentifySigapFeatures = ({ activeLayers, onResult }) => {
         }
     });
     return null;
+};
+
+// Custom Pins Manager Component
+export const CustomPinsManager = ({ pins, isAddingPin, onAddPin, onDeletePin, onUpdatePin }) => {
+    const map = useMap();
+    const [editingPinId, setEditingPinId] = useState(null);
+    const [editLabel, setEditLabel] = useState('');
+
+    // Handle map click to add new pin
+    useMapEvents({
+        click(e) {
+            if (isAddingPin) {
+                const label = prompt('Masukkan label untuk pin (opsional):');
+                if (label !== null) { // User didn't cancel
+                    onAddPin(e.latlng, label || '');
+                }
+            }
+        }
+    });
+
+    // Change cursor when in adding mode
+    useEffect(() => {
+        if (isAddingPin) {
+            map.getContainer().style.cursor = 'crosshair';
+        } else {
+            map.getContainer().style.cursor = '';
+        }
+    }, [isAddingPin, map]);
+
+    // Create custom marker icon
+    const createCustomPinIcon = (label) => {
+        return L.divIcon({
+            className: 'custom-pin-marker',
+            html: `
+                <div style="position: relative;">
+                    <svg width="32" height="40" viewBox="0 0 32 40" style="filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));">
+                        <path d="M16 0C7.163 0 0 7.163 0 16c0 8.837 16 24 16 24s16-15.163 16-24C32 7.163 24.837 0 16 0z" fill="#ef4444"/>
+                        <circle cx="16" cy="16" r="6" fill="white"/>
+                    </svg>
+                    ${label ? `<div style="position: absolute; top: 42px; left: 50%; transform: translateX(-50%); background: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 1px 3px rgba(0,0,0,0.2);">${label}</div>` : ''}
+                </div>
+            `,
+            iconSize: [32, 40],
+            iconAnchor: [16, 40],
+            popupAnchor: [0, -40]
+        });
+    };
+
+    return (
+        <>
+            {pins.map(pin => (
+                <Marker
+                    key={pin.id}
+                    position={[pin.lat, pin.lng]}
+                    icon={createCustomPinIcon(pin.label)}
+                >
+                    <Popup>
+                        <div className="p-2 min-w-[160px]">
+                            {editingPinId === pin.id ? (
+                                <div className="space-y-2">
+                                    <input
+                                        type="text"
+                                        value={editLabel}
+                                        onChange={(e) => setEditLabel(e.target.value)}
+                                        className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                                        placeholder="Label pin..."
+                                        autoFocus
+                                    />
+                                    <div className="flex gap-1">
+                                        <button
+                                            onClick={() => {
+                                                onUpdatePin(pin.id, { label: editLabel });
+                                                setEditingPinId(null);
+                                            }}
+                                            className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold uppercase rounded"
+                                        >
+                                            Simpan
+                                        </button>
+                                        <button
+                                            onClick={() => setEditingPinId(null)}
+                                            className="flex-1 py-1 bg-slate-400 hover:bg-slate-500 text-white text-[9px] font-bold uppercase rounded"
+                                        >
+                                            Batal
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : (
+                                <>
+                                    <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Custom Pin</div>
+                                    <div className="text-xs font-bold text-slate-800 mb-2">{pin.label || 'No Label'}</div>
+                                    <div className="text-[9px] text-slate-500 mb-2">
+                                        <div>Lat: {pin.lat.toFixed(6)}</div>
+                                        <div>Lng: {pin.lng.toFixed(6)}</div>
+                                    </div>
+                                    <div className="flex gap-1 mb-2">
+                                        <button
+                                            onClick={() => {
+                                                setEditingPinId(pin.id);
+                                                setEditLabel(pin.label);
+                                            }}
+                                            className="flex-1 py-1 bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-bold uppercase rounded"
+                                        >
+                                            Edit
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                if (window.confirm('Hapus pin ini?')) {
+                                                    onDeletePin(pin.id);
+                                                }
+                                            }}
+                                            className="flex-1 py-1 bg-red-600 hover:bg-red-700 text-white text-[9px] font-bold uppercase rounded"
+                                        >
+                                            Hapus
+                                        </button>
+                                    </div>
+                                    <button
+                                        onClick={() => {
+                                            const googleMapsUrl = `https://maps.google.com/?q=${pin.lat},${pin.lng}&z=15`;
+                                            window.open(googleMapsUrl, '_blank');
+                                        }}
+                                        className="w-full py-1 bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 text-white text-[9px] font-bold uppercase rounded"
+                                    >
+                                        🗺️ Google Maps
+                                    </button>
+                                </>
+                            )}
+                        </div>
+                    </Popup>
+                </Marker>
+            ))}
+        </>
+    );
 };

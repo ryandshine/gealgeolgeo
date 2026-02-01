@@ -1,0 +1,20 @@
+Jan 31 18:33:13 ryandvps uvicorn[931899]:   File "/srv/apps/gealgeolgeo/.venv/lib/python3.13/site-packages/starlette/routing.py", line 571, in __aenter__
+Jan 31 18:33:13 ryandvps uvicorn[931899]:     await self._router.startup()
+Jan 31 18:33:13 ryandvps uvicorn[931899]:   File "/srv/apps/gealgeolgeo/.venv/lib/python3.13/site-packages/starlette/routing.py", line 671, in startup
+Jan 31 18:33:13 ryandvps uvicorn[931899]:     await handler()
+Jan 31 18:33:13 ryandvps uvicorn[931899]:   File "/srv/apps/gealgeolgeo/main.py", line 795, in startup_event
+Jan 31 18:33:13 ryandvps uvicorn[931899]:     initialize_gee()
+Jan 31 18:33:13 ryandvps uvicorn[931899]:     ~~~~~~~~~~~~~~^^
+Jan 31 18:33:13 ryandvps uvicorn[931899]:   File "/srv/apps/gealgeolgeo/main.py", line 789, in initialize_gee
+Jan 31 18:33:13 ryandvps uvicorn[931899]:     raise RuntimeError(f"Inisialisasi GEE gagal: {str(e)}")
+Jan 31 18:33:13 ryandvps uvicorn[931899]: RuntimeError: Inisialisasi GEE gagal: Please authorize access to your Earth Engine account by running
+Jan 31 18:33:13 ryandvps uvicorn[931899]: earthengine authenticate
+Jan 31 18:33:13 ryandvps uvicorn[931899]: in your command line, or ee.Authenticate() in Python, and then retry.
+Jan 31 18:33:13 ryandvps uvicorn[931899]: ERROR:    Application startup failed. Exiting.
+Jan 31 18:33:13 ryandvps uvicorn[931899]: ✅ Disk cache initialized at: /srv/apps/gealgeolgeo/cache (Size limit: 10GB, Permanent mode)
+Jan 31 18:33:13 ryandvps uvicorn[931899]: ✅ Local storage initialized at: /srv/apps/gealgeolgeo/storage
+Jan 31 18:33:13 ryandvps uvicorn[931899]: 🚀 Local storage mounted at /storage
+Jan 31 18:33:13 ryandvps uvicorn[931899]: ✅ WebSocket log handler initialized
+Jan 31 18:33:13 ryandvps uvicorn[931899]: ❌ Gagal inisialisasi GEE: Please authorize access to your Earth Engine account by running
+Jan 31 18:33:13 ryandvps uvicorn[931899]: earthengine authenticate
+Jan 31 18:33:13 ryandvps uvicorn[931899]: in your command line, or ee.Authenticate() in Python, and then retry.

@@ -8,6 +8,10 @@ import MainLayout from './MainLayout';
 import { CALIBRATION_DEFAULTS, LAND_COVER_CONFIG, API_URL, MAX_BATCH_SIZE } from './constants';
 import BatchQueueList from './components/BatchQueueList';
 import CarbonDashboard from './components/CarbonDashboard';
+import KpsDetectionDialog from './components/KpsDetectionDialog';
+import DuplicateDialog from './components/DuplicateDialog';
+import BulkUploadDialog from './components/BulkUploadDialog';
+import BulkReportDialog from './components/BulkReportDialog';
 
 // Expose proj4 globally for shpjs to find it
 if (typeof window !== 'undefined') {
@@ -237,7 +241,71 @@ const App = () => {
     const [showDAS, setShowDAS] = useState(false);
     const [dasOpacity, setDasOpacity] = useState(0.6);
 
-    useEffect(() => { fetchHistory(); }, []);
+    const [showSlopeLayer, setShowSlopeLayer] = useState(false);
+    const [slopeOpacityInside, setSlopeOpacityInside] = useState(0.7);
+    const [slopeOpacityOutside, setSlopeOpacityOutside] = useState(0.7);
+    const [slopeMapUrlInside, setSlopeMapUrlInside] = useState(null);
+    const [slopeMapUrlOutside, setSlopeMapUrlOutside] = useState(null);
+    const [slopeDbSummary, setSlopeDbSummary] = useState(null);
+    const [slopeDbSummaryOutside, setSlopeDbSummaryOutside] = useState(null);
+
+    // KPS Detection State
+    const [showKpsDialog, setShowKpsDialog] = useState(false);
+    const [detectedKps, setDetectedKps] = useState(null);
+    const [extractedNoSk, setExtractedNoSk] = useState(null);
+    const [kpsLinkMethod, setKpsLinkMethod] = useState(null); // 'NO_SK_METADATA', 'MANUAL', 'NONE'
+    const [pendingGeoData, setPendingGeoData] = useState(null); // Store geo data while KPS dialog is shown
+    const [pendingFile, setPendingFile] = useState(null); // Store file info while KPS dialog is shown
+
+    // Duplicate Detection State
+    const [showDuplicateDialog, setShowDuplicateDialog] = useState(false);
+    const [duplicateInfo, setDuplicateInfo] = useState(null);
+    const [duplicateHandleMode, setDuplicateHandleMode] = useState('replace'); // 'merge' or 'replace'
+    const [selectedYearsForAnalysis, setSelectedYearsForAnalysis] = useState(null); // null = all years
+
+    // Bulk Upload State
+    const [showBulkUploadDialog, setShowBulkUploadDialog] = useState(false);
+    const [showBulkReportDialog, setShowBulkReportDialog] = useState(false);
+    const [bulkValidationResults, setBulkValidationResults] = useState(null);
+    const [bulkFileItems, setBulkFileItems] = useState(null);
+
+    // Custom Pins State (Manual Pin Markers)
+    const [customPins, setCustomPins] = useState([]);
+    const [isAddingPin, setIsAddingPin] = useState(false);
+    const [loadingPins, setLoadingPins] = useState(false);
+
+    // Fetch custom pins from backend
+    const fetchCustomPins = async () => {
+        setLoadingPins(true);
+        try {
+            const response = await axios.get(`${API_URL}/api/pins`);
+            if (response.data?.status === 'success') {
+                setCustomPins(response.data.data || []);
+                // Also save to localStorage as cache
+                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(response.data.data || []));
+                console.log(`📍 Loaded ${response.data.count || 0} pins from backend`);
+            }
+        } catch (err) {
+            console.error("Error fetching custom pins:", err);
+            // Fallback to localStorage if backend fails
+            try {
+                const saved = localStorage.getItem('gealgeolgeo_custom_pins');
+                if (saved) {
+                    setCustomPins(JSON.parse(saved));
+                    console.log('📍 Loaded pins from localStorage (fallback)');
+                }
+            } catch (e) {
+                console.error("Error loading pins from localStorage:", e);
+            }
+        } finally {
+            setLoadingPins(false);
+        }
+    };
+
+    useEffect(() => {
+        fetchHistory();
+        fetchCustomPins(); // Fetch custom pins on mount
+    }, []);
 
     const fetchHistory = async () => {
         setLoadingHistory(true);
@@ -247,6 +315,45 @@ const App = () => {
             setHistoryData(response.data || []);
         } catch (err) { console.error("Error fetching history:", err.message); } finally { setLoadingHistory(false); }
     };
+
+    // Fetch Slope Analysis Map (Raster from GEE)
+    useEffect(() => {
+        const getSlopeLayer = async () => {
+            if (!showSlopeLayer || !geoData) {
+                if (!showSlopeLayer) {
+                    setSlopeMapUrlInside(null);
+                    setSlopeMapUrlOutside(null);
+                }
+                return;
+            }
+
+            try {
+                // Use current geoData to get slope raster visualization
+                const payload = { geo_data: geoData };
+
+                const response = await axios.post(`${API_URL}/map/slope`, payload);
+                if (response.data?.status === 'success') {
+                    setSlopeMapUrlInside(response.data.map_url_inside);
+                    setSlopeMapUrlOutside(response.data.map_url_outside);
+
+                    // Only update stats if we don't have saved data from history
+                    // (saved data is loaded in handleHistorySelect)
+                    if (!slopeDbSummary && response.data.db_summary && response.data.db_summary.length > 0) {
+                        // Get INSIDE record
+                        const insideRecord = response.data.db_summary.find(r => r.scope === 'INSIDE') || response.data.db_summary[0];
+                        setSlopeDbSummary(insideRecord);
+                        // Get OUTSIDE (buffer 2km) record
+                        const outsideRecord = response.data.db_summary.find(r => r.scope === 'OUTSIDE');
+                        setSlopeDbSummaryOutside(outsideRecord || null);
+                    }
+                }
+            } catch (err) {
+                console.error("Error fetching slope layer:", err);
+            }
+        };
+
+        getSlopeLayer();
+    }, [showSlopeLayer, geoData]);
 
     useEffect(() => {
         const handleClickOutside = (event) => {
@@ -334,13 +441,92 @@ const App = () => {
                 if (Array.isArray(rawGeojson)) rawGeojson = rawGeojson[0];
                 const finalGeo = reprojectToWGS84(rawGeojson);
 
-                setGeoData(finalGeo);
-                setFile({ name: targetFile.name, size: targetFile.size });
+                // === KPS DETECTION FROM SHP METADATA ===
+                // Extract identifier from SHP properties (check multiple common field names)
+                let foundNoSk = null;
+                if (finalGeo?.features?.length > 0) {
+                    // Collect all properties from all features to find identifier
+                    for (const feature of finalGeo.features) {
+                        const props = feature.properties || {};
 
-                // Reset state
+                        // Strategy: Look for any key that contains 'SK' or 'KPS' case-insensitively
+                        // Priority given to exact matches like NO_SK or NO_KPS
+                        const keys = Object.keys(props);
+
+                        // 1. High priority exact-ish matches
+                        const priorityFields = ['NO_SK', 'NO_KPS', 'NOSK', 'NOSK_KPS', 'SK_NUMBER'];
+                        for (const field of priorityFields) {
+                            const foundKey = keys.find(k => k.toUpperCase() === field);
+                            if (foundKey && props[foundKey] && String(props[foundKey]).trim()) {
+                                foundNoSk = String(props[foundKey]).trim();
+                                break;
+                            }
+                        }
+
+                        // 2. Fallback: Search for any key containing SK or KPS
+                        if (!foundNoSk) {
+                            for (const key of keys) {
+                                const upperKey = key.toUpperCase();
+                                if (upperKey.includes('SK') || (upperKey.includes('NO') && upperKey.includes('KPS'))) {
+                                    if (props[key] && String(props[key]).trim()) {
+                                        foundNoSk = String(props[key]).trim();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (foundNoSk) break;
+                    }
+                }
+
+                // Store pending data for KPS dialog
+                setPendingGeoData(finalGeo);
+                setPendingFile({ name: targetFile.name, size: targetFile.size });
+                setExtractedNoSk(foundNoSk);
+
+                // Reset previous state
                 setData(null); setMapUrl(null); setVectorLayerData(null); setError(null);
                 setBatchQueue([]); // Clear batch queue if switching to single mode
-                // Keep sidebar open after upload so user can configure analysis
+
+                // === CHECK FOR DUPLICATE BEFORE KPS DETECTION ===
+                try {
+                    console.log('🔍 Checking for duplicate geometry...');
+                    const dupResponse = await axios.post(`${API_URL}/api/check-duplicate`, { geo_data: finalGeo });
+
+                    if (dupResponse.data?.is_duplicate && dupResponse.data?.has_analysis) {
+                        console.log('⚠️ Duplicate found:', dupResponse.data);
+                        setDuplicateInfo(dupResponse.data);
+                        setShowDuplicateDialog(true);
+                        return; // Stop here, let DuplicateDialog handle the flow
+                    }
+                } catch (err) {
+                    console.warn('Duplicate check failed:', err.message);
+                    // Continue with normal flow if check fails
+                }
+
+                // Try auto-detect KPS if NO_SK found
+                if (foundNoSk) {
+                    try {
+                        console.log(`🔍 Auto-detecting KPS for NO_SK: ${foundNoSk}`);
+                        const response = await axios.get(`${API_URL}/api/kps/auto-detect?no_sk=${encodeURIComponent(foundNoSk)}`);
+                        if (response.data?.status === 'found' && response.data.kps) {
+                            console.log(`✅ KPS found:`, response.data.kps);
+                            setDetectedKps(response.data.kps);
+                        } else {
+                            console.log(`ℹ️ NO_SK not found in master_kps`);
+                            setDetectedKps(null);
+                        }
+                    } catch (err) {
+                        console.error("KPS auto-detect error:", err);
+                        setDetectedKps(null);
+                    }
+                } else {
+                    setDetectedKps(null);
+                }
+
+                // Show KPS detection dialog
+                setShowKpsDialog(true);
 
             } catch (err) {
                 console.error("Single File Parse Error:", err);
@@ -509,7 +695,7 @@ const App = () => {
                                 ...j,
                                 status: 'skipped',
                                 progress: 100,
-                                progressDetail: `Sudah ada di database (${existingItem.filename})`,
+                                progressDetail: `Sudah ada di database (${existingItem.display_name || existingItem.filename})`,
                                 existingHistoryId: existingItem.id
                             }
                             : j
@@ -699,7 +885,7 @@ const App = () => {
             if (fullItem.geo_data) {
                 setGeoData(fullItem.geo_data);
             }
-            setFile({ name: fullItem.filename, size: fullItem.file_size, id: item.id });
+            setFile({ name: fullItem.display_name || fullItem.filename, size: fullItem.file_size, id: item.id });
             if (fullItem.analysis_results?.length > 0) {
                 const lastData = fullItem.analysis_results[fullItem.analysis_results.length - 1];
                 setSelectedYear(lastData.year || fullItem.analysis_results[0].year);
@@ -710,6 +896,19 @@ const App = () => {
                 setStartYear(fullItem.metadata.start_year || 2017);
                 setTransitionSummary(fullItem.metadata.transition_summary || null);
                 setAuditReport(fullItem.metadata.audit_report || null);
+            }
+
+            // Load slope summary data if available (saved from previous analysis)
+            if (fullItem.slope_summary && fullItem.slope_summary.length > 0) {
+                const insideSlope = fullItem.slope_summary.find(s => s.scope === 'INSIDE');
+                const outsideSlope = fullItem.slope_summary.find(s => s.scope === 'OUTSIDE_2KM');
+                if (insideSlope) setSlopeDbSummary(insideSlope);
+                if (outsideSlope) setSlopeDbSummaryOutside(outsideSlope);
+                console.log('📐 Loaded saved slope data from history');
+            } else {
+                // Clear slope data if not available
+                setSlopeDbSummary(null);
+                setSlopeDbSummaryOutside(null);
             }
 
             setShowHistoryTable(false);
@@ -729,7 +928,7 @@ const App = () => {
             const fullItem = response.data;
 
             if (fullItem.geo_data) setGeoData(fullItem.geo_data);
-            setFile({ name: fullItem.filename, size: fullItem.file_size });
+            setFile({ name: fullItem.display_name || fullItem.filename, size: fullItem.file_size });
             setData(null);
             setVectorLayerData(null);
             setMapUrl(null);
@@ -757,6 +956,9 @@ const App = () => {
         setStartYear(2017); setEndYear(currentYear - 1);
         setMapType('satellite'); // Switch back to high-res basemap
         setShowAllPins(true); fetchHistory();
+        // Clear KPS detection states
+        setDetectedKps(null); setExtractedNoSk(null); setKpsLinkMethod(null);
+        setPendingGeoData(null); setPendingFile(null);
     };
 
     const handleCancel = () => {
@@ -774,26 +976,238 @@ const App = () => {
         setError("Analisis dibatalkan oleh pengguna");
     };
 
-    const handleAnalyze = async (customThresholds = null, config = { skipConflictCheck: false, mode: 'replace' }) => {
-        if (!geoData) return;
+    // === KPS DETECTION DIALOG HANDLERS ===
+    const handleKpsConfirm = (kps, method) => {
+        // User confirmed a KPS selection
+        console.log(`✅ KPS confirmed: ${kps.nama_kps} (method: ${method})`);
+        setDetectedKps(kps);
+        setKpsLinkMethod(method);
+        setShowKpsDialog(false);
 
-        const skipConflictCheck = config?.skipConflictCheck || false;
-        const currentMode = config?.mode || 'replace';
+        // Now set the actual geoData and file from pending state
+        if (pendingGeoData) {
+            setGeoData(pendingGeoData);
+        }
+        if (pendingFile) {
+            setFile(pendingFile);
+        }
 
-        // 1. Conflict Check: Cari apakah SHP ini sudah pernah dianalisis
-        if (!skipConflictCheck && historyData.length > 0) {
-            // Heuristic check: bandingkan string coordinates fitur pertama
-            const currentGeom = JSON.stringify(geoData.features?.[0]?.geometry?.coordinates);
-            const match = historyData.find(item => {
-                const itemGeom = JSON.stringify(item.geo_data?.features?.[0]?.geometry?.coordinates);
-                return itemGeom === currentGeom;
-            });
+        // Clear pending state
+        setPendingGeoData(null);
+        setPendingFile(null);
+    };
 
-            if (match) {
-                setAnalysisConflict(match);
-                return; // Tunggu konfirmasi user
+    const handleKpsSkip = () => {
+        // User chose to proceed as NON_KPS
+        console.log(`ℹ️ Proceeding as NON_KPS`);
+        setDetectedKps(null);
+        setKpsLinkMethod('NONE');
+        setShowKpsDialog(false);
+
+        // Now set the actual geoData and file from pending state
+        if (pendingGeoData) {
+            setGeoData(pendingGeoData);
+        }
+        if (pendingFile) {
+            setFile(pendingFile);
+        }
+
+        // Clear pending state
+        setPendingGeoData(null);
+        setPendingFile(null);
+    };
+
+    const handleKpsClose = () => {
+        // User closed dialog without selection - cancel the upload
+        console.log(`ℹ️ KPS dialog closed - cancelling upload`);
+        setShowKpsDialog(false);
+        setDetectedKps(null);
+        setExtractedNoSk(null);
+        setKpsLinkMethod(null);
+        setPendingGeoData(null);
+        setPendingFile(null);
+    };
+
+    // === DUPLICATE DIALOG HANDLERS ===
+    const continueToKpsDetection = async () => {
+        // Helper function to continue the flow after duplicate handling
+        const foundNoSk = extractedNoSk;
+
+        if (foundNoSk) {
+            try {
+                console.log(`🔍 Auto-detecting KPS for NO_SK: ${foundNoSk}`);
+                const response = await axios.get(`${API_URL}/api/kps/auto-detect?no_sk=${encodeURIComponent(foundNoSk)}`);
+                if (response.data?.status === 'found' && response.data.kps) {
+                    console.log(`✅ KPS found:`, response.data.kps);
+                    setDetectedKps(response.data.kps);
+                } else {
+                    setDetectedKps(null);
+                }
+            } catch (err) {
+                console.error("KPS auto-detect error:", err);
+                setDetectedKps(null);
             }
         }
+
+        setShowKpsDialog(true);
+    };
+
+    const handleDuplicateUpdate = async (missingYears) => {
+        // User chose to Update - analyze only missing years
+        console.log(`📥 Update mode: Will analyze only years: ${missingYears.join(', ')}`);
+        setDuplicateHandleMode('merge');
+        setSelectedYearsForAnalysis(missingYears);
+        setShowDuplicateDialog(false);
+
+        // Continue to KPS detection
+        await continueToKpsDetection();
+    };
+
+    const handleDuplicateReplace = async () => {
+        // User chose to Replace - delete old and analyze all years
+        console.log(`🔄 Replace mode: Will delete old data and re-analyze all years`);
+        setDuplicateHandleMode('replace');
+        setSelectedYearsForAnalysis(null); // null = all years
+        setShowDuplicateDialog(false);
+
+        // Continue to KPS detection
+        await continueToKpsDetection();
+    };
+
+    const handleDuplicateCancel = () => {
+        // User cancelled - reset everything
+        console.log(`❌ Duplicate dialog cancelled`);
+        setShowDuplicateDialog(false);
+        setDuplicateInfo(null);
+        setDuplicateHandleMode('replace');
+        setSelectedYearsForAnalysis(null);
+        setPendingGeoData(null);
+        setPendingFile(null);
+        setExtractedNoSk(null);
+    };
+
+    // Custom Pins Handlers (with backend sync)
+    const handleAddCustomPin = async (latlng, label = '') => {
+        try {
+            // Optimistic update
+            const tempPin = {
+                id: `temp_${Date.now()}`,
+                lat: latlng.lat,
+                lng: latlng.lng,
+                label: label || `Pin ${customPins.length + 1}`,
+                created_at: new Date().toISOString()
+            };
+            setCustomPins(prev => [...prev, tempPin]);
+
+            // Save to backend
+            const response = await axios.post(`${API_URL}/api/pins`, {
+                lat: latlng.lat,
+                lng: latlng.lng,
+                label: label || `Pin ${customPins.length + 1}`
+            });
+
+            if (response.data?.status === 'success') {
+                // Replace temp pin with real pin from backend
+                setCustomPins(prev => prev.map(p =>
+                    p.id === tempPin.id ? response.data.data : p
+                ));
+                // Update localStorage cache
+                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
+                    customPins.map(p => p.id === tempPin.id ? response.data.data : p)
+                ));
+                console.log(`📍 Added custom pin:`, response.data.data);
+            }
+        } catch (err) {
+            console.error("Error adding pin:", err);
+            // Revert optimistic update on error
+            fetchCustomPins();
+            alert('Gagal menambahkan pin. Silakan coba lagi.');
+        }
+    };
+
+    const handleDeleteCustomPin = async (pinId) => {
+        try {
+            // Optimistic update
+            const pinToDelete = customPins.find(p => p.id === pinId);
+            setCustomPins(prev => prev.filter(p => p.id !== pinId));
+
+            // Delete from backend
+            await axios.delete(`${API_URL}/api/pins/${pinId}`);
+
+            // Update localStorage cache
+            localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
+                customPins.filter(p => p.id !== pinId)
+            ));
+            console.log(`🗑️ Deleted custom pin: ${pinId}`);
+        } catch (err) {
+            console.error("Error deleting pin:", err);
+            // Revert optimistic update on error
+            fetchCustomPins();
+            alert('Gagal menghapus pin. Silakan coba lagi.');
+        }
+    };
+
+    const handleUpdateCustomPin = async (pinId, updates) => {
+        try {
+            // Optimistic update
+            setCustomPins(prev => prev.map(p => p.id === pinId ? { ...p, ...updates } : p));
+
+            // Update backend
+            const response = await axios.put(`${API_URL}/api/pins/${pinId}`, {
+                label: updates.label
+            });
+
+            if (response.data?.status === 'success') {
+                // Update with backend response
+                setCustomPins(prev => prev.map(p =>
+                    p.id === pinId ? response.data.data : p
+                ));
+                // Update localStorage cache
+                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
+                    customPins.map(p => p.id === pinId ? response.data.data : p)
+                ));
+                console.log(`✏️ Updated custom pin: ${pinId}`, updates);
+            }
+        } catch (err) {
+            console.error("Error updating pin:", err);
+            // Revert optimistic update on error
+            fetchCustomPins();
+            alert('Gagal mengupdate pin. Silakan coba lagi.');
+        }
+    };
+
+    const handleClearAllCustomPins = () => {
+        // This function is no longer used since we removed the Clear All button
+        console.log('Clear all pins is deprecated');
+    };
+
+    const handleBulkValidationComplete = (validationResults, fileItems) => {
+        setBulkValidationResults(validationResults);
+        setBulkFileItems(fileItems);
+        setShowBulkUploadDialog(false);
+        setShowBulkReportDialog(true);
+    };
+
+    const handleBulkReportSuccess = async (results, fileItems) => {
+        console.log('Bulk upload complete:', results);
+        setShowBulkReportDialog(false);
+        setShowAnalysisComplete(true);
+        setTimeout(() => setShowAnalysisComplete(false), 3000);
+        fetchHistory();
+    };
+
+    const handleBulkError = (error) => {
+        alert(`Bulk upload error: ${error}`);
+        setShowBulkUploadDialog(false);
+        setShowBulkReportDialog(false);
+    };
+
+    const handleAnalyze = async (customThresholds = null) => {
+        if (!geoData) return;
+
+        // Use mode from duplicate dialog state
+        const analysisMode = duplicateHandleMode; // 'merge' or 'replace'
+        const yearsToAnalyze = selectedYearsForAnalysis; // Array of years or null (all)
 
         let actualThresholds = (customThresholds && customThresholds.nativeEvent) ? null : customThresholds;
         if (!actualThresholds) actualThresholds = thresholds;
@@ -806,7 +1220,8 @@ const App = () => {
         abortControllerRef.current = new AbortController(); // Create controller for potential fallback
 
         console.log(' RF Classification Request');
-        console.log(`📅 Year Range: ${startYear} - ${endYear}`);
+        console.log(`📅 Year Range: ${yearsToAnalyze ? yearsToAnalyze.join(', ') : startYear + ' - ' + endYear}`);
+        console.log(`📥 Mode: ${analysisMode}`);
         console.log(`☁️ Cloud Threshold: ${CLOUD_PROB_THRESHOLD_FIXED}% (Fixed)`);
 
         const WS_URL = API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
@@ -824,12 +1239,12 @@ const App = () => {
                     geojson: geoData,
                     start_year: startYear,
                     end_year: endYear,
+                    selected_years: yearsToAnalyze, // NEW: Specific years to analyze
                     thresholds: actualThresholds,
-                    mode: analysisMode,
-                    specific_date: analysisMode === 'single' ? specificDate : null,
+                    mode: analysisMode, // 'merge' or 'replace'
                     cloud_prob_threshold: CLOUD_PROB_THRESHOLD_FIXED,
-                    // OPTIMASI: Kirim data tahun yang sudah ada jika mode MERGE
-                    existing_data: currentMode === 'merge' ? (analysisConflict?.analysis_results || []) : []
+                    // If merge mode, we don't need to send existing data back, backend handles it
+                    existing_data: []
                 }));
             };
             ws.onerror = () => { clearTimeout(connTimeout); if (!completed) { completed = true; reject(new Error('WebSocket error')); } };
@@ -870,9 +1285,13 @@ const App = () => {
                                 },
                                 analysis_results: msg.data.data,
                                 geo_data: geoData,
-                                mode: currentMode,
+                                mode: analysisMode, // Pass the mode (merge/replace)
                                 transition_summary: msg.data.transition_summary,
-                                audit_report: msg.data.audit_report
+                                audit_report: msg.data.audit_report,
+                                // KPS Detection Fields
+                                kps_id: detectedKps?.id_kps_api || null,
+                                link_method: kpsLinkMethod || 'NONE',
+                                analysis_scope: detectedKps ? 'KPS' : 'NON_KPS'
                             }).then(() => {
                                 console.log('✅ History saved successfully');
                                 fetchHistory();
@@ -1013,6 +1432,8 @@ const App = () => {
         // SIGAP Interaktif
         showKawasanHutan, setShowKawasanHutan, kawasanHutanOpacity, setKawasanHutanOpacity,
         showDAS, setShowDAS, dasOpacity, setDasOpacity,
+        // Slope Analysis Layer
+        showSlopeLayer, setShowSlopeLayer, slopeOpacityInside, setSlopeOpacityInside, slopeOpacityOutside, setSlopeOpacityOutside, slopeMapUrlInside, slopeMapUrlOutside, slopeDbSummary, slopeDbSummaryOutside,
         // Batch Mode
         isBatchMode, setIsBatchMode,
         // Carbon Time-Series Mode
@@ -1024,7 +1445,17 @@ const App = () => {
         transitionSummary,
         auditReport,
         timeLeft, // Pass countdown to MainLayout
-        queuePosition // Pass current queue rank
+        queuePosition, // Pass current queue rank
+        // Custom Pins
+        customPins,
+        isAddingPin,
+        setIsAddingPin,
+        handleAddCustomPin,
+        handleDeleteCustomPin,
+        handleUpdateCustomPin,
+        handleClearAllCustomPins,
+        // Bulk Upload
+        setShowBulkUploadDialog
     };
 
     return (
@@ -1198,6 +1629,46 @@ const App = () => {
                 }}
                 filename={carbonFilename}
             />
+
+            {/* KPS Detection Dialog */}
+            <KpsDetectionDialog
+                show={showKpsDialog}
+                detectedKps={detectedKps}
+                extractedNoSk={extractedNoSk}
+                onConfirm={handleKpsConfirm}
+                onSkip={handleKpsSkip}
+                onClose={handleKpsClose}
+            />
+
+            {/* Duplicate SHP Detection Dialog */}
+            <DuplicateDialog
+                show={showDuplicateDialog}
+                duplicateInfo={duplicateInfo}
+                allYears={Array.from({ length: endYear - 2016 }, (_, i) => 2017 + i)}
+                onUpdate={handleDuplicateUpdate}
+                onReplace={handleDuplicateReplace}
+                onCancel={handleDuplicateCancel}
+            />
+
+            {/* Bulk Upload Dialog */}
+            {showBulkUploadDialog && (
+                <BulkUploadDialog
+                    onClose={() => setShowBulkUploadDialog(false)}
+                    onValidationComplete={handleBulkValidationComplete}
+                    onError={handleBulkError}
+                />
+            )}
+
+            {/* Bulk Report Dialog */}
+            {showBulkReportDialog && bulkValidationResults && bulkFileItems && (
+                <BulkReportDialog
+                    validationResults={bulkValidationResults}
+                    bulkFileItems={bulkFileItems}
+                    onClose={() => setShowBulkReportDialog(false)}
+                    onSuccess={handleBulkReportSuccess}
+                    onError={handleBulkError}
+                />
+            )}
         </>
     );
 };

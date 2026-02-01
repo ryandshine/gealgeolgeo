@@ -1,0 +1,141 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "year": 2021,
+        "hutan_primer": 900.5,
+        "hutan_sekunder": 850.2,
+        "tanah_kering": 150.3,
+        "tanah_kosong": 50.0,
+        "lahan_terbangun": 25.0,
+        "air": 24.0,
+        "total_area": 2000.0,
+        "deforestation_ha": 0.0,
+        "reforestation_ha": 0.0,
+        "description": "Year 2021 - Hutan Sekunder dominan (BASELINE) - Total Area: 2000 ha"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 0.0],
+            [101.0, 0.0],
+            [101.0, 1.0],
+            [100.0, 1.0],
+            [100.0, 0.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "year": 2022,
+        "hutan_primer": 895.0,
+        "hutan_sekunder": 860.5,
+        "tanah_kering": 145.0,
+        "tanah_kosong": 55.0,
+        "lahan_terbangun": 25.5,
+        "air": 24.0,
+        "total_area": 2005.0,
+        "deforestation_ha": 15.0,
+        "reforestation_ha": 5.0,
+        "description": "Year 2022 - Hutan Sekunder masih dominan → Status: STABLE - Total Area: 2005 ha"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 0.0],
+            [101.0, 0.0],
+            [101.0, 1.0],
+            [100.0, 1.0],
+            [100.0, 0.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "year": 2023,
+        "hutan_primer": 320.0,
+        "hutan_sekunder": 680.0,
+        "tanah_kering": 500.0,
+        "tanah_kosong": 400.0,
+        "lahan_terbangun": 75.0,
+        "air": 25.0,
+        "total_area": 2000.0,
+        "deforestation_ha": 850.0,
+        "reforestation_ha": 0.0,
+        "description": "Year 2023 - PERUBAHAN BESAR! Tanah Kosong jadi dominan → Status: TRANSITION_UNCONFIRMED (GREY AREA) - Total Area: 2000 ha"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 0.0],
+            [101.0, 0.0],
+            [101.0, 1.0],
+            [100.0, 1.0],
+            [100.0, 0.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "year": 2024,
+        "hutan_primer": 280.0,
+        "hutan_sekunder": 520.0,
+        "tanah_kering": 450.0,
+        "tanah_kosong": 620.0,
+        "lahan_terbangun": 100.0,
+        "air": 30.0,
+        "total_area": 2000.0,
+        "deforestation_ha": 180.0,
+        "reforestation_ha": 0.0,
+        "description": "Year 2024 - Tanah Kosong tetap dominan → Status: TRANSITION_CONFIRMED (perubahan dikonfirmasi) - Total Area: 2000 ha"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 0.0],
+            [101.0, 0.0],
+            [101.0, 1.0],
+            [100.0, 1.0],
+            [100.0, 0.0]
+          ]
+        ]
+      }
+    }
+  ],
+  "metadata": {
+    "title": "Test Data - Temporal Status Grey Area Scenario",
+    "description": "Synthetic test data untuk testing temporal status calculation dengan grey area scenario",
+    "scenario": "Deforestation & Grey Area Detection",
+    "expected_temporal_status": {
+      "2021": "stable (baseline year)",
+      "2022": "stable (same dominant class as 2021)",
+      "2023": "transition_unconfirmed (GREY AREA - changed from Hutan Sekunder to Tanah Kosong, but 2024 not yet known)",
+      "2024": "transition_confirmed (change persisted from 2023)"
+    },
+    "expected_dominant_class": {
+      "2021": "hutan_sekunder (850.2 ha)",
+      "2022": "hutan_sekunder (860.5 ha)",
+      "2023": "tanah_kosong (400.0 ha)",
+      "2024": "tanah_kosong (620.0 ha)"
+    },
+    "expected_visualization": {
+      "2021": "100% opacity - solid color (STABLE)",
+      "2022": "100% opacity - solid color (STABLE)",
+      "2023": "50% opacity - fading/grey color (GREY AREA - TRANSITION_UNCONFIRMED)",
+      "2024": "100% opacity - solid color (TRANSITION_CONFIRMED)"
+    },
+    "testing_notes": "Upload this GeoJSON as a new analysis to trigger backend temporal_status calculation. The system should automatically calculate and assign temporal_status values based on year-to-year dominant class changes."
+  }
+}

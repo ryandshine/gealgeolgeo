@@ -156,20 +156,17 @@ export const SIGAP_CONFIG = {
     DAS: `${API_URL}/proxy/sigap/Klasifikasi_DAS/MapServer`
 };
 
-// BMKG Hotspot FeatureServer (Public, No Token Required)
-export const BMKG_HOTSPOT_CONFIG = {
-    QUERY_URL: 'https://datacuaca.bmkg.go.id/arcgis/rest/services/production/geohotspot/FeatureServer/0/query'
+// NASA FIRMS Hotspot API (Fire Information for Resource Management System)
+// Source: https://firms.modaps.eosdis.nasa.gov/
+export const NASA_FIRMS_CONFIG = {
+    // Backend proxy endpoint for NASA FIRMS data
+    PROXY_URL: `${API_URL}/proxy/nasa/hotspot`,
+    // Available satellite sources
+    SOURCES: {
+        VIIRS_SNPP: 'VIIRS_SNPP_NRT',  // Suomi NPP satellite (375m resolution)
+        VIIRS_NOAA20: 'VIIRS_NOAA20_NRT',  // NOAA-20 satellite (375m resolution)
+        MODIS_TERRA: 'MODIS_NRT',  // Terra & Aqua combined (1km resolution)
+    },
+    DEFAULT_SOURCE: 'VIIRS_SNPP_NRT'  // Use VIIRS for better resolution
 };
 
-// BIG (Badan Informasi Geospasial) Administrative Boundaries - Reference Layer ONLY
-// Source: https://geoservices.big.go.id/rbi/rest/services/BATASWILAYAH/BATAS_WILAYAH/MapServer
-export const BIG_ADMIN_CONFIG = {
-    EXPORT_URL: 'https://geoservices.big.go.id/rbi/rest/services/BATASWILAYAH/BATAS_WILAYAH/MapServer/export',
-    LAYERS: {
-        NEGARA: { id: 7, name: 'Batas Negara' },
-        PROVINSI: { id: 8, name: 'Batas Provinsi' },
-        KABKOTA: { id: 9, labelId: 5, name: 'Batas Kabupaten/Kota' },
-        KECAMATAN: { id: 10, labelId: 0, name: 'Batas Kecamatan' },
-        DESA: { id: 11, labelId: 3, name: 'Batas Desa / Kelurahan' }
-    }
-};

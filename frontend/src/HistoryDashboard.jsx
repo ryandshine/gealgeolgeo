@@ -13,81 +13,110 @@ const COLORS = {
     4: "#1E90FF"   // Air
 };
 
-const GeoJSONThumbnail = ({ data, width = 60, height = 60, fallbackColor = '#cccccc' }) => {
+const GeoJSONThumbnail = React.memo(({ data, width = 60, height = 60, fallbackColor = '#cccccc' }) => {
     const canvasRef = React.useRef(null);
+    const [isVisible, setIsVisible] = React.useState(false);
 
+    // Intersection Observer for lazy loading
     React.useEffect(() => {
-        if (!data || !data.features || !canvasRef.current) return;
+        const observer = new IntersectionObserver(
+            ([entry]) => {
+                if (entry.isIntersecting) {
+                    setIsVisible(true);
+                    observer.unobserve(entry.target);
+                }
+            },
+            { rootMargin: '50px' }
+        );
 
-        const ctx = canvasRef.current.getContext('2d');
-        ctx.clearRect(0, 0, width, height);
+        if (canvasRef.current) observer.observe(canvasRef.current);
+        return () => observer.disconnect();
+    }, []);
 
-        // 1. Calculate Bounds
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    // Deferred canvas rendering using requestIdleCallback
+    React.useEffect(() => {
+        if (!isVisible || !data || !data.features || !canvasRef.current) return;
 
-        const processCoords = (coords) => {
-            if (typeof coords[0] === 'number') {
-                const [x, y] = coords;
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
-            } else {
-                coords.forEach(processCoords);
-            }
-        };
+        const renderCanvas = () => {
+            const ctx = canvasRef.current?.getContext('2d');
+            if (!ctx) return;
 
-        data.features.forEach(f => processCoords(f.geometry.coordinates));
+            ctx.clearRect(0, 0, width, height);
 
-        if (!isFinite(minX)) return; // Empty or invalid
+            // 1. Calculate Bounds
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
-        const rangeX = maxX - minX;
-        const rangeY = maxY - minY;
-        const scale = Math.min(width / rangeX, height / rangeY) * 0.9; // 90% fill
-
-        const offsetX = (width - rangeX * scale) / 2;
-        const offsetY = (height - rangeY * scale) / 2;
-
-        // 2. Draw
-        data.features.forEach(f => {
-            // Priority: Feature specific class -> Fallback dominant color -> Default grey
-            // Try to parse class if it's a string, or lookup directly
-            const featureClass = f.properties.class || f.properties.gridcode || f.properties.DN;
-            let fillStyle = fallbackColor;
-
-            if (featureClass) {
-                fillStyle = COLORS[Number(featureClass)] || COLORS[featureClass] || fallbackColor;
-            }
-
-            ctx.fillStyle = fillStyle;
-            ctx.beginPath();
-
-            const drawPoly = (rings) => {
-                rings.forEach((ring) => {
-                    ring.forEach(([x, y], i) => {
-                        // Flip Y because Canvas Y is down, Geo Y is up (Latitude)
-                        const px = (x - minX) * scale + offsetX;
-                        const py = (maxY - y) * scale + offsetY;
-                        if (i === 0) ctx.moveTo(px, py);
-                        else ctx.lineTo(px, py);
-                    });
-                    ctx.closePath();
-                });
+            const processCoords = (coords) => {
+                if (typeof coords[0] === 'number') {
+                    const [x, y] = coords;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                } else {
+                    coords.forEach(processCoords);
+                }
             };
 
-            if (f.geometry.type === 'Polygon') {
-                drawPoly(f.geometry.coordinates);
-            } else if (f.geometry.type === 'MultiPolygon') {
-                f.geometry.coordinates.forEach(poly => drawPoly(poly));
-            }
+            data.features.forEach(f => processCoords(f.geometry.coordinates));
 
-            ctx.fill();
-        });
+            if (!isFinite(minX)) return;
 
-    }, [data, width, height, fallbackColor]);
+            const rangeX = maxX - minX;
+            const rangeY = maxY - minY;
+            const scale = Math.min(width / rangeX, height / rangeY) * 0.9;
+
+            const offsetX = (width - rangeX * scale) / 2;
+            const offsetY = (height - rangeY * scale) / 2;
+
+            // 2. Draw - limit to first 100 features for perf
+            const featuresToDraw = data.features.slice(0, 100);
+            featuresToDraw.forEach(f => {
+                const featureClass = f.properties.class || f.properties.gridcode || f.properties.DN;
+                let fillStyle = fallbackColor;
+
+                if (featureClass) {
+                    fillStyle = COLORS[Number(featureClass)] || COLORS[featureClass] || fallbackColor;
+                }
+
+                ctx.fillStyle = fillStyle;
+                ctx.beginPath();
+
+                const drawPoly = (rings) => {
+                    rings.forEach((ring) => {
+                        ring.forEach(([x, y], i) => {
+                            const px = (x - minX) * scale + offsetX;
+                            const py = (maxY - y) * scale + offsetY;
+                            if (i === 0) ctx.moveTo(px, py);
+                            else ctx.lineTo(px, py);
+                        });
+                        ctx.closePath();
+                    });
+                };
+
+                if (f.geometry.type === 'Polygon') {
+                    drawPoly(f.geometry.coordinates);
+                } else if (f.geometry.type === 'MultiPolygon') {
+                    f.geometry.coordinates.forEach(poly => drawPoly(poly));
+                }
+
+                ctx.fill();
+            });
+        };
+
+        // Use requestIdleCallback if available, else setTimeout
+        if ('requestIdleCallback' in window) {
+            requestIdleCallback(renderCanvas, { timeout: 2000 });
+        } else {
+            setTimeout(renderCanvas, 0);
+        }
+
+    }, [data, width, height, fallbackColor, isVisible]);
 
     return <canvas ref={canvasRef} width={width} height={height} className="rounded-lg bg-slate-100/50 border border-slate-200" />;
-};
+});
+
+GeoJSONThumbnail.displayName = 'GeoJSONThumbnail';
 
 const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete, onReanalyze, onUpdateItem, onOpenCarbonMode }) => {
 
@@ -157,12 +186,16 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
     const [searchTerm, setSearchTerm] = React.useState("");
     const [deleteConfirmId, setDeleteConfirmId] = React.useState(null);
     const [selectedImage, setSelectedImage] = React.useState(null); // Lightbox State
+    const [failedThumbnails, setFailedThumbnails] = React.useState(new Set()); // Track failed image loads
 
     const filteredHistory = React.useMemo(() => {
         if (!searchTerm) return history;
-        return history.filter(item =>
-            item.filename.toLowerCase().includes(searchTerm.toLowerCase())
-        );
+        return history.filter(item => {
+            const displayName = (item.display_name || item.filename || '').toLowerCase();
+            const fileName = (item.filename || '').toLowerCase();
+            return displayName.includes(searchTerm.toLowerCase()) ||
+                   fileName.includes(searchTerm.toLowerCase());
+        });
     }, [history, searchTerm]);
 
     const handleRegenerateVisuals = async (e, item) => {
@@ -245,7 +278,7 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `GealGeolGeo_Stats_${item.filename.replace('.shp', '')}_${new Date().toISOString().split('T')[0]}.xlsx`;
+            a.download = `GealGeolGeo_Stats_${(item.display_name || item.filename).replace('.shp', '')}_${new Date().toISOString().split('T')[0]}.xlsx`;
             document.body.appendChild(a);
             a.click();
             a.remove();
@@ -276,7 +309,7 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
 
                 {/* Header Section */}
                 <div className="bg-gradient-to-r from-white to-emerald-50/30 backdrop-blur-md rounded-2xl p-4 md:p-6 shadow-xl border border-white/20 mb-6 md:mb-8 flex flex-col md:flex-row items-center md:items-start gap-4 ring-1 ring-slate-900/5">
-                    <div className="flex items-start gap-4 self-start md:self-auto">
+                    <div className="flex items-center md:items-start gap-4 self-auto md:self-auto">
                         <div className="p-2.5 md:p-3 bg-emerald-500 text-white rounded-xl shadow-lg shadow-emerald-500/30">
                             <Database size={20} className="md:w-6 md:h-6" />
                         </div>
@@ -315,17 +348,22 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                     </div>
                 </div>
 
-                {/* NEW LAYOUT: MODERN CARD GRID (Mobile Optimized) */}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mb-24 animate-in fade-in duration-500">
+                {/* NEW LAYOUT: MODERN CARD GRID (Mobile Optimized + Performance) */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mb-24 animate-in fade-in duration-500" style={{ contain: 'layout style paint' }}>
                     {filteredHistory.map((item) => {
                         // Logic Extract Last Year Data & Total & Trend
-                        const latestData = item.analysis_results && item.analysis_results.length > 0
-                            ? item.analysis_results[item.analysis_results.length - 1]
-                            : null;
+                        // Find the actual latest year (max year value) - don't just use last element
+                        let latestData = null;
+                        let firstData = null;
 
-                        const firstData = item.analysis_results && item.analysis_results.length > 0
-                            ? item.analysis_results[0]
-                            : null;
+                        if (item.analysis_results && item.analysis_results.length > 0) {
+                            // Sort by year to ensure we get the actual latest year
+                            const sorted = [...item.analysis_results].sort((a, b) =>
+                                (Number(a.year) || 0) - (Number(b.year) || 0)
+                            );
+                            latestData = sorted[sorted.length - 1]; // Last = highest year
+                            firstData = sorted[0]; // First = lowest year
+                        }
 
                         const totalArea = latestData
                             ? (
@@ -371,29 +409,28 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                         const vectorData = latestData?.vector_geojson || item.geo_data;
 
                         return (
-                            <div key={item.id} className="group bg-white rounded-2xl border border-slate-200 shadow-sm hover:shadow-[0_20px_40px_rgba(0,0,0,0.1)] hover:-translate-y-1 transition-all duration-300 overflow-hidden flex flex-col relative touch-manipulation">
+                            <div key={item.id} className="group bg-white rounded-2xl border border-slate-200 shadow-sm hover:shadow-[0_20px_40px_rgba(0,0,0,0.1)] hover:-translate-y-1 transition-all duration-300 overflow-hidden flex flex-col relative touch-manipulation" style={{ willChange: 'transform, box-shadow', contain: 'content' }}>
                                 {/* Card Header: File Info */}
                                 <div className="p-3.5 md:p-4 flex items-start gap-3 border-b border-slate-100 bg-slate-50/50">
                                     <div className="p-2.5 bg-white rounded-xl shadow-sm border border-slate-100 text-slate-400 group-hover:text-emerald-500 group-hover:border-emerald-200 transition-colors">
                                         <FileText size={20} />
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                        <h3 className="font-bold text-slate-800 text-sm truncate mb-1" title={item.filename}>
-                                            {item.filename}
+                                        <h3 className="font-bold text-slate-800 text-sm line-clamp-2 mb-1 leading-tight" title={item.display_name || item.filename}>
+                                            {item.display_name || item.filename}
                                         </h3>
-                                        <div className="flex items-center gap-2 text-[10px] text-slate-400 font-medium">
-                                            <span className="flex items-center gap-1">
-                                                <Calendar size={10} />
+                                        <div className="flex flex-wrap items-center gap-2 text-[9px] text-slate-400 font-medium mt-1">
+                                            <span className="flex items-center gap-0.5">
+                                                <Calendar size={9} />
                                                 {new Date(item.created_at).toLocaleString('id-ID', {
                                                     day: 'numeric',
                                                     month: 'short',
                                                     year: 'numeric',
                                                     hour: '2-digit',
-                                                    minute: '2-digit',
-                                                    second: '2-digit'
+                                                    minute: '2-digit'
                                                 })}
                                             </span>
-                                            <div className="w-1 h-1 rounded-full bg-slate-300"></div>
+                                            <div className="w-0.5 h-0.5 rounded-full bg-slate-300"></div>
                                             <span>{formatFileSize(item.file_size)}</span>
                                         </div>
                                     </div>
@@ -404,7 +441,7 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                                 {trendInfo.label}
                                             </div>
                                         )}
-                                        <div className="px-2 py-0.5 rounded bg-amber-50 border border-amber-100 text-[8px] font-bold text-amber-700 uppercase tracking-tighter shadow-sm">
+                                        <div className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[8px] font-bold uppercase tracking-tighter shadow-sm">
                                             Dominan: {dominantClassName}
                                         </div>
                                     </div>
@@ -445,24 +482,35 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                                     dominantColor = hutan >= nonHutan ? '#10b981' : '#f59e0b'; // Emerald (Forest) vs Amber (Non-Forest/Dry)
                                                 }
 
+                                                const thumbKey = `${item.id}-${res.year}`;
+                                                const imageFailed = failedThumbnails.has(thumbKey);
+                                                const thumbUrl = isValidThumb ? (res.thumb_url.startsWith('/') ? `${API_URL.replace(/\/api\/?$/, '')}${res.thumb_url}` : res.thumb_url) : null;
+
                                                 return (
                                                     <div key={idx} className="shrink-0 relative group/thumb cursor-zoom-in"
                                                         onClick={(e) => {
                                                             e.stopPropagation();
-                                                            const fullUrl = res.thumb_url.startsWith('/') ? `${API_URL.replace(/\/api\/?$/, '')}${res.thumb_url}` : res.thumb_url;
-                                                            setSelectedImage({
-                                                                url: fullUrl,
-                                                                title: `Visualisasi Tahun ${res.year}`,
-                                                                subtitle: `${item.filename} - Analisis Tutupan Lahan`
-                                                            });
+                                                            if (thumbUrl && !imageFailed) {
+                                                                setSelectedImage({
+                                                                    url: thumbUrl,
+                                                                    title: `Visualisasi Tahun ${res.year}`,
+                                                                    subtitle: `${item.display_name || item.filename} - Analisis Tutupan Lahan`
+                                                                });
+                                                            }
                                                         }}
                                                     >
                                                         <div className="w-20 h-20 rounded-lg bg-white border border-slate-200 shadow-sm overflow-hidden relative group-hover/thumb:border-emerald-400 group-hover/thumb:shadow-md transition-all">
-                                                            {isValidThumb ? (
+                                                            {isValidThumb && !imageFailed ? (
                                                                 <img
-                                                                    src={res.thumb_url.startsWith('/') ? `${API_URL.replace(/\/api\/?$/, '')}${res.thumb_url}` : res.thumb_url}
+                                                                    src={thumbUrl}
                                                                     alt={res.year}
                                                                     className="w-full h-full object-cover transition-transform duration-500 group-hover/thumb:scale-110"
+                                                                    decoding="async"
+                                                                    loading="lazy"
+                                                                    onError={() => {
+                                                                        console.warn(`Failed to load thumbnail for ${item.id} year ${res.year}: ${thumbUrl}`);
+                                                                        setFailedThumbnails(prev => new Set([...prev, thumbKey]));
+                                                                    }}
                                                                 />
                                                             ) : geoData ? (
                                                                 <div className="w-full h-full p-1 opacity-80 group-hover/thumb:opacity-100 transition-opacity">
@@ -517,7 +565,7 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                             hutan_primer: 'Hutan Primer',
                                             hutan_sekunder: 'Hutan Sekunder',
                                             tanah_kering: 'Kering',
-                                            tanah_kosong: 'Kosong',
+                                            tanah_kosong: 'Tanah Kosong (Terbuka)',
                                             air: 'Air (Sungai/Danau)',
                                             lahan_terbangun: 'Lahan Terbangun (Urban)'
                                         };
@@ -531,8 +579,9 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                         };
                                         const val = latestData?.[key] || 0;
 
-                                        // Bersihkan tampilan: Sembunyikan jika 0, KECUALI untuk kategori utama (Hutan, Air, Urban)
-                                        const isMainCategory = ['hutan_primer', 'hutan_sekunder', 'air', 'lahan_terbangun'].includes(key);
+                                        // Display all 6 IPSDH standard classes
+                                        // Always show main categories and tanah_kosong (one of the 6 classes)
+                                        const isMainCategory = ['hutan_primer', 'hutan_sekunder', 'air', 'lahan_terbangun', 'tanah_kosong'].includes(key);
                                         if (val <= 0 && !isMainCategory) return null;
 
                                         const pct = totalArea ? (val / totalArea * 100).toFixed(1) : 0;
@@ -605,7 +654,6 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                         <Grid size={14} />
                                     </button>
 
-                                    {/* Hide Delete Button per user request
                                     <button
                                         onClick={(e) => {
                                             e.stopPropagation();
@@ -616,14 +664,13 @@ const HistoryDashboard = ({ history, loading, onSelect, isSidebarOpen, onDelete,
                                     >
                                         <Trash2 size={14} />
                                     </button>
-                                    */}
 
                                     {/* Carbon Time-Series Button */}
                                     {item.analysis_results && onOpenCarbonMode && (
                                         <button
                                             onClick={(e) => {
                                                 e.stopPropagation();
-                                                onOpenCarbonMode(item.id, item.filename);
+                                                onOpenCarbonMode(item.id, item.display_name || item.filename);
                                             }}
                                             className="px-3 py-2 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 hover:border-emerald-300 text-emerald-600 rounded-lg transition-all shadow-sm active:scale-95"
                                             title="Analisis Karbon Time-Series (Indikatif)"

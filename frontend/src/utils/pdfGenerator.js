@@ -334,7 +334,7 @@ export const generateAnalysisReport = async (item) => {
 
     // Prepend standard info
     const identityBody = [
-        ['Nama File', item.filename || '-'],
+        ['Nama KPS/Wilayah', item.display_name || item.filename || '-'],
         ['Koordinat (Centroid)', coordStr],
         ['Tanggal Analisis', new Date().toLocaleString('id-ID', { dateStyle: 'long', timeStyle: 'medium' })],
         ...metadataRows
@@ -544,7 +544,7 @@ export const generateAnalysisReport = async (item) => {
 
     // Standardize filename: Laporan_Name_YYYYMMDD.pdf
     const dateStr = new Date().toISOString().split('T')[0].replace(/-/g, '');
-    const cleanName = (item.filename || 'Laporan')
+    const cleanName = (item.display_name || item.filename || 'Laporan')
         .replace(/\.[^/.]+$/, "") // Remove existing extension if any
         .replace(/[^a-z0-9]/gi, '_') // Replace special chars with underscore
         .substring(0, 30); // Limit length

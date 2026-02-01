@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
-import { Upload, BarChart3, ChevronUp, ChevronDown, ChevronLeft, ArrowLeft, Layers, Activity, AlertCircle, Satellite, Download, RefreshCw, Calendar, Eye, EyeOff, Sliders, MapPin, Grid, History, ArrowRight, TrendingDown, TrendingUp, CheckCircle2, Info, Sparkles, FileText, Database, Split, Menu, X, Trash2, PenTool, RotateCcw, Eraser, ShieldCheck, List, Maximize, Flame, Image as ImageIcon, Map as MapIcon, Terminal, Clock } from 'lucide-react';
+import { Upload, BarChart3, ChevronUp, ChevronDown, ChevronLeft, ArrowLeft, Layers, Activity, AlertCircle, Satellite, Download, RefreshCw, Calendar, Eye, EyeOff, Sliders, MapPin, Grid, ArrowRight, TrendingDown, TrendingUp, CheckCircle2, Info, Sparkles, FileText, Database, Split, Menu, X, ShieldCheck, List, Maximize, Flame, Image as ImageIcon, Clock } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, LineChart, Line, AreaChart, Area, ReferenceLine, LabelList } from 'recharts';
 import { MapContainer, TileLayer, GeoJSON, ImageOverlay, Marker, Popup, useMap, useMapEvents, WMSTileLayer, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
@@ -15,7 +15,7 @@ import {
 import HistoryDashboard from './HistoryDashboard';
 import AttributeTag from './AttributeTag';
 import CalibrationPanel from './CalibrationPanel';
-import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures } from './MapComponents';
+import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures, CustomPinsManager } from './MapComponents';
 import { LAND_COVER_CONFIG, MAP_TILES, CALIBRATION_DEFAULTS, SIGAP_CONFIG, NASA_FIRMS_CONFIG, API_URL } from './constants';
 
 
@@ -213,31 +213,28 @@ const TemporalStatusLegend = ({ show }) => {
     if (!show) return null;
 
     return (
-        <div className="mt-4 pt-3 border-t border-slate-100">
-            <div className="text-[10px] font-bold text-amber-700 mb-1.5 uppercase tracking-tight">Status Perubahan Tutupan</div>
-            <div className="flex flex-col gap-1.5">
-                {[
-                    { status: 'stable', label: 'Stabil', opacity: 1.0 },
-                    { status: 'transition_confirmed', label: 'Terkonfirmasi', opacity: 1.0 },
-                    { status: 'transition_unconfirmed', label: 'Belum Terkonfirmasi (Grey Area)', opacity: 0.5 },
-                    { status: 'reverted_noise', label: 'Noise/Musiman', opacity: 0.3 }
-                ].map(item => {
-                    const style = getTemporalStatusStyle(item.status);
-                    return (
-                        <div key={item.status} className="flex items-center gap-2">
-                            <div
-                                className="w-3.5 h-3.5 rounded-sm shadow-sm"
-                                style={{
-                                    backgroundColor: style.color,
-                                    opacity: item.opacity,
-                                    border: '1px solid rgba(0,0,0,0.15)'
-                                }}
-                            />
-                            <span className="text-[10px] text-slate-600 leading-normal">{item.label}</span>
-                        </div>
-                    );
-                })}
-            </div>
+        <div className="flex flex-col gap-1.5 px-1">
+            {[
+                { status: 'stable', label: 'Stabil', opacity: 1.0 },
+                { status: 'transition_confirmed', label: 'Terkonfirmasi', opacity: 1.0 },
+                { status: 'transition_unconfirmed', label: 'Belum Terkonfirmasi (Grey Area)', opacity: 0.5 },
+                { status: 'reverted_noise', label: 'Noise/Musiman', opacity: 0.3 }
+            ].map(item => {
+                const style = getTemporalStatusStyle(item.status);
+                return (
+                    <div key={item.status} className="flex items-center gap-2 py-0.5">
+                        <div
+                            className="w-3.5 h-3.5 rounded-sm shadow-sm flex-shrink-0"
+                            style={{
+                                backgroundColor: style.color,
+                                opacity: item.opacity,
+                                border: '1px solid rgba(0,0,0,0.15)'
+                            }}
+                        />
+                        <span className="text-[10px] text-slate-600 leading-normal">{item.label}</span>
+                    </div>
+                );
+            })}
         </div>
     );
 };
@@ -374,10 +371,19 @@ const MainLayout = (props) => {
         showKawasanHutan, setShowKawasanHutan, kawasanHutanOpacity, setKawasanHutanOpacity,
         showDAS, setShowDAS, dasOpacity, setDasOpacity,
         // Slope Analysis
-        showSlopeLayer, setShowSlopeLayer, slopeOpacity, setSlopeOpacity, slopeMapUrl, slopeDbSummary, slopeDbSummaryOutside,
+        showSlopeLayer, setShowSlopeLayer, slopeOpacityInside, setSlopeOpacityInside, slopeOpacityOutside, setSlopeOpacityOutside, slopeMapUrlInside, slopeMapUrlOutside, slopeDbSummary, slopeDbSummaryOutside,
 
         onOpenCarbonMode,
-        queuePosition
+        queuePosition,
+        // Custom Pins
+        customPins,
+        isAddingPin,
+        setIsAddingPin,
+        handleAddCustomPin,
+        handleDeleteCustomPin,
+        handleUpdateCustomPin,
+        // Bulk Upload
+        setShowBulkUploadDialog
     } = props;
 
     // Local State for SIGAP Panel Visibility
@@ -1382,6 +1388,24 @@ const MainLayout = (props) => {
                 >
                     {showHistoryTable ? <MapPin size={20} /> : <Database size={20} />}
                 </button>
+
+                {/* Divider */}
+                <div className="w-px h-5 bg-slate-300/50 mx-0.5"></div>
+
+                {/* 4. Toggle Add Custom Pin Mode */}
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        setIsAddingPin(!isAddingPin);
+                    }}
+                    className={`p-2.5 rounded-full transition-all active:scale-95 ${isAddingPin
+                        ? 'bg-red-100 text-red-600'
+                        : 'bg-slate-100 text-slate-400 hover:bg-red-50 hover:text-red-600'
+                        }`}
+                    title={isAddingPin ? "Selesai Tambah Pin" : "Tambah Pin Custom"}
+                >
+                    <MapPin size={20} />
+                </button>
             </div>
 
 
@@ -1463,14 +1487,29 @@ const MainLayout = (props) => {
                             </div>
 
                             {/* Upload Area */}
-                            <div className="group border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 hover:border-emerald-400 transition-all cursor-pointer relative bg-slate-50/50">
-                                <input type="file" accept=".zip,.shp,.shx,.dbf,.prj,.cpg,.geojson" multiple onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
-                                <div className="flex flex-col items-center gap-1">
-                                    <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-emerald-500 transition-colors">
+                            <div className="flex gap-3">
+                                <div className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 hover:border-emerald-400 transition-all cursor-pointer relative bg-slate-50/50">
+                                    <input type="file" accept=".zip,.shp,.shx,.dbf,.prj,.cpg,.geojson" multiple onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                                    <div className="flex flex-col items-center gap-1 pointer-events-none">
+                                        <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-emerald-500 transition-colors">
+                                            <Upload size={16} />
+                                        </div>
+                                        <span className={`text-[10px] font-bold uppercase tracking-wide mt-1 ${file ? "text-emerald-600" : "text-slate-400"}`}>
+                                            {file ? file.name : "Upload KPS / GeoJSON"}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                {/* Bulk Upload Button */}
+                                <div
+                                    onClick={() => setShowBulkUploadDialog(true)}
+                                    className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-blue-50 hover:border-blue-400 transition-all cursor-pointer bg-slate-50/50 flex flex-col items-center justify-center gap-1"
+                                >
+                                    <div className="p-2 bg-white rounded-full shadow-sm text-slate-400 group-hover:text-blue-500 transition-colors">
                                         <Upload size={16} />
                                     </div>
-                                    <span className={`text-[10px] font-bold uppercase tracking-wide mt-1 ${file ? "text-emerald-600" : "text-slate-400"}`}>
-                                        {file ? file.name : "Upload KPS / GeoJSON"}
+                                    <span className="text-[10px] font-bold uppercase tracking-wide mt-1 text-slate-400 group-hover:text-blue-600">
+                                        Bulk Upload
                                     </span>
                                 </div>
                             </div>
@@ -1899,9 +1938,15 @@ const MainLayout = (props) => {
                         zoom={5}
                         className="w-full h-full"
                         zoomControl={false}
-                        maxZoom={24}
+                        maxZoom={18}
                         preferCanvas={true}
                         attributionControl={false}
+                        // Smooth Zoom Settings - Optimized for fluid zoom experience
+                        zoomSnap={0}
+                        zoomDelta={0.5}
+                        wheelPxPerZoomLevel={200}
+                        wheelDebounceTime={100}
+                        scrollWheelZoom={true}
                     >
                         {/* 1. LAYER DASAR (BASEMAP) */}
                         {((mapType === 'SENTINEL_RGB' && rgbMapUrl) || MAP_TILES[mapType].url) && (
@@ -1911,8 +1956,8 @@ const MainLayout = (props) => {
                                 attributed={MAP_TILES[mapType].attribution || ''}
                                 subdomains={MAP_TILES[mapType].subdomains || []}
                                 zIndex={1}
-                                maxNativeZoom={20} // Google supports up to 20-21 typically
-                                maxZoom={24} // Allow deeper over-zooming
+                                maxNativeZoom={18}
+                                maxZoom={18}
                             />
                         )}
 
@@ -2001,9 +2046,38 @@ const MainLayout = (props) => {
                                                 )}
                                                 <Marker position={center} icon={createPinIcon(item.filename, finalColor)}>
                                                     <Popup className="custom-popup">
-                                                        <div className="p-1 min-w-[120px]">
+                                                        <div className="p-1 min-w-[180px]">
                                                             <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Riwayat Lahan</div>
-                                                            <div className="text-xs font-bold text-slate-800 mb-2">{item.filename}</div>
+                                                            <div className="text-xs font-bold text-slate-800 mb-2">{item.display_name || item.filename}</div>
+
+                                                            {/* Latest Analysis Info */}
+                                                            {item.analysis_results && item.analysis_results.length > 0 && (() => {
+                                                                const latestAnalysis = item.analysis_results[item.analysis_results.length - 1];
+                                                                const totalArea = latestAnalysis.class_stats ?
+                                                                    Object.values(latestAnalysis.class_stats).reduce((sum, val) => sum + (val || 0), 0) : 0;
+
+                                                                return (
+                                                                    <div className="mb-2 pb-2 border-b border-slate-200">
+                                                                        <div className="flex items-center justify-between mb-1">
+                                                                            <span className="text-[9px] text-slate-500 font-semibold">Tahun Analisis:</span>
+                                                                            <span className="text-[10px] font-bold text-emerald-700">{latestAnalysis.year}</span>
+                                                                        </div>
+                                                                        <div className="flex items-center justify-between mb-1">
+                                                                            <span className="text-[9px] text-slate-500 font-semibold">Total Luas:</span>
+                                                                            <span className="text-[10px] font-bold text-slate-700">{totalArea.toFixed(2)} ha</span>
+                                                                        </div>
+                                                                        {trendData?.trendInfo && (
+                                                                            <div className="flex items-center justify-between">
+                                                                                <span className="text-[9px] text-slate-500 font-semibold">Status:</span>
+                                                                                <span className="text-[9px] font-bold" style={{ color: finalColor }}>
+                                                                                    {trendData.trendInfo.label}
+                                                                                </span>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })()}
+
                                                             <div className="flex flex-col gap-2">
                                                                 <button
                                                                     onClick={() => handleHistorySelect(item)}
@@ -2043,12 +2117,22 @@ const MainLayout = (props) => {
                                     />
                                 )}
 
-                                {/* Slope Analysis Layer */}
-                                {slopeMapUrl && (
+                                {/* Slope Analysis Layer - INSIDE */}
+                                {slopeMapUrlInside && (
                                     <DynamicTileLayer
-                                        url={slopeMapUrl}
+                                        url={slopeMapUrlInside}
                                         show={showSlopeLayer}
-                                        opacity={slopeOpacity}
+                                        opacity={slopeOpacityInside}
+                                        zIndex={200}
+                                    />
+                                )}
+
+                                {/* Slope Analysis Layer - OUTSIDE (Buffer 2km) */}
+                                {slopeMapUrlOutside && (
+                                    <DynamicTileLayer
+                                        url={slopeMapUrlOutside}
+                                        show={showSlopeLayer}
+                                        opacity={slopeOpacityOutside}
                                         zIndex={200}
                                     />
                                 )}
@@ -2063,7 +2147,7 @@ const MainLayout = (props) => {
                                 opacity={kawasanHutanOpacity}
                                 zIndex={100}
                                 maxNativeZoom={12}
-                                maxZoom={24}
+                                maxZoom={14}
                             />
                         )}
                         {showDAS && (
@@ -2073,7 +2157,7 @@ const MainLayout = (props) => {
                                 opacity={dasOpacity}
                                 zIndex={99}
                                 maxNativeZoom={12}
-                                maxZoom={24}
+                                maxZoom={14}
                             />
                         )}
 
@@ -2275,6 +2359,16 @@ const MainLayout = (props) => {
                             }}
                             onResult={(latlng, features) => setIdentifyResult({ latlng, features })}
                         />
+
+                        {/* Custom Pins Manager */}
+                        <CustomPinsManager
+                            pins={customPins || []}
+                            isAddingPin={isAddingPin}
+                            onAddPin={handleAddCustomPin}
+                            onDeletePin={handleDeleteCustomPin}
+                            onUpdatePin={handleUpdateCustomPin}
+                        />
+
                         {identifyResult && (
                             <Popup position={identifyResult.latlng} onClose={() => setIdentifyResult(null)}>
                                 <div className="min-w-[200px] max-h-[300px] overflow-y-auto no-scrollbar">
@@ -2474,19 +2568,36 @@ const MainLayout = (props) => {
                                         </div>
                                         {showSlopeLayer && (
                                             <div className="px-2 pt-1 pb-1 animate-in slide-in-from-top-1">
-                                                <div className="flex items-center justify-between mb-1.5">
-                                                    <span className="text-[8px] text-slate-400 uppercase font-black tracking-wider">Opasitas</span>
+                                                {/* Slider Inside */}
+                                                <div className="flex items-center justify-between mb-1">
+                                                    <span className="text-[8px] text-slate-400 uppercase font-black tracking-wider">Opasitas Dalam</span>
                                                     <span className="text-[9px] font-bold text-orange-600 bg-orange-50 px-1.5 rounded">
-                                                        {(slopeOpacity * 100).toFixed(0)}%
+                                                        {(slopeOpacityInside * 100).toFixed(0)}%
                                                     </span>
                                                 </div>
                                                 <input
                                                     type="range"
                                                     min="0" max="1" step="0.1"
-                                                    value={slopeOpacity}
-                                                    onChange={(e) => setSlopeOpacity(parseFloat(e.target.value))}
-                                                    className="w-full h-1.5 bg-slate-100 rounded-full appearance-none cursor-pointer accent-orange-500 hover:accent-orange-400"
+                                                    value={slopeOpacityInside}
+                                                    onChange={(e) => setSlopeOpacityInside(parseFloat(e.target.value))}
+                                                    className="w-full h-1.5 bg-slate-100 rounded-full appearance-none cursor-pointer accent-orange-500 hover:accent-orange-400 mb-2"
                                                 />
+
+                                                {/* Slider Outside */}
+                                                <div className="flex items-center justify-between mb-1">
+                                                    <span className="text-[8px] text-slate-400 uppercase font-black tracking-wider">Opasitas Buffer</span>
+                                                    <span className="text-[9px] font-bold text-blue-600 bg-blue-50 px-1.5 rounded">
+                                                        {(slopeOpacityOutside * 100).toFixed(0)}%
+                                                    </span>
+                                                </div>
+                                                <input
+                                                    type="range"
+                                                    min="0" max="1" step="0.1"
+                                                    value={slopeOpacityOutside}
+                                                    onChange={(e) => setSlopeOpacityOutside(parseFloat(e.target.value))}
+                                                    className="w-full h-1.5 bg-slate-100 rounded-full appearance-none cursor-pointer accent-blue-500 hover:accent-blue-400 mb-2"
+                                                />
+
                                                 <SlopeLegend show={true} />
                                             </div>
                                         )}
@@ -2542,9 +2653,18 @@ const MainLayout = (props) => {
                                         </div>
                                     )}
 
-                                    {/* 🔄 TEMPORAL STATUS LEGEND (NEW - OPTIONAL STEP 8) */}
-                                    {showTemporalStatus && temporalStatusData && (
-                                        <TemporalStatusLegend show={true} />
+                                    {/* 🔄 TEMPORAL STATUS LEGEND */}
+                                    {showTemporalStatus && (
+                                        <div className="pt-3 mt-1 border-t border-slate-100 animate-in fade-in">
+                                            <div className="flex items-center justify-between mb-3 px-1">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-[10px] font-black uppercase text-amber-700 tracking-widest">Status Temporal</span>
+                                                    <span className="text-[8px] font-bold bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">GREY AREA</span>
+                                                </div>
+                                                <AlertCircle size={11} className="text-amber-400" />
+                                            </div>
+                                            <TemporalStatusLegend show={true} />
+                                        </div>
                                     )}
                                     {/* END TEMPORAL STATUS LEGEND */}
 
@@ -2561,7 +2681,7 @@ const MainLayout = (props) => {
                             <div className={`bg-white/95 backdrop-blur-xl border border-emerald-100/50 rounded-[2rem] shadow-[0_10px_40px_rgba(0,0,0,0.15)] transition-all duration-700 overflow-hidden ${showChart ? 'h-[85vh] md:h-[26rem]' : 'h-16'}`}>
 
                                 {/* Header Toggle */}
-                                <div className="flex items-center justify-between px-4 md:px-5 py-2.5 md:py-3 cursor-pointer hover:bg-slate-50/50 transition-colors" onClick={() => setShowChart(!showChart)}>
+                                <div className="flex items-center justify-between px-4 md:px-5 py-4 md:py-3 cursor-pointer hover:bg-slate-50/50 transition-colors" onClick={() => setShowChart(!showChart)}>
                                     <div className="flex items-center gap-2 md:gap-4 overflow-hidden">
                                         {!loading && (
                                             <div className="flex items-center gap-2 md:gap-3 animate-in fade-in duration-300 overflow-hidden">
