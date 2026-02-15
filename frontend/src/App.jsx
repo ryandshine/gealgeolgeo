@@ -1,110 +1,111 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, Suspense, useCallback } from 'react';
 import axios from 'axios';
-import shp from 'shpjs';
-import proj4 from 'proj4';
-import JSZip from 'jszip';
 import { CheckCircle2, History, Calendar, Database, Activity, AlertCircle, ArrowRight, RefreshCw } from 'lucide-react';
-import MainLayout from './MainLayout';
 import { CALIBRATION_DEFAULTS, LAND_COVER_CONFIG, API_URL, MAX_BATCH_SIZE } from './constants';
-import BatchQueueList from './components/BatchQueueList';
-import CarbonDashboard from './components/CarbonDashboard';
-import KpsDetectionDialog from './components/KpsDetectionDialog';
-import DuplicateDialog from './components/DuplicateDialog';
-import BulkUploadDialog from './components/BulkUploadDialog';
-import BulkReportDialog from './components/BulkReportDialog';
 
-// Expose proj4 globally for shpjs to find it
-if (typeof window !== 'undefined') {
-    window.proj4 = proj4;
-}
+// Lazy load components
+const MainLayout = React.lazy(() => import('./MainLayout'));
+const Login = React.lazy(() => import('./Login'));
+const BatchQueueList = React.lazy(() => import('./components/BatchQueueList'));
+const CarbonDashboard = React.lazy(() => import('./components/CarbonDashboard'));
+const KpsDetectionDialog = React.lazy(() => import('./components/KpsDetectionDialog'));
+const DuplicateDialog = React.lazy(() => import('./components/DuplicateDialog'));
+const BulkUploadDialog = React.lazy(() => import('./components/BulkUploadDialog'));
+const BulkReportDialog = React.lazy(() => import('./components/BulkReportDialog'));
+const MonitoringTerkiniDashboard = React.lazy(() => import('./components/MonitoringTerkiniDashboard'));
 
-// Define common Indonesian CRS projections
-proj4.defs([
-    ['EPSG:32751', '+proj=utm +zone=51 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32750', '+proj=utm +zone=50 +south +datum=WGS84 +units=m +no_defs'],
-    // Sumatra & West Indo (N/S)
-    ['EPSG:32646', '+proj=utm +zone=46 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32647', '+proj=utm +zone=47 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32648', '+proj=utm +zone=48 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32746', '+proj=utm +zone=46 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32747', '+proj=utm +zone=47 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32748', '+proj=utm +zone=48 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32749', '+proj=utm +zone=49 +south +datum=WGS84 +units=m +no_defs'],
-    // Java/Bali/Nusa/Kalimantan/Sulawesi (49-51)
-    ['EPSG:32649', '+proj=utm +zone=49 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32650', '+proj=utm +zone=50 +datum=WGS84 +units=m +no_defs'],
-    // Eastern Indo
-    ['EPSG:32752', '+proj=utm +zone=52 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32753', '+proj=utm +zone=53 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32754', '+proj=utm +zone=54 +south +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32651', '+proj=utm +zone=51 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32652', '+proj=utm +zone=52 +datum=WGS84 +units=m +no_defs'],
-    ['EPSG:32653', '+proj=utm +zone=53 +datum=WGS84 +units=m +no_defs'],
-    // Custom
-    ['EPSG:23838', '+proj=tmerc +lat_0=0 +lon_0=124.5 +k=0.9999 +x_0=200000 +y_0=1500000 +ellps=WGS84 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs'],
-    ['EPSG:54034', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'],
-    ['World_Cylindrical_Equal_Area', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'],
-    ['Cylindrical_Equal_Area', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'],
-    ['ESRI:54034', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'],
-    ['PROJCS["World_Cylindrical_Equal_Area",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Cylindrical_Equal_Area"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",0.0],UNIT["Meter",1.0]]', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'],
-    ['CEA', '+proj=cea +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs']
-]);
+// Proj4 definitions and helpers moved to src/utils/geoUtils.js
 
-const swapCoordinates = (coords) => {
-    if (typeof coords[0] === 'number' && coords.length >= 2) return [coords[1], coords[0], ...coords.slice(2)];
-    return coords.map(swapCoordinates);
-};
-
-const reprojectToWGS84 = (geojson) => {
-    const firstCoord = geojson.type === 'FeatureCollection' ? geojson.features[0]?.geometry?.coordinates?.flat(Infinity).slice(0, 2)
-        : (geojson.type === 'Feature' ? geojson.geometry?.coordinates?.flat(Infinity).slice(0, 2) : geojson.coordinates?.flat(Infinity).slice(0, 2));
-
-    if (!firstCoord || firstCoord.length < 2) return geojson;
-    const [x, y] = firstCoord;
-
-    // ALGORITMA REPROYEKSI "MAX": Jika koordinat sangat besar (bukan Lat/Lon), paksa ke proyeksi yang paling masuk akal
-    if (Math.abs(x) > 180 || Math.abs(y) > 90) {
-        let sourceProj = 'EPSG:32751'; // Default UTM 51S
-
-        // Deteksi berdasarkan rentang koordinat CEA (Cylindrical Equal Area)
-        // Biasanya koordinat CEA sangat besar (jutaan / sepuluh jutaan)
-        if (Math.abs(x) > 5000000 || Math.abs(y) > 5000000) {
-            sourceProj = 'EPSG:54034'; // Cylindrical Equal Area
-        }
-        // Deteksi UTM berdasarkan rentang Indonesia (Zone 46-54)
-        else if (x > 100000 && x < 900000) {
-            if (y > 1400000 && y < 1600000) sourceProj = 'EPSG:23838'; // Kasus khusus wilayah tertentu
-            else sourceProj = 'EPSG:32751';
-        }
-
-        const reproject = (coords) => {
-            if (typeof coords[0] === 'number' && coords.length >= 2) {
-                try {
-                    const projected = proj4(sourceProj, 'WGS84', [coords[0], coords[1]]);
-                    if (Number.isFinite(projected[0]) && Number.isFinite(projected[1])) {
-                        return [projected[0], projected[1], ...coords.slice(2)];
-                    }
-                } catch (e) { return coords; }
-            }
-            return Array.isArray(coords) ? coords.map(reproject) : coords;
-        };
-        const reprojectGeometry = (geometry) => ({ ...geometry, coordinates: reproject(geometry.coordinates) });
-
-        if (geojson.type === 'FeatureCollection') return { ...geojson, features: geojson.features.filter(f => f.geometry?.coordinates?.length > 0).map(f => ({ ...f, geometry: reprojectGeometry(f.geometry) })) };
-        if (geojson.type === 'Feature') return { ...geojson, geometry: reprojectGeometry(geojson.geometry) };
-        return reprojectGeometry(geojson);
-    }
-
-    if (y >= 95 && y <= 141 && Math.abs(x) <= 15) {
-        const fixGeometry = (geometry) => ({ ...geometry, coordinates: swapCoordinates(geometry.coordinates) });
-        if (geojson.type === 'FeatureCollection') return { ...geojson, features: geojson.features.map(f => ({ ...f, geometry: fixGeometry(f.geometry) })) };
-        if (geojson.type === 'Feature') return { ...geojson, geometry: fixGeometry(geojson.geometry) };
-        return fixGeometry(geojson);
-    }
-    return geojson;
-};
 
 const App = () => {
+    // Authentication State
+    const [isAuthenticated, setIsAuthenticated] = useState(() => {
+        const user = localStorage.getItem('user');
+        return !!user;
+    });
+
+    // Session Timeout Configuration (30 minutes = 1800000 ms)
+    const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+    const sessionTimeoutRef = useRef(null);
+    const lastActivityRef = useRef(Date.now());
+    const loadingRef = useRef(false);
+    const batchRunningRef = useRef(false);
+
+    // Auto Logout Handler - SKIP if analysis is running or data is loaded
+    const handleAutoLogout = useCallback(() => {
+        // DON'T logout if analysis is in progress
+        if (loadingRef.current || batchRunningRef.current) {
+            console.log('⏸️ Session timeout paused - Analysis in progress');
+            sessionTimeoutRef.current = setTimeout(handleAutoLogout, 60 * 1000);
+            return;
+        }
+
+        // DON'T logout if user has active analysis data (viewing results)
+        // Only logout if truly idle (no data loaded)
+        if (dataRef.current && dataRef.current.length > 0) {
+            console.log('⏸️ Session timeout paused - User has active data');
+            sessionTimeoutRef.current = setTimeout(handleAutoLogout, 5 * 60 * 1000); // Recheck in 5 min
+            return;
+        }
+
+        console.log('🔒 Session expired - Auto logout');
+        localStorage.removeItem('user');
+        setIsAuthenticated(false);
+        setFile(null);
+        setData(null);
+        setGeoData(null);
+        setMapUrl(null);
+        setShowAllPins(true);
+        alert('Sesi Anda telah berakhir. Silakan login kembali.');
+    }, []);
+
+    // Reset session timeout on user activity
+    const resetSessionTimeout = useCallback(() => {
+        lastActivityRef.current = Date.now();
+
+        // Clear existing timeout
+        if (sessionTimeoutRef.current) {
+            clearTimeout(sessionTimeoutRef.current);
+        }
+
+        // Set new timeout
+        sessionTimeoutRef.current = setTimeout(() => {
+            handleAutoLogout();
+        }, SESSION_TIMEOUT);
+    }, [SESSION_TIMEOUT, handleAutoLogout]);
+
+    // Setup activity listeners for session timeout
+    useEffect(() => {
+        if (!isAuthenticated) {
+            // Clear timeout if not authenticated
+            if (sessionTimeoutRef.current) {
+                clearTimeout(sessionTimeoutRef.current);
+            }
+            return;
+        }
+
+        // Initialize session timeout
+        resetSessionTimeout();
+
+        // Activity events to track
+        const activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart', 'click'];
+
+        // Add event listeners
+        activityEvents.forEach(event => {
+            window.addEventListener(event, resetSessionTimeout);
+        });
+
+        // Cleanup
+        return () => {
+            activityEvents.forEach(event => {
+                window.removeEventListener(event, resetSessionTimeout);
+            });
+            if (sessionTimeoutRef.current) {
+                clearTimeout(sessionTimeoutRef.current);
+            }
+        };
+    }, [isAuthenticated, resetSessionTimeout]);
+
     useEffect(() => {
         const link = document.createElement('link');
         link.href = 'https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@100;200;300;400;500;600;700&display=swap';
@@ -117,12 +118,13 @@ const App = () => {
 
     const [file, setFile] = useState(null);
     const [loading, setLoading] = useState(false);
-    const [showChart, setShowChart] = useState(true);
+
     const [data, setData] = useState(null);
     const [geoData, setGeoData] = useState(null);
     const [vectorLayerData, setVectorLayerData] = useState(null);
     const [mapUrl, setMapUrl] = useState(null);
     const [rgbMapUrl, setRgbMapUrl] = useState(null);
+    const [pipelineState, setPipelineState] = useState(null);
     const [error, setError] = useState(null);
     // Year Range Selection (for series mode)
     const currentYear = new Date().getFullYear();
@@ -185,6 +187,7 @@ const App = () => {
     const [expandedAttributes, setExpandedAttributes] = useState(false);
     const [historyData, setHistoryData] = useState([]);
     const [loadingHistory, setLoadingHistory] = useState(false);
+    const [loadingGeometries, setLoadingGeometries] = useState(false);
     const [showSidebar, setShowSidebar] = useState(false);
     const sidebarRef = useRef(null);
     const [isCompareMode, setIsCompareMode] = useState(false);
@@ -200,11 +203,25 @@ const App = () => {
     const [isBatchMode, setIsBatchMode] = useState(false); // Toggle for Batch Mode vs Single Mode
     const batchWsRef = useRef(null); // WebSocket ref for batch cancellation
 
+    // Track loading, batch, and data state in refs for timeout callback
+    const dataRef = useRef(null);
+    useEffect(() => {
+        loadingRef.current = loading;
+    }, [loading]);
+    useEffect(() => {
+        dataRef.current = data;
+    }, [data]);
+
+    useEffect(() => {
+        batchRunningRef.current = isBatchRunning;
+    }, [isBatchRunning]);
+
 
     // Cancellation Refs
     const abortControllerRef = useRef(null);
     const wsRef = useRef(null);
     const isCancelledRef = useRef(false);
+    const pendingReanalyzeRef = useRef(false);
 
     // Cloud Probability Threshold - FIXED at 50% per methodology
     // Cannot be changed by user to ensure consistency across all years and runs
@@ -221,7 +238,7 @@ const App = () => {
     // Missing UI States
     const [selectedYear, setSelectedYear] = useState(null);
     const [mapType, setMapType] = useState('satellite');
-    const [chartType, setChartType] = useState('bar');
+
     const [showOverlay, setShowOverlay] = useState(true);
     const [showRgb, setShowRgb] = useState(true);
     const [polygonOpacity, setPolygonOpacity] = useState(1.0);
@@ -232,6 +249,16 @@ const App = () => {
     const [auditReport, setAuditReport] = useState(null);
 
     // Carbon Time-Series Mode (Indicative)
+    const [isCarbonMode, setIsCarbonMode] = useState(false);
+
+    // Identity for Security Verification (Point 4)
+    const [userId] = useState(() => {
+        const saved = localStorage.getItem('gealgeolgeo_user_id');
+        if (saved) return saved;
+        const newId = crypto.randomUUID();
+        localStorage.setItem('gealgeolgeo_user_id', newId);
+        return newId;
+    });
     const [carbonModeEnabled, setCarbonModeEnabled] = useState(false);
     const [carbonHistoryId, setCarbonHistoryId] = useState(null);
     const [carbonFilename, setCarbonFilename] = useState(null);
@@ -246,8 +273,10 @@ const App = () => {
     const [slopeOpacityOutside, setSlopeOpacityOutside] = useState(0.7);
     const [slopeMapUrlInside, setSlopeMapUrlInside] = useState(null);
     const [slopeMapUrlOutside, setSlopeMapUrlOutside] = useState(null);
+    const [slopeStaticMapUrl, setSlopeStaticMapUrl] = useState(null); // NEW: Static map for PDF
     const [slopeDbSummary, setSlopeDbSummary] = useState(null);
     const [slopeDbSummaryOutside, setSlopeDbSummaryOutside] = useState(null);
+    const [isExportingAll, setIsExportingAll] = useState(false);
 
     // KPS Detection State
     const [showKpsDialog, setShowKpsDialog] = useState(false);
@@ -269,42 +298,13 @@ const App = () => {
     const [bulkValidationResults, setBulkValidationResults] = useState(null);
     const [bulkFileItems, setBulkFileItems] = useState(null);
 
-    // Custom Pins State (Manual Pin Markers)
-    const [customPins, setCustomPins] = useState([]);
-    const [isAddingPin, setIsAddingPin] = useState(false);
-    const [loadingPins, setLoadingPins] = useState(false);
-
-    // Fetch custom pins from backend
-    const fetchCustomPins = async () => {
-        setLoadingPins(true);
-        try {
-            const response = await axios.get(`${API_URL}/api/pins`);
-            if (response.data?.status === 'success') {
-                setCustomPins(response.data.data || []);
-                // Also save to localStorage as cache
-                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(response.data.data || []));
-                console.log(`📍 Loaded ${response.data.count || 0} pins from backend`);
-            }
-        } catch (err) {
-            console.error("Error fetching custom pins:", err);
-            // Fallback to localStorage if backend fails
-            try {
-                const saved = localStorage.getItem('gealgeolgeo_custom_pins');
-                if (saved) {
-                    setCustomPins(JSON.parse(saved));
-                    console.log('📍 Loaded pins from localStorage (fallback)');
-                }
-            } catch (e) {
-                console.error("Error loading pins from localStorage:", e);
-            }
-        } finally {
-            setLoadingPins(false);
-        }
-    };
+    // Monitoring Terkini State
+    const [showMonitoringTerkini, setShowMonitoringTerkini] = useState(false);
+    const [monitoringKpsId, setMonitoringKpsId] = useState(null);
+    const [monitoringKpsName, setMonitoringKpsName] = useState(null);
 
     useEffect(() => {
         fetchHistory();
-        fetchCustomPins(); // Fetch custom pins on mount
     }, []);
 
     const fetchHistory = async () => {
@@ -313,7 +313,21 @@ const App = () => {
             // Add timestamp query param to bypass client/browser cache
             const response = await axios.get(`${API_URL}/history?_t=${new Date().getTime()}`);
             setHistoryData(response.data || []);
-        } catch (err) { console.error("Error fetching history:", err.message); } finally { setLoadingHistory(false); }
+        } catch (err) {
+            console.error("Error fetching history:", err.message);
+
+            // Check if it's a network error (backend not running)
+            if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
+                console.warn('⚠️ Backend server tidak dapat dijangkau. Pastikan backend berjalan di', API_URL);
+                // Set empty history data instead of leaving it undefined
+                setHistoryData([]);
+            } else {
+                // Other errors (e.g., 500, 404)
+                setHistoryData([]);
+            }
+        } finally {
+            setLoadingHistory(false);
+        }
     };
 
     // Fetch Slope Analysis Map (Raster from GEE)
@@ -323,27 +337,31 @@ const App = () => {
                 if (!showSlopeLayer) {
                     setSlopeMapUrlInside(null);
                     setSlopeMapUrlOutside(null);
+                    // Don't clear static URL immediately so we can still export PDF if layer is toggled off but analysis exists
                 }
                 return;
             }
 
             try {
                 // Use current geoData to get slope raster visualization
-                const payload = { geo_data: geoData };
+                // Pass history_id so backend can persist slope stats to DB
+                const payload = { geo_data: geoData, history_id: file?.id || null };
 
                 const response = await axios.post(`${API_URL}/map/slope`, payload);
                 if (response.data?.status === 'success') {
                     setSlopeMapUrlInside(response.data.map_url_inside);
                     setSlopeMapUrlOutside(response.data.map_url_outside);
+                    // Save static map URL for PDF
+                    if (response.data.slope_map_url) {
+                        setSlopeStaticMapUrl(response.data.slope_map_url);
+                    }
 
-                    // Only update stats if we don't have saved data from history
-                    // (saved data is loaded in handleHistorySelect)
-                    if (!slopeDbSummary && response.data.db_summary && response.data.db_summary.length > 0) {
-                        // Get INSIDE record
+                    // Update stats from live computation
+                    if (response.data.db_summary && response.data.db_summary.length > 0) {
                         const insideRecord = response.data.db_summary.find(r => r.scope === 'INSIDE') || response.data.db_summary[0];
                         setSlopeDbSummary(insideRecord);
-                        // Get OUTSIDE (buffer 2km) record
-                        const outsideRecord = response.data.db_summary.find(r => r.scope === 'OUTSIDE');
+                        const outsideRecord = response.data.db_summary.find(r => r.scope === 'OUTSIDE_2KM')
+                            || response.data.db_summary.find(r => r.scope === 'OUTSIDE');
                         setSlopeDbSummaryOutside(outsideRecord || null);
                     }
                 }
@@ -405,8 +423,12 @@ const App = () => {
             let targetFile;
 
             try {
+                // Lazy import libraries and utils
+                const { reprojectToWGS84 } = await import('./utils/geoUtils');
+
                 if (zipFiles.length === 1) {
                     targetFile = zipFiles[0];
+                    const { default: shp } = await import('shpjs');
                     rawGeojson = await shp(await readFileAsArrayBuffer(targetFile));
                 } else if (geoJsonFiles.length === 1) {
                     targetFile = geoJsonFiles[0];
@@ -419,6 +441,8 @@ const App = () => {
                     rawGeojson = JSON.parse(text);
                 } else if (shpComponents.length > 0) {
                     // Zip in-memory
+                    const { default: JSZip } = await import('jszip');
+                    const { default: shp } = await import('shpjs');
                     const zip = new JSZip();
                     const allowedExts = ['.shp', '.shx', '.dbf', '.prj', '.cpg'];
                     let shpName = "";
@@ -637,45 +661,61 @@ const App = () => {
             setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, status: 'processing', progress: 5, progressDetail: 'Menyiapkan...' } : j));
 
             try {
-                // 1. Parse Geometry (lokal browser)
-                let rawGeojson;
-                const file = nextJob.file;
-                const fileType = nextJob.fileType;
+                // 1. Parse Geometry (lokal browser) - Skip if already parsed from bulk upload
+                let finalGeo;
 
-                let totalSize = file.size;
-
-                setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, progress: 10, progressDetail: 'Membaca file...' } : j));
-
-                if (fileType === 'geojson') {
-                    const text = await new Promise((res, rej) => {
-                        const reader = new FileReader();
-                        reader.onload = (e) => res(e.target.result);
-                        reader.onerror = rej;
-                        reader.readAsText(file);
-                    });
-                    rawGeojson = JSON.parse(text);
-                } else if (fileType === 'zip') {
-                    rawGeojson = await shp(await readFileAsArrayBuffer(file));
-                } else if (fileType === 'shp-bundle') {
-                    // Bundle loose SHP components into in-memory ZIP
-                    const zip = new JSZip();
-                    const allowedExts = ['.shp', '.shx', '.dbf', '.prj', '.cpg'];
-                    totalSize = nextJob.files.reduce((acc, f) => acc + f.size, 0); // Re-calculate total size for bundle
-                    for (const f of nextJob.files) {
-                        const ext = '.' + f.name.split('.').pop().toLowerCase();
-                        if (allowedExts.includes(ext)) {
-                            zip.file(f.name, await readFileAsArrayBuffer(f));
-                        }
-                    }
-                    const zipBlob = await zip.generateAsync({ type: 'arraybuffer' });
-                    rawGeojson = await shp(zipBlob);
+                if (nextJob.parsedGeometry) {
+                    // Geometry already parsed during bulk upload validation
+                    console.log(`✓ Using pre-parsed geometry for ${nextJob.file.name}`);
+                    finalGeo = nextJob.parsedGeometry;
+                    setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, progress: 15, progressDetail: 'Menggunakan data validasi...' } : j));
                 } else {
-                    throw new Error(`Tipe file tidak dikenal: ${fileType}`);
-                }
+                    // Parse geometry from file
+                    let rawGeojson;
+                    const file = nextJob.file;
+                    const fileType = nextJob.fileType;
 
-                if (!rawGeojson) throw new Error("Gagal membaca file.");
-                if (Array.isArray(rawGeojson)) rawGeojson = rawGeojson[0];
-                const finalGeo = reprojectToWGS84(rawGeojson);
+                    let totalSize = file.size;
+
+                    setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, progress: 10, progressDetail: 'Membaca file...' } : j));
+
+                    // Load geoUtils FIRST to ensure Proj4 definitions are registered
+                    const { reprojectToWGS84 } = await import('./utils/geoUtils');
+
+                    if (fileType === 'geojson') {
+                        const text = await new Promise((res, rej) => {
+                            const reader = new FileReader();
+                            reader.onload = (e) => res(e.target.result);
+                            reader.onerror = rej;
+                            reader.readAsText(file);
+                        });
+                        rawGeojson = JSON.parse(text);
+                    } else if (fileType === 'zip') {
+                        const { default: shp } = await import('shpjs');
+                        rawGeojson = await shp(await readFileAsArrayBuffer(file));
+                    } else if (fileType === 'shp-bundle') {
+                        // Bundle loose SHP components into in-memory ZIP
+                        const { default: JSZip } = await import('jszip');
+                        const { default: shp } = await import('shpjs');
+                        const zip = new JSZip();
+                        const allowedExts = ['.shp', '.shx', '.dbf', '.prj', '.cpg'];
+                        totalSize = nextJob.files.reduce((acc, f) => acc + f.size, 0); // Re-calculate total size for bundle
+                        for (const f of nextJob.files) {
+                            const ext = '.' + f.name.split('.').pop().toLowerCase();
+                            if (allowedExts.includes(ext)) {
+                                zip.file(f.name, await readFileAsArrayBuffer(f));
+                            }
+                        }
+                        const zipBlob = await zip.generateAsync({ type: 'arraybuffer' });
+                        rawGeojson = await shp(zipBlob);
+                    } else {
+                        throw new Error(`Tipe file tidak dikenal: ${fileType}`);
+                    }
+
+                    if (!rawGeojson) throw new Error("Gagal membaca file.");
+                    if (Array.isArray(rawGeojson)) rawGeojson = rawGeojson[0];
+                    finalGeo = reprojectToWGS84(rawGeojson);
+                }
 
                 // 2. Duplicate Detection - Cek apakah geometry sudah ada di history
                 setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, progress: 15, progressDetail: 'Memeriksa duplikat...' } : j));
@@ -704,7 +744,7 @@ const App = () => {
                 }
 
                 // 3. Kirim ke WebSocket (Analisis)
-                await runBatchAnalysis(nextJob.id, finalGeo, file.name, totalSize);
+                await runBatchAnalysis(nextJob.id, finalGeo, nextJob.file.name, nextJob.file.size, nextJob.kpsMetadata);
 
                 // 3. Sukses
                 setBatchQueue(q => q.map(j => j.id === nextJob.id ? { ...j, status: 'completed' } : j));
@@ -729,8 +769,10 @@ const App = () => {
         processNextJob();
     }, [batchQueue, currentJobId, isBatchRunning]);
 
-    const runBatchAnalysis = (jobId, geometry, filename, fileSize) => {
+    const runBatchAnalysis = (jobId, geometry, filename, fileSize, kpsMetadata = null) => {
         return new Promise((resolve, reject) => {
+            let completed = false; // Track if promise is already resolved/rejected
+
             // Establish WS
             const clientId = Math.random().toString(36).substring(7);
             const WS_URL = API_URL.replace('http', 'ws');
@@ -754,26 +796,40 @@ const App = () => {
                 if (response.type === 'progress') {
                     setBatchQueue(q => q.map(j => j.id === jobId ? { ...j, progress: response.progress, progressDetail: `${response.step}${response.detail ? ': ' + response.detail : ''}` } : j));
                 } else if (response.type === 'complete') {
+                    completed = true; // Mark as completed IMMEDIATELY to prevent race condition
                     try {
                         const payload = {
                             filename: filename,
                             file_size: fileSize,
                             metadata: {
                                 year: 2025,
-                                location: "Batch Upload",
+                                location: kpsMetadata?.kps_name || "Batch Upload",
                                 source: "Sentinel-2",
                                 start_year: startYear,
                                 end_year: endYear,
                                 version: "3.0 (RF)",
-                                cloud_prob: CLOUD_PROB_THRESHOLD_FIXED
+                                cloud_prob: CLOUD_PROB_THRESHOLD_FIXED,
+                                // Add KPS metadata if available
+                                ...(kpsMetadata ? {
+                                    no_sk: kpsMetadata.kps_no_sk,
+                                    link_method: kpsMetadata.link_method
+                                } : {})
                             },
                             analysis_results: response.data.data,
                             geo_data: geometry,
                             mode: 'replace',
                             transition_summary: response.data.transition_summary,
-                            audit_report: response.data.audit_report
+                            audit_report: response.data.audit_report,
+                            // Add KPS linking if available
+                            ...(kpsMetadata ? {
+                                kps_id: kpsMetadata.kps_id,
+                                link_method: kpsMetadata.link_method,
+                                analysis_scope: 'KPS'
+                            } : {})
                         };
-                        await axios.post(`${API_URL}/history`, payload);
+                        await axios.post(`${API_URL}/history`, payload, {
+                            headers: { 'X-User-ID': userId }
+                        });
                         fetchHistory();
                         ws.close();
                         resolve();
@@ -782,17 +838,23 @@ const App = () => {
                         reject(new Error("Gagal menyimpan: " + saveErr.message));
                     }
                 } else if (response.type === 'error') {
+                    completed = true; // Mark as completed
                     ws.close();
                     reject(new Error(response.message || "Unknown error"));
                 }
             };
 
             ws.onerror = (e) => {
-                reject(new Error("WebSocket Error"));
+                if (!completed) {
+                    completed = true;
+                    reject(new Error("WebSocket Error"));
+                }
             };
 
             ws.onclose = (event) => {
-                if (!event.wasClean) {
+                // Only reject if not already completed and close was not clean
+                if (!completed && !event.wasClean) {
+                    completed = true;
                     reject(new Error('Koneksi terputus secara tidak terduga'));
                 }
             };
@@ -836,27 +898,26 @@ const App = () => {
 
 
     const handleDeleteHistory = async (id) => {
-        // Optimistic update - remove from UI immediately
-        const previousData = historyData;
-        setHistoryData(prev => prev.filter(item => item.id !== id));
-
         try {
-            await axios.delete(`${API_URL}/history/${id}`);
+            await axios.delete(`${API_URL}/history/${id}`, {
+                headers: { 'X-User-ID': userId }
+            });
+            // Remove from parent state after confirmed success
+            setHistoryData(prev => prev.filter(item => item.id !== id));
             console.log(`✅ ID ${id} deleted successfully.`);
         } catch (err) {
             const is404 = err.response?.status === 404 || err.message?.includes("404");
 
             if (is404) {
-                // If 404, it means it's already gone, which is effectively a success
-                // No need to rollback or alert the user
+                // Already gone — still remove from parent state
+                setHistoryData(prev => prev.filter(item => item.id !== id));
                 console.log(`ℹ️ ID ${id} was already deleted (404).`);
                 return;
             }
 
-            // Rollback on other failures (500, etc)
+            // Re-throw so child can handle the error via toast
             console.error("❌ Delete failure:", err);
-            setHistoryData(previousData);
-            alert('Gagal menghapus data: ' + (err.response?.data?.detail || err.message));
+            throw err;
         }
     };
 
@@ -867,59 +928,125 @@ const App = () => {
         });
     };
 
+    // Strip expired GEE tile URLs from analysis results loaded from history.
+    // GEE tile URLs expire after a few hours, so when loading saved data
+    // we nullify them to let the fallback ImageOverlay (using local thumb_url/rgb_thumb_url) work.
+    const stripExpiredGeeUrls = (results) => {
+        if (!results) return results;
+        const isGeeUrl = (url) => url && (url.includes('earthengine.googleapis.com') || url.includes('googleapis.com/v1'));
+        return results.map(r => ({
+            ...r,
+            map_url: isGeeUrl(r.map_url) ? null : r.map_url,
+            rgb_url: isGeeUrl(r.rgb_url) ? null : r.rgb_url,
+        }));
+    };
+
     const handleHistorySelect = async (item) => {
-        setLoadingHistory(true);
+        // --- ⚡ OPTIMIZATION: RENDER DASHBOARD IMMEDIATELY ---
+        // First, hide the global pins view so the dashboard knows we are in a specific item view
+        setShowAllPins(false);
+        setShowHistoryTable(false);
+        setError(null);
+
+        // Clear vectorLayerData to allow MapRecenter to auto-fit to new geoData
+        setVectorLayerData(null);
+
+        // Set the file/name immediately to update the dashboard title
+        setFile({ name: item.nama_kps || item.display_name || item.filename, size: item.file_size, id: item.id, kps_info: item.kps_info || null });
+
+        // Use the stats we already have from the list view
+        // Strip expired GEE tile URLs so local assets (thumb_url, rgb_thumb_url) are used as fallback
+        if (item.analysis_results) {
+            console.log("📊 Setting analysis results immediately:", item.analysis_results.length, "years");
+            setData(stripExpiredGeeUrls(item.analysis_results));
+        }
+
+        setTransitionSummary(item.metadata?.transition_summary || null);
+        setAuditReport(item.metadata?.audit_report || null);
+
+        // Restore slope data if available in summary
+        if (item.slope_summary && item.slope_summary.length > 0) {
+            const insideSlope = item.slope_summary.find(s => s.scope === 'INSIDE');
+            const outsideSlope = item.slope_summary.find(s => s.scope === 'OUTSIDE_2KM')
+                || item.slope_summary.find(s => s.scope === 'OUTSIDE');
+            if (insideSlope) setSlopeDbSummary(insideSlope);
+            if (outsideSlope) setSlopeDbSummaryOutside(outsideSlope);
+        }
+        // Restore slope map URL if available from DB
+        if (item.slope_map_url) {
+            setSlopeStaticMapUrl(item.slope_map_url);
+        }
+
+        if (item.analysis_results?.length > 0) {
+            // Set to the highest year (most recent)
+            const maxYear = Math.max(...item.analysis_results.map(d => d.year));
+            setSelectedYear(maxYear);
+            setMapType('SENTINEL_RGB');
+            setShowOverlay(true);
+        }
+
+        // If we have a centroid/point from the list, use it as temporary geoData 
+        // until the full geometry loads, so the dashboard doesn't show "No Location"
+        if (item.geo_data) {
+            setGeoData(item.geo_data);
+        }
+
+        // --- 🛰️ BACKGROUND FETCH FOR GEOMETRIES ---
+        setLoadingGeometries(true);
         try {
-            // Fetch detailed data including full GeoJSON and all thumbnails
-            console.log(`🔍 Fetching full details for history item: ${item.id}`);
+            console.log(`📡 Background Fetch: GeoJSON for history item ${item.id}`);
             const response = await axios.get(`${API_URL}/history/${item.id}`);
             const fullItem = response.data;
 
-            // Clear previous analysis states to prevent stale layers
-            setVectorLayerData(null);
-            setMapUrl(null);
-            setRgbMapUrl(null);
-            setError(null);
-
-            setData(fullItem.analysis_results);
+            // Only update if we're still looking at the same item
+            // (Minimal safety, can be improved with refs)
             if (fullItem.geo_data) {
                 setGeoData(fullItem.geo_data);
             }
-            setFile({ name: fullItem.display_name || fullItem.filename, size: fullItem.file_size, id: item.id });
-            if (fullItem.analysis_results?.length > 0) {
-                const lastData = fullItem.analysis_results[fullItem.analysis_results.length - 1];
-                setSelectedYear(lastData.year || fullItem.analysis_results[0].year);
-                setMapType('SENTINEL_RGB');
-                setShowOverlay(true);
-            }
-            if (fullItem.metadata) {
-                setStartYear(fullItem.metadata.start_year || 2017);
-                setTransitionSummary(fullItem.metadata.transition_summary || null);
-                setAuditReport(fullItem.metadata.audit_report || null);
+
+            // Sync any other details that might only be in the full item
+            // Strip expired GEE URLs so local assets are used
+            if (fullItem.analysis_results) {
+                const cleanedResults = stripExpiredGeeUrls(fullItem.analysis_results);
+                setData(cleanedResults);
+                // Set selectedYear ke tahun terbaru jika belum di-set
+                if (cleanedResults.length > 0) {
+                    const maxYear = Math.max(...cleanedResults.map(d => d.year));
+                    setSelectedYear(maxYear);
+                    setMapType('SENTINEL_RGB');
+                    setShowOverlay(true);
+                }
             }
 
-            // Load slope summary data if available (saved from previous analysis)
-            if (fullItem.slope_summary && fullItem.slope_summary.length > 0) {
-                const insideSlope = fullItem.slope_summary.find(s => s.scope === 'INSIDE');
-                const outsideSlope = fullItem.slope_summary.find(s => s.scope === 'OUTSIDE_2KM');
-                if (insideSlope) setSlopeDbSummary(insideSlope);
-                if (outsideSlope) setSlopeDbSummaryOutside(outsideSlope);
-                console.log('📐 Loaded saved slope data from history');
-            } else {
-                // Clear slope data if not available
-                setSlopeDbSummary(null);
-                setSlopeDbSummaryOutside(null);
+            // Update file with kps_info from full detail
+            if (fullItem.kps_info) {
+                setFile(prev => prev ? { ...prev, kps_info: fullItem.kps_info } : prev);
             }
 
-            setShowHistoryTable(false);
-            setShowAllPins(false);
+            // Track pipeline state for tile cache status
+            setPipelineState(fullItem.pipeline_state || 'LEGACY');
+
+            // Restore slope map URL from DB if available
+            if (fullItem.slope_map_url) {
+                setSlopeStaticMapUrl(fullItem.slope_map_url);
+            }
+
+            console.log('✅ Background GeoJSON loaded');
         } catch (err) {
-            console.error("Error fetching history detail:", err);
-            alert("Gagal mengambil detail data: " + err.message);
+            console.error("Error fetching background geometries:", err);
+            // Don't show global error, just map might be empty
         } finally {
-            setLoadingHistory(false);
+            setLoadingGeometries(false);
         }
     };
+
+    // Auto-trigger analysis after re-analyze sets geoData
+    useEffect(() => {
+        if (pendingReanalyzeRef.current && geoData && !loading) {
+            pendingReanalyzeRef.current = false;
+            handleAnalyze();
+        }
+    }, [geoData]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleHistoryReanalyze = async (item) => {
         setLoadingHistory(true);
@@ -927,7 +1054,6 @@ const App = () => {
             const response = await axios.get(`${API_URL}/history/${item.id}`);
             const fullItem = response.data;
 
-            if (fullItem.geo_data) setGeoData(fullItem.geo_data);
             setFile({ name: fullItem.display_name || fullItem.filename, size: fullItem.file_size });
             setData(null);
             setVectorLayerData(null);
@@ -938,10 +1064,12 @@ const App = () => {
             setShowHistoryTable(false);
             setShowAllPins(false);
 
-            // Auto-trigger analysis
-            setTimeout(() => handleAnalyze(), 100);
+            // Set flag before setting geoData - useEffect will trigger handleAnalyze
+            pendingReanalyzeRef.current = true;
+            if (fullItem.geo_data) setGeoData(fullItem.geo_data);
         } catch (err) {
             console.error("Error fetching history for reanalysis:", err);
+            pendingReanalyzeRef.current = false;
             alert("Gagal memuat data untuk analisis ulang: " + err.message);
         } finally {
             setLoadingHistory(false);
@@ -952,13 +1080,17 @@ const App = () => {
         setData(null); setGeoData(null); setFile(null); setMapUrl(null); setRgbMapUrl(null);
         setVectorLayerData(null); // Clear any specific classification vectors
         setTransitionSummary(null); setAuditReport(null);
-        setSelectedYear(null); setError(null); setChartType('bar');
+        setSelectedYear(null); setError(null);
         setStartYear(2017); setEndYear(currentYear - 1);
         setMapType('satellite'); // Switch back to high-res basemap
         setShowAllPins(true); fetchHistory();
         // Clear KPS detection states
         setDetectedKps(null); setExtractedNoSk(null); setKpsLinkMethod(null);
         setPendingGeoData(null); setPendingFile(null);
+        // Clear Slope states
+        setSlopeDbSummary(null); setSlopeDbSummaryOutside(null);
+        setSlopeMapUrlInside(null); setSlopeMapUrlOutside(null);
+        setShowSlopeLayer(false);
     };
 
     const handleCancel = () => {
@@ -1086,100 +1218,7 @@ const App = () => {
         setExtractedNoSk(null);
     };
 
-    // Custom Pins Handlers (with backend sync)
-    const handleAddCustomPin = async (latlng, label = '') => {
-        try {
-            // Optimistic update
-            const tempPin = {
-                id: `temp_${Date.now()}`,
-                lat: latlng.lat,
-                lng: latlng.lng,
-                label: label || `Pin ${customPins.length + 1}`,
-                created_at: new Date().toISOString()
-            };
-            setCustomPins(prev => [...prev, tempPin]);
 
-            // Save to backend
-            const response = await axios.post(`${API_URL}/api/pins`, {
-                lat: latlng.lat,
-                lng: latlng.lng,
-                label: label || `Pin ${customPins.length + 1}`
-            });
-
-            if (response.data?.status === 'success') {
-                // Replace temp pin with real pin from backend
-                setCustomPins(prev => prev.map(p =>
-                    p.id === tempPin.id ? response.data.data : p
-                ));
-                // Update localStorage cache
-                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
-                    customPins.map(p => p.id === tempPin.id ? response.data.data : p)
-                ));
-                console.log(`📍 Added custom pin:`, response.data.data);
-            }
-        } catch (err) {
-            console.error("Error adding pin:", err);
-            // Revert optimistic update on error
-            fetchCustomPins();
-            alert('Gagal menambahkan pin. Silakan coba lagi.');
-        }
-    };
-
-    const handleDeleteCustomPin = async (pinId) => {
-        try {
-            // Optimistic update
-            const pinToDelete = customPins.find(p => p.id === pinId);
-            setCustomPins(prev => prev.filter(p => p.id !== pinId));
-
-            // Delete from backend
-            await axios.delete(`${API_URL}/api/pins/${pinId}`);
-
-            // Update localStorage cache
-            localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
-                customPins.filter(p => p.id !== pinId)
-            ));
-            console.log(`🗑️ Deleted custom pin: ${pinId}`);
-        } catch (err) {
-            console.error("Error deleting pin:", err);
-            // Revert optimistic update on error
-            fetchCustomPins();
-            alert('Gagal menghapus pin. Silakan coba lagi.');
-        }
-    };
-
-    const handleUpdateCustomPin = async (pinId, updates) => {
-        try {
-            // Optimistic update
-            setCustomPins(prev => prev.map(p => p.id === pinId ? { ...p, ...updates } : p));
-
-            // Update backend
-            const response = await axios.put(`${API_URL}/api/pins/${pinId}`, {
-                label: updates.label
-            });
-
-            if (response.data?.status === 'success') {
-                // Update with backend response
-                setCustomPins(prev => prev.map(p =>
-                    p.id === pinId ? response.data.data : p
-                ));
-                // Update localStorage cache
-                localStorage.setItem('gealgeolgeo_custom_pins', JSON.stringify(
-                    customPins.map(p => p.id === pinId ? response.data.data : p)
-                ));
-                console.log(`✏️ Updated custom pin: ${pinId}`, updates);
-            }
-        } catch (err) {
-            console.error("Error updating pin:", err);
-            // Revert optimistic update on error
-            fetchCustomPins();
-            alert('Gagal mengupdate pin. Silakan coba lagi.');
-        }
-    };
-
-    const handleClearAllCustomPins = () => {
-        // This function is no longer used since we removed the Clear All button
-        console.log('Clear all pins is deprecated');
-    };
 
     const handleBulkValidationComplete = (validationResults, fileItems) => {
         setBulkValidationResults(validationResults);
@@ -1190,16 +1229,57 @@ const App = () => {
 
     const handleBulkReportSuccess = async (results, fileItems) => {
         console.log('Bulk upload complete:', results);
+
+        // Convert validated bulk files to batch queue jobs
+        const newJobs = fileItems.map((fileItem, idx) => {
+            const result = results[idx];
+            return {
+                id: Math.random().toString(36).substr(2, 9),
+                file: {
+                    name: result.filename,
+                    size: fileItem.file_size || 0
+                },
+                fileType: result.filename.toLowerCase().endsWith('.geojson') ? 'geojson' : 'zip',
+                status: 'waiting',
+                progress: 0,
+                progressDetail: 'Antre...',
+                error: null,
+                // Store the already-parsed geometry from validation
+                parsedGeometry: fileItem.geo_data,
+                // Store KPS metadata if available
+                kpsMetadata: result.kps_id ? {
+                    kps_id: result.kps_id,
+                    kps_name: result.kps_name,
+                    kps_no_sk: result.kps_no_sk,
+                    link_method: result.status === 'valid' ? 'AUTO' : 'MANUAL'
+                } : null
+            };
+        });
+
+        // Add jobs to batch queue
+        setBatchQueue(prev => [...prev, ...newJobs]);
+
+        // Close dialogs
         setShowBulkReportDialog(false);
-        setShowAnalysisComplete(true);
-        setTimeout(() => setShowAnalysisComplete(false), 3000);
-        fetchHistory();
+        setBulkValidationResults(null);
+        setBulkFileItems(null);
+
+        // Auto-start batch processing
+        setIsBatchRunning(true);
+
+        console.log(`✓ Added ${newJobs.length} files to batch queue and started processing`);
     };
 
     const handleBulkError = (error) => {
         alert(`Bulk upload error: ${error}`);
         setShowBulkUploadDialog(false);
         setShowBulkReportDialog(false);
+    };
+
+    const handleOpenMonitoringTerkini = (kpsId, kpsName) => {
+        setMonitoringKpsId(kpsId);
+        setMonitoringKpsName(kpsName);
+        setShowMonitoringTerkini(true);
     };
 
     const handleAnalyze = async (customThresholds = null) => {
@@ -1212,9 +1292,10 @@ const App = () => {
         let actualThresholds = (customThresholds && customThresholds.nativeEvent) ? null : customThresholds;
         if (!actualThresholds) actualThresholds = thresholds;
         setLoading(true); setError(null); setData(null); setMapUrl(null);
-        setShowChart(true); // Force dashboard expansion on analysis start
         setProgress(5); setProgressStep("Menghubungkan ke server...");
         setQueuePosition(null); // Reset queue position
+        // Clear slope stats for the new analysis session
+        setSlopeDbSummary(null); setSlopeDbSummaryOutside(null);
 
         isCancelledRef.current = false;
         abortControllerRef.current = new AbortController(); // Create controller for potential fallback
@@ -1260,6 +1341,8 @@ const App = () => {
                         setProgress(msg.progress);
                         setProgressStep(msg.step);
                         setProgressDetail(msg.detail || "");
+                        // Keep session alive during analysis progress
+                        resetSessionTimeout();
                     } else if (msg.type === 'complete') {
                         setQueuePosition(null);
                         console.log('✅ Analysis complete! Data received:', msg.data);
@@ -1270,8 +1353,10 @@ const App = () => {
                         setAuditReport(msg.data.audit_report || null);
                         if (msg.data.data?.length > 0) {
                             console.log('💾 Saving to history...');
-                            const lastData = msg.data.data[msg.data.data.length - 1];
-                            setSelectedYear(lastData.year); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB');
+                            // Set to the highest year (most recent)
+                            const maxYear = Math.max(...msg.data.data.map(d => d.year));
+                            const lastData = msg.data.data.find(d => d.year === maxYear) || msg.data.data[msg.data.data.length - 1];
+                            setSelectedYear(maxYear); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB');
                             axios.post(`${API_URL}/history`, {
                                 filename: file?.name || 'Unknown',
                                 file_size: file?.size || 0,
@@ -1292,6 +1377,8 @@ const App = () => {
                                 kps_id: detectedKps?.id_kps_api || null,
                                 link_method: kpsLinkMethod || 'NONE',
                                 analysis_scope: detectedKps ? 'KPS' : 'NON_KPS'
+                            }, {
+                                headers: { 'X-User-ID': userId }
                             }).then(() => {
                                 console.log('✅ History saved successfully');
                                 fetchHistory();
@@ -1336,8 +1423,10 @@ const App = () => {
                     setTransitionSummary(response.data.transition_summary || null);
                     setAuditReport(response.data.audit_report || null);
                     if (response.data.data?.length > 0) {
-                        const lastData = response.data.data[response.data.data.length - 1];
-                        setSelectedYear(lastData.year); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB'); setShowOverlay(true);
+                        // Set to the highest year (most recent)
+                        const maxYear = Math.max(...response.data.data.map(d => d.year));
+                        const lastData = response.data.data.find(d => d.year === maxYear) || response.data.data[response.data.data.length - 1];
+                        setSelectedYear(maxYear); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB'); setShowOverlay(true);
                         axios.post(`${API_URL}/history`, {
                             filename: file?.name || 'Unknown',
                             file_size: file?.size || 0,
@@ -1352,7 +1441,13 @@ const App = () => {
                             analysis_results: response.data.data,
                             geo_data: geoData,
                             transition_summary: response.data.transition_summary,
-                            audit_report: response.data.audit_report
+                            audit_report: response.data.audit_report,
+                            // KPS Detection Fields
+                            kps_id: detectedKps?.id_kps_api || null,
+                            link_method: kpsLinkMethod || 'NONE',
+                            analysis_scope: detectedKps ? 'KPS' : 'NON_KPS'
+                        }, {
+                            headers: { 'X-User-ID': userId }
                         }).then(() => fetchHistory());
                     }
                     setShowAnalysisComplete(true);
@@ -1382,15 +1477,34 @@ const App = () => {
         try {
             const response = await axios.post(`${API_URL}/export/geojson`, { geojson: geoData, data: data });
             const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/geo+json' })); a.download = `tutupan_lahan_${new Date().toISOString().split('T')[0]}.geojson`; a.click();
-        } catch (e) { setError('Export GeoJSON gagal'); }
+        } catch (e) { setError('Export GeoJSON gagal: ' + (e.response?.data?.detail || e.message)); }
     };
 
-    const handleExportBundle = async () => {
+    const exportAllAnalysisToExcel = async () => {
+        setIsExportingAll(true);
+        try {
+            const response = await axios.get(`${API_URL}/api/export/all-analysis-excel`, { responseType: 'blob' });
+            const url = window.URL.createObjectURL(new Blob([response.data]));
+            const link = document.createElement('a');
+            link.href = url;
+            const timestamp = new Date().toISOString().split('T')[0];
+            link.setAttribute('download', `Laporan_Semua_Analisis_${timestamp}.xlsx`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        } catch (e) {
+            setError('Export Excel gagal: ' + (e.response?.data?.detail || e.message));
+        } finally {
+            setIsExportingAll(false);
+        }
+    };
+
+    const handleExportShp = async () => {
         if (!data?.length || !geoData) return;
         try {
-            const response = await axios.post(`${API_URL}/export/bundle`, { geojson: geoData, data: data, title: 'Laporan Analisis GealGeolGeo' }, { responseType: 'blob', timeout: 600000 });
-            const a = document.createElement('a'); a.href = window.URL.createObjectURL(response.data); a.download = `GealGeolGeo_Export_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.zip`; document.body.appendChild(a); a.click(); a.remove();
-        } catch (e) { setError('Export gagal: ' + (e.response?.data?.detail || e.message)); }
+            const response = await axios.post(`${API_URL}/export/shp`, { geojson: geoData, data: data }, { responseType: 'blob', timeout: 600000 });
+            const a = document.createElement('a'); a.href = window.URL.createObjectURL(response.data); a.download = `SHP_Tutupan_Lahan_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.zip`; document.body.appendChild(a); a.click(); a.remove();
+        } catch (e) { setError('Export SHP gagal: ' + (e.response?.data?.detail || e.message)); }
     };
 
     const selectedYearData = useMemo(() => data?.find(d => d.year === selectedYear), [data, selectedYear]);
@@ -1405,6 +1519,18 @@ const App = () => {
             setVectorLayerData(null);
         }
     }, [selectedYearData]);
+
+    // Local tile URLs for cache-first serving (pipeline Phase 1)
+    const localMapTileUrl = useMemo(() => {
+        if (!file?.id || !selectedYear) return null;
+        const idShort = file.id.substring(0, 8);
+        return `${API_URL}/tiles/${file.id}/classified/${selectedYear}/{z}/{x}/{y}.png`;
+    }, [file?.id, selectedYear]);
+
+    const localRgbTileUrl = useMemo(() => {
+        if (!file?.id || !selectedYear) return null;
+        return `${API_URL}/tiles/${file.id}/rgb/${selectedYear}/{z}/{x}/{y}.png`;
+    }, [file?.id, selectedYear]);
     const yearStats = useMemo(() => {
         if (!selectedYearData) return null;
         const stats = Object.entries(LAND_COVER_CONFIG).map(([key, config]) => ({ key, ...config, value: selectedYearData[key] || 0 })).filter(s => s.value > 0);
@@ -1412,17 +1538,16 @@ const App = () => {
         return { stats: stats.map(s => ({ ...s, percentage: total > 0 ? ((s.value / total) * 100).toFixed(1) : 0 })).sort((a, b) => b.value - a.value), total };
     }, [selectedYearData]);
     const dominantLandCover = useMemo(() => yearStats?.stats?.[0] || null, [yearStats]);
-
     const layoutProps = {
-        file, loading, showChart, setShowChart, data, geoData, setData, setGeoData, setFile, setMapUrl, setRgbMapUrl, setVectorLayerData, setError,
-        vectorLayerData, mapUrl, rgbMapUrl, error, startYear, setStartYear, endYear, setEndYear,
-        analysisMode, setAnalysisMode, specificDate, setSpecificDate, mapType, setMapType, chartType, setChartType, selectedYear, setSelectedYear,
+        file, loading, data, geoData, setData, setGeoData, setFile, setMapUrl, setRgbMapUrl, setVectorLayerData, setError,
+        vectorLayerData, mapUrl, rgbMapUrl, localMapTileUrl, localRgbTileUrl, pipelineState, error, startYear, setStartYear, endYear, setEndYear,
+        analysisMode, setAnalysisMode, specificDate, setSpecificDate, mapType, setMapType, selectedYear, setSelectedYear,
         showOverlay, setShowOverlay, showRgb, setShowRgb, polygonOpacity, setPolygonOpacity, showConfidenceInfo, setShowConfidenceInfo,
         showMetadata, setShowMetadata, progress, progressStep, progressDetail, showCalibration, setShowCalibration, thresholds, setThresholds,
-        expandedAttributes, setExpandedAttributes, historyData, loadingHistory, showSidebar, setShowSidebar, sidebarRef,
+        expandedAttributes, setExpandedAttributes, historyData, loadingHistory, loadingGeometries, showSidebar, setShowSidebar, sidebarRef,
         isCompareMode, setIsCompareMode, compareYear, setCompareYear, compareMapUrl, setCompareMapUrl, compareRgbMapUrl, setCompareRgbMapUrl,
-        handleFileChange, handleAnalyze, handleDeleteHistory, handleUpdateHistoryItem, handleHistorySelect, handleHistoryReanalyze, handleReset, handleExportBundle, exportToExcel, exportToGeoJSON,
-        handleCancel,
+        handleFileChange, handleAnalyze, handleDeleteHistory, handleUpdateHistoryItem, handleHistorySelect, handleHistoryReanalyze, handleReset, onExportShp: handleExportShp, onExportToExcel: exportToExcel, onExportToGeoJSON: exportToGeoJSON, onExportAllToExcel: exportAllAnalysisToExcel,
+        handleCancel, isExportingAll,
         selectedYearData, yearStats, dominantLandCover,
         // Global Props
         showAllPins, setShowAllPins, showHistoryTable, setShowHistoryTable,
@@ -1446,228 +1571,305 @@ const App = () => {
         auditReport,
         timeLeft, // Pass countdown to MainLayout
         queuePosition, // Pass current queue rank
-        // Custom Pins
-        customPins,
-        isAddingPin,
-        setIsAddingPin,
-        handleAddCustomPin,
-        handleDeleteCustomPin,
-        handleUpdateCustomPin,
-        handleClearAllCustomPins,
+
         // Bulk Upload
-        setShowBulkUploadDialog
+        setShowBulkUploadDialog,
+        // Monitoring Terkini
+        onOpenMonitoringTerkini: handleOpenMonitoringTerkini,
+        detectedKps
     };
 
+    // Login Handler
+    const handleLoginSuccess = (userData) => {
+        setIsAuthenticated(true);
+    };
+
+    const handleLogout = () => {
+        localStorage.removeItem('user');
+        setIsAuthenticated(false);
+        // Reset all state when logging out
+        setFile(null);
+        setData(null);
+        setGeoData(null);
+        setMapUrl(null);
+        setShowAllPins(true);
+    };
+
+    // Show Login Page if not authenticated
+    if (!isAuthenticated) {
+        return (
+            <Suspense fallback={
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    height: '100vh',
+                    background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)',
+                    color: '#fff',
+                    fontFamily: 'sans-serif'
+                }}>
+                    Loading...
+                </div>
+            }>
+                <Login onLoginSuccess={handleLoginSuccess} />
+            </Suspense>
+        );
+    }
+
+    // Main App Content (shown when authenticated)
     return (
         <>
-            <MainLayout {...layoutProps}>
-                <BatchQueueList
-                    queue={batchQueue}
-                    currentJobId={currentJobId}
-                    isRunning={isBatchRunning}
-                    onStart={handleStartBatch}
-                    onCancel={handleCancelBatch}
-                    onClear={handleClearQueue}
-                    onRemove={handleRemoveJob}
-                />
-            </MainLayout>
-
-            {showAnalysisComplete && (
-                <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[2000] bg-emerald-600 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 animate-bounce">
-                    <CheckCircle2 size={20} />
-                    <span className="text-sm font-bold uppercase tracking-widest">Analisis Selesai & Tersimpan!</span>
+            <Suspense fallback={
+                <div className="flex h-screen w-full items-center justify-center bg-slate-50 text-slate-400 font-sans font-medium">
+                    <div className="flex flex-col items-center gap-4 animate-pulse">
+                        <div className="w-12 h-12 bg-emerald-500 rounded-2xl shadow-xl shadow-emerald-500/20"></div>
+                        <div>Memuat Aplikasi...</div>
+                    </div>
                 </div>
-            )}
+            }>
+                <MainLayout {...layoutProps} onLogout={handleLogout}>
+                    <BatchQueueList
+                        queue={batchQueue}
+                        currentJobId={currentJobId}
+                        isRunning={isBatchRunning}
+                        onStart={handleStartBatch}
+                        onCancel={handleCancelBatch}
+                        onClear={handleClearQueue}
+                        onRemove={handleRemoveJob}
+                    />
+                </MainLayout>
 
-            {/* MODAL KONFIRMASI ANALISIS ULANG (Request User) */}
-            {analysisConflict && (
-                <div className="fixed inset-0 z-[5000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-300">
-                    <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-xl overflow-hidden border border-slate-100 flex flex-col animate-in zoom-in-95 duration-300">
-                        {/* Header dengan Icon */}
-                        <div className="bg-emerald-50 px-8 py-10 text-center relative">
-                            <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-100/50 rounded-full blur-3xl -mr-16 -mt-16" />
-                            <div className="w-20 h-20 bg-white rounded-3xl shadow-xl flex items-center justify-center mx-auto mb-6 text-emerald-600 relative z-10">
-                                <History size={40} />
+                {showAnalysisComplete && (
+                    <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[2000] bg-emerald-600 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 animate-bounce">
+                        <CheckCircle2 size={20} />
+                        <span className="text-sm font-bold uppercase tracking-widest">Analisis Selesai & Tersimpan!</span>
+                    </div>
+                )}
+
+                {/* MODAL KONFIRMASI ANALISIS ULANG (Request User) */}
+                {analysisConflict && (
+                    <div className="fixed inset-0 z-[5000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-300">
+                        <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-xl overflow-hidden border border-slate-100 flex flex-col animate-in zoom-in-95 duration-300">
+                            {/* Header dengan Icon */}
+                            <div className="bg-emerald-50 px-8 py-10 text-center relative">
+                                <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-100/50 rounded-full blur-3xl -mr-16 -mt-16" />
+                                <div className="w-20 h-20 bg-white rounded-3xl shadow-xl flex items-center justify-center mx-auto mb-6 text-emerald-600 relative z-10">
+                                    <History size={40} />
+                                </div>
+                                <h3 className="text-2xl font-black text-slate-800 tracking-tight leading-tight relative z-10">
+                                    Lanjutkan Analisis Baru?
+                                </h3>
+                                <p className="text-slate-500 text-sm mt-2 font-medium relative z-10">SHP ini terdeteksi sudah pernah dianalisis sebelumnya.</p>
                             </div>
-                            <h3 className="text-2xl font-black text-slate-800 tracking-tight leading-tight relative z-10">
-                                Lanjutkan Analisis Baru?
-                            </h3>
-                            <p className="text-slate-500 text-sm mt-2 font-medium relative z-10">SHP ini terdeteksi sudah pernah dianalisis sebelumnya.</p>
+
+                            {/* Body Detail */}
+                            <div className="p-8 space-y-6">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 flex items-center gap-4 transition-all hover:bg-slate-100">
+                                        <div className="p-3 bg-white rounded-xl text-emerald-600 shadow-sm">
+                                            <Calendar size={20} />
+                                        </div>
+                                        <div className="flex flex-col">
+                                            <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Dianalisis Pada</span>
+                                            <span className="text-[11px] font-bold text-slate-700">
+                                                {new Date(analysisConflict.created_at).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 flex items-center gap-4 transition-all hover:bg-slate-100">
+                                        <div className="p-3 bg-white rounded-xl text-emerald-600 shadow-sm">
+                                            <Activity size={20} />
+                                        </div>
+                                        <div className="flex flex-col">
+                                            <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Time Series</span>
+                                            <span className="text-sm font-bold text-slate-700">
+                                                {analysisConflict.metadata?.start_year} - {analysisConflict.metadata?.end_year}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl flex items-start gap-4">
+                                    <AlertCircle className="text-amber-500 shrink-0 mt-0.5" size={20} />
+                                    <div className="space-y-1">
+                                        <p className="text-[11px] font-bold text-amber-800 uppercase tracking-widest">Peringatan Penting</p>
+                                        <p className="text-[11px] text-amber-700 leading-relaxed font-medium">
+                                            SHP ini sudah dianalisis sebelumnya. Jika Anda melanjutkan, data analisis lama akan <b>digantikan secara permanen</b> dengan hasil analisis terbaru dari GEE.
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Footer Actions */}
+                            <div className="p-8 bg-slate-50 flex flex-col sm:flex-row gap-4 border-t border-slate-100">
+                                <button
+                                    onClick={() => setAnalysisConflict(null)}
+                                    className="flex-1 py-4 bg-white border border-slate-200 text-slate-500 font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-sm hover:bg-slate-100 transition-all active:scale-95"
+                                >
+                                    Tutup
+                                </button>
+
+                                <button
+                                    onClick={() => {
+                                        setAnalysisConflict(null);
+                                        handleAnalyze(null, { skipConflictCheck: true, mode: 'merge' });
+                                    }}
+                                    className="flex-1 py-4 bg-blue-600 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-blue-500/30 hover:bg-blue-700 transition-all active:scale-95 flex items-center justify-center gap-2"
+                                >
+                                    Gabungkan Data <RefreshCw size={14} />
+                                </button>
+
+                                <button
+                                    onClick={() => {
+                                        setAnalysisConflict(null);
+                                        handleAnalyze(null, { skipConflictCheck: true, mode: 'replace' });
+                                    }}
+                                    className="flex-1 py-4 bg-emerald-600 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-emerald-500/30 hover:bg-emerald-700 transition-all active:scale-95 flex items-center justify-center gap-2"
+                                >
+                                    Mulai Baru <ArrowRight size={16} />
+                                </button>
+                            </div>
                         </div>
+                    </div>
+                )}
 
-                        {/* Body Detail */}
-                        <div className="p-8 space-y-6">
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 flex items-center gap-4 transition-all hover:bg-slate-100">
-                                    <div className="p-3 bg-white rounded-xl text-emerald-600 shadow-sm">
-                                        <Calendar size={20} />
-                                    </div>
-                                    <div className="flex flex-col">
-                                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Dianalisis Pada</span>
-                                        <span className="text-[11px] font-bold text-slate-700">
-                                            {new Date(analysisConflict.created_at).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                                        </span>
+                {/* Batch Complete Modal */}
+                {showBatchComplete && (
+                    <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
+                        <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-300 border border-white/20">
+                            <div className="h-2 bg-gradient-to-r from-emerald-400 via-teal-500 to-emerald-600" />
+
+                            <div className="p-8 text-center space-y-6">
+                                <div className="relative mx-auto w-20 h-20 bg-emerald-50 rounded-3xl flex items-center justify-center text-emerald-600 shadow-inner">
+                                    <CheckCircle2 className="w-10 h-10" />
+                                    <div className="absolute -top-1 -right-1 w-6 h-6 bg-emerald-500 rounded-full border-4 border-white flex items-center justify-center">
+                                        <div className="w-1.5 h-1.5 bg-white rounded-full animate-ping" />
                                     </div>
                                 </div>
 
-                                <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 flex items-center gap-4 transition-all hover:bg-slate-100">
-                                    <div className="p-3 bg-white rounded-xl text-emerald-600 shadow-sm">
-                                        <Activity size={20} />
-                                    </div>
-                                    <div className="flex flex-col">
-                                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Time Series</span>
-                                        <span className="text-sm font-bold text-slate-700">
-                                            {analysisConflict.metadata?.start_year} - {analysisConflict.metadata?.end_year}
-                                        </span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl flex items-start gap-4">
-                                <AlertCircle className="text-amber-500 shrink-0 mt-0.5" size={20} />
-                                <div className="space-y-1">
-                                    <p className="text-[11px] font-bold text-amber-800 uppercase tracking-widest">Peringatan Penting</p>
-                                    <p className="text-[11px] text-amber-700 leading-relaxed font-medium">
-                                        SHP ini sudah dianalisis sebelumnya. Jika Anda melanjutkan, data analisis lama akan <b>digantikan secara permanen</b> dengan hasil analisis terbaru dari GEE.
+                                <div className="space-y-2">
+                                    <h2 className="text-2xl font-black text-slate-800 tracking-tight">Analisis Batch Selesai!</h2>
+                                    <p className="text-sm text-slate-500 font-medium leading-relaxed px-4">
+                                        Seluruh file dalam antrian telah berhasil dianalisis dan disimpan ke riwayat.
                                     </p>
                                 </div>
+
+                                <div className="grid grid-cols-3 gap-3">
+                                    <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100">
+                                        <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total</div>
+                                        <div className="text-lg font-black text-slate-700">{batchQueue.length}</div>
+                                    </div>
+                                    <div className="bg-emerald-50 p-3 rounded-2xl border border-emerald-100/50">
+                                        <div className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-1">Sukses</div>
+                                        <div className="text-lg font-black text-emerald-700">{batchQueue.filter(j => j.status === 'completed').length}</div>
+                                    </div>
+                                    <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100">
+                                        <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Gagal</div>
+                                        <div className="text-lg font-black text-red-600">{batchQueue.filter(j => j.status === 'error').length}</div>
+                                    </div>
+                                </div>
+
+                                <button
+                                    onClick={() => {
+                                        setShowBatchComplete(false);
+                                        setBatchQueue([]); // Bersihkan antrian setelah selesai
+                                    }}
+                                    className="group relative w-full py-4 bg-slate-900 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-slate-900/20 hover:bg-slate-800 transition-all active:scale-95 flex items-center justify-center gap-2"
+                                >
+                                    <span className="relative z-10">Tutup Antrian & Lihat Hasil</span>
+                                    <ArrowRight size={14} className="group-hover:translate-x-1 transition-transform" />
+                                </button>
                             </div>
-                        </div>
-
-                        {/* Footer Actions */}
-                        <div className="p-8 bg-slate-50 flex flex-col sm:flex-row gap-4 border-t border-slate-100">
-                            <button
-                                onClick={() => setAnalysisConflict(null)}
-                                className="flex-1 py-4 bg-white border border-slate-200 text-slate-500 font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-sm hover:bg-slate-100 transition-all active:scale-95"
-                            >
-                                Tutup
-                            </button>
-
-                            <button
-                                onClick={() => {
-                                    setAnalysisConflict(null);
-                                    handleAnalyze(null, { skipConflictCheck: true, mode: 'merge' });
-                                }}
-                                className="flex-1 py-4 bg-blue-600 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-blue-500/30 hover:bg-blue-700 transition-all active:scale-95 flex items-center justify-center gap-2"
-                            >
-                                Gabungkan Data <RefreshCw size={14} />
-                            </button>
-
-                            <button
-                                onClick={() => {
-                                    setAnalysisConflict(null);
-                                    handleAnalyze(null, { skipConflictCheck: true, mode: 'replace' });
-                                }}
-                                className="flex-1 py-4 bg-emerald-600 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-emerald-500/30 hover:bg-emerald-700 transition-all active:scale-95 flex items-center justify-center gap-2"
-                            >
-                                Mulai Baru <ArrowRight size={16} />
-                            </button>
                         </div>
                     </div>
-                </div>
-            )}
+                )}
 
-            {/* Batch Complete Modal */}
-            {showBatchComplete && (
-                <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
-                    <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-300 border border-white/20">
-                        <div className="h-2 bg-gradient-to-r from-emerald-400 via-teal-500 to-emerald-600" />
-
-                        <div className="p-8 text-center space-y-6">
-                            <div className="relative mx-auto w-20 h-20 bg-emerald-50 rounded-3xl flex items-center justify-center text-emerald-600 shadow-inner">
-                                <CheckCircle2 className="w-10 h-10" />
-                                <div className="absolute -top-1 -right-1 w-6 h-6 bg-emerald-500 rounded-full border-4 border-white flex items-center justify-center">
-                                    <div className="w-1.5 h-1.5 bg-white rounded-full animate-ping" />
-                                </div>
-                            </div>
-
-                            <div className="space-y-2">
-                                <h2 className="text-2xl font-black text-slate-800 tracking-tight">Analisis Batch Selesai!</h2>
-                                <p className="text-sm text-slate-500 font-medium leading-relaxed px-4">
-                                    Seluruh file dalam antrian telah berhasil dianalisis dan disimpan ke riwayat.
-                                </p>
-                            </div>
-
-                            <div className="grid grid-cols-3 gap-3">
-                                <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100">
-                                    <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total</div>
-                                    <div className="text-lg font-black text-slate-700">{batchQueue.length}</div>
-                                </div>
-                                <div className="bg-emerald-50 p-3 rounded-2xl border border-emerald-100/50">
-                                    <div className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-1">Sukses</div>
-                                    <div className="text-lg font-black text-emerald-700">{batchQueue.filter(j => j.status === 'completed').length}</div>
-                                </div>
-                                <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100">
-                                    <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Gagal</div>
-                                    <div className="text-lg font-black text-red-600">{batchQueue.filter(j => j.status === 'error').length}</div>
-                                </div>
-                            </div>
-
-                            <button
-                                onClick={() => {
-                                    setShowBatchComplete(false);
-                                    setBatchQueue([]); // Bersihkan antrian setelah selesai
-                                }}
-                                className="group relative w-full py-4 bg-slate-900 text-white font-black uppercase tracking-widest text-[10px] rounded-2xl shadow-xl shadow-slate-900/20 hover:bg-slate-800 transition-all active:scale-95 flex items-center justify-center gap-2"
-                            >
-                                <span className="relative z-10">Tutup Antrian & Lihat Hasil</span>
-                                <ArrowRight size={14} className="group-hover:translate-x-1 transition-transform" />
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            </Suspense>
 
             {/* Carbon Time-Series Dashboard Modal */}
-            <CarbonDashboard
-                historyId={carbonHistoryId}
-                isOpen={carbonModeEnabled}
-                onClose={() => {
-                    setCarbonModeEnabled(false);
-                    setCarbonHistoryId(null);
-                    setCarbonFilename(null);
-                }}
-                filename={carbonFilename}
-            />
+            {carbonModeEnabled && (
+                <Suspense fallback={null}>
+                    <CarbonDashboard
+                        historyId={carbonHistoryId}
+                        isOpen={carbonModeEnabled}
+                        onClose={() => {
+                            setCarbonModeEnabled(false);
+                            setCarbonHistoryId(null);
+                            setCarbonFilename(null);
+                        }}
+                        filename={carbonFilename}
+                    />
+                </Suspense>
+            )}
 
             {/* KPS Detection Dialog */}
-            <KpsDetectionDialog
-                show={showKpsDialog}
-                detectedKps={detectedKps}
-                extractedNoSk={extractedNoSk}
-                onConfirm={handleKpsConfirm}
-                onSkip={handleKpsSkip}
-                onClose={handleKpsClose}
-            />
+            {showKpsDialog && (
+                <Suspense fallback={null}>
+                    <KpsDetectionDialog
+                        show={showKpsDialog}
+                        detectedKps={detectedKps}
+                        extractedNoSk={extractedNoSk}
+                        onConfirm={handleKpsConfirm}
+                        onSkip={handleKpsSkip}
+                        onClose={handleKpsClose}
+                    />
+                </Suspense>
+            )}
 
             {/* Duplicate SHP Detection Dialog */}
-            <DuplicateDialog
-                show={showDuplicateDialog}
-                duplicateInfo={duplicateInfo}
-                allYears={Array.from({ length: endYear - 2016 }, (_, i) => 2017 + i)}
-                onUpdate={handleDuplicateUpdate}
-                onReplace={handleDuplicateReplace}
-                onCancel={handleDuplicateCancel}
-            />
+            {showDuplicateDialog && (
+                <Suspense fallback={null}>
+                    <DuplicateDialog
+                        show={showDuplicateDialog}
+                        duplicateInfo={duplicateInfo}
+                        allYears={Array.from({ length: endYear - 2016 }, (_, i) => 2017 + i)}
+                        onUpdate={handleDuplicateUpdate}
+                        onReplace={handleDuplicateReplace}
+                        onCancel={handleDuplicateCancel}
+                    />
+                </Suspense>
+            )}
 
             {/* Bulk Upload Dialog */}
             {showBulkUploadDialog && (
-                <BulkUploadDialog
-                    onClose={() => setShowBulkUploadDialog(false)}
-                    onValidationComplete={handleBulkValidationComplete}
-                    onError={handleBulkError}
-                />
+                <Suspense fallback={null}>
+                    <BulkUploadDialog
+                        onClose={() => setShowBulkUploadDialog(false)}
+                        onValidationComplete={handleBulkValidationComplete}
+                        onError={handleBulkError}
+                    />
+                </Suspense>
             )}
 
             {/* Bulk Report Dialog */}
             {showBulkReportDialog && bulkValidationResults && bulkFileItems && (
-                <BulkReportDialog
-                    validationResults={bulkValidationResults}
-                    bulkFileItems={bulkFileItems}
-                    onClose={() => setShowBulkReportDialog(false)}
-                    onSuccess={handleBulkReportSuccess}
-                    onError={handleBulkError}
-                />
+                <Suspense fallback={null}>
+                    <BulkReportDialog
+                        validationResults={bulkValidationResults}
+                        bulkFileItems={bulkFileItems}
+                        onClose={() => setShowBulkReportDialog(false)}
+                        onSuccess={handleBulkReportSuccess}
+                        onError={handleBulkError}
+                    />
+                </Suspense>
+            )}
+
+            {/* Monitoring Terkini Dashboard */}
+            {showMonitoringTerkini && (
+                <Suspense fallback={null}>
+                    <MonitoringTerkiniDashboard
+                        isOpen={showMonitoringTerkini}
+                        onClose={() => {
+                            setShowMonitoringTerkini(false);
+                            setMonitoringKpsId(null);
+                            setMonitoringKpsName(null);
+                        }}
+                        idKps={monitoringKpsId}
+                        namaKps={monitoringKpsName}
+                        geoData={geoData}
+                    />
+                </Suspense>
             )}
         </>
     );

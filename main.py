@@ -26,7 +26,7 @@ import logging
 import base64
 import shapefile # pyshp
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response, Request, BackgroundTasks, Query
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from shapely.geometry import shape, mapping
@@ -36,10 +36,14 @@ from fastapi.staticfiles import StaticFiles
 import pathlib
 
 from pkps_sync import run_sync_process
+from pipeline import PipelineState, PipelineManager, AssetManifest, calculate_bbox_from_geojson
 
 from dotenv import load_dotenv
 import requests
 from supabase import create_client, Client
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 import sys
 
@@ -79,12 +83,33 @@ disk_cache = diskcache.Cache(CACHE_DIR, size_limit=CACHE_SIZE_LIMIT)
 # Permanent cache - no TTL, only invalidated on data changes (POST/DELETE)
 print(f"✅ Disk cache initialized at: {CACHE_DIR} (Size limit: 10GB, Permanent mode)")
 
+
+async def supabase_query(fn, max_retries=3):
+    """Execute a Supabase query with retry on transient socket errors (Windows 10035)."""
+    for attempt in range(max_retries):
+        try:
+            return await asyncio.to_thread(fn)
+        except OSError as e:
+            # WinError 10035: non-blocking socket not ready
+            if attempt < max_retries - 1 and getattr(e, 'winerror', 0) == 10035:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            err_str = str(e)
+            if attempt < max_retries - 1 and "10035" in err_str:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+
 # ==============================================================================
 # LOCAL STORAGE (IMAGE HOSTING)
 # ==============================================================================
 STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 THUMBNAIL_DIR = os.path.join(STORAGE_ROOT, "thumbnails")
+TILES_DIR = os.path.join(STORAGE_ROOT, "tiles")
 pathlib.Path(THUMBNAIL_DIR).mkdir(parents=True, exist_ok=True)
+pathlib.Path(TILES_DIR).mkdir(parents=True, exist_ok=True)
 print(f"✅ Local storage initialized at: {STORAGE_ROOT}")
 
 def ensure_storage_ready():
@@ -120,6 +145,14 @@ def ensure_storage_ready():
 
 # Call immediately on startup
 ensure_storage_ready()
+
+# ==============================================================================
+# PIPELINE MANAGER (Tile Download + Asset Manifest)
+# ==============================================================================
+pipeline_manager: Optional[PipelineManager] = None
+if supabase:
+    pipeline_manager = PipelineManager(supabase, STORAGE_ROOT)
+    print("✅ Pipeline manager initialized")
 
 def save_image_persistence(data: Any, filename: str) -> Optional[str]:
     """
@@ -159,7 +192,8 @@ def save_image_persistence(data: Any, filename: str) -> Optional[str]:
         elif hasattr(data, 'save'): # Already a PIL Image
             img = data
         else:
-            print(f"⚠️ save_image_persistence: Unsupported data type {type(data)}")
+            print(f"⚠️ save_image_persistence: Unsupported data type {type(data)} for filename={filename}")
+            print(f"   Data preview: {str(data)[:200]}")
             return None
              
         # 3. Convert to RGB/RGBA
@@ -275,6 +309,7 @@ LC_CATEGORIES = {
     5: "air",             # Water bodies
     6: "lahan_terbangun", # Built-up / Pemukiman
 }
+LC_CLASSES = LC_CATEGORIES  # Alias used throughout export/shapefile code
 
 # Konfigurasi visualisasi peta dengan palet warna
 LC_PALETTE = {
@@ -764,6 +799,13 @@ class AnalyzeResponse(BaseModel):
 class SlopeRequest(BaseModel):
     """Request body untuk endpoint /map/slope."""
     geo_data: Dict[str, Any] = Field(..., description="Objek geometri GeoJSON untuk analisis")
+    history_id: Optional[str] = None
+
+
+class MonitoringTerkiniRequest(BaseModel):
+    """Request body untuk endpoint /api/dashboard/monitoring-terkini."""
+    geo_data: Dict[str, Any]
+    nama: Optional[str] = "Analisis Monitoring"
 
 
 class SaveHistoryRequest(BaseModel):
@@ -843,6 +885,31 @@ class CarbonTimeSeriesResponse(BaseModel):
     change_result: Optional[CarbonChangeResult] = None
     carbon_factors_used: Dict[str, Any] = {}  # Transparansi faktor yang digunakan
     disclaimer: str = CARBON_DISCLAIMER
+
+
+# ==============================================================================
+# CHART AGGREGATION MODELS
+# ==============================================================================
+
+class ChartYearlyData(BaseModel):
+    """Data agregat tahunan dari view vw_chart_yearly_aggregate."""
+    year: int
+    hutan_primer: float = 0
+    hutan_sekunder: float = 0
+    tanah_kering: float = 0
+    tanah_kosong: float = 0
+    lahan_terbangun: float = 0
+    air: float = 0
+    total_ha: float = 0
+    kps_count: int = 0
+
+class ChartYearlyAggregateResponse(BaseModel):
+    """Response body untuk endpoint /api/chart/yearly-aggregate."""
+    status: str = "success"
+    data: List[ChartYearlyData] = []
+    total_years: int = 0
+    total_kps: int = 0
+    metadata: Dict[str, Any] = {}
 
 
 async def check_database_health():
@@ -1772,6 +1839,26 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
     Internal function to save history (extracted from save_history endpoint).
     Returns (history_id, lahan_id)
     """
+    # 0. Calculate Centroid (Robust)
+    centroid_lat = None
+    centroid_lng = None
+    try:
+        from shapely.geometry import shape
+        geo = request.geo_data
+        # Normalize: extract geometry from Feature/FeatureCollection
+        if geo.get("type") == "FeatureCollection":
+            features = geo.get("features", [])
+            if features:
+                geo = features[0].get("geometry", geo)
+        elif geo.get("type") == "Feature":
+            geo = geo.get("geometry", geo)
+        geom = shape(geo)
+        centroid = geom.centroid
+        centroid_lat = centroid.y
+        centroid_lng = centroid.x
+    except Exception as e:
+        print(f"⚠️ Centroid calculation failed: {e}")
+
     # 1. Hash GeoJSON
     geom_str = json.dumps(request.geo_data, sort_keys=True)
     geom_hash = hashlib.md5(geom_str.encode()).hexdigest()
@@ -1789,12 +1876,18 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
 
     if res.data and len(res.data) > 0:
         lahan_id = res.data[0]['id']
+        # Optional: Update existing master_lahan with centroid if missing?
+        # For now, rely on new history having it.
     else:
         # Create new master_lahan
         new_lahan = {
             "geom_geojson": request.geo_data,
             "geom_hash": geom_hash
         }
+        if centroid_lat is not None:
+            new_lahan["centroid_lat"] = centroid_lat
+            new_lahan["centroid_lng"] = centroid_lng
+
         ins = await asyncio.to_thread(
             lambda: supabase.table("master_lahan").insert(new_lahan).execute()
         )
@@ -1857,6 +1950,11 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
         "audit_report": request.audit_report,
         "status": "COMPLETE"
     }
+    
+    # Save centroid to analysis_history for fast access (avoiding joins later)
+    if centroid_lat is not None:
+        history_data["center_lat"] = centroid_lat
+        history_data["center_lng"] = centroid_lng
 
     history_res = await asyncio.to_thread(
         lambda: supabase.table("analysis_history").insert(history_data).execute()
@@ -4073,6 +4171,9 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
         
         # Core variables
         geojson_data = data.get("geojson")
+        if not geojson_data:
+            await ws_manager.send_error(client_id, "Missing 'geojson' field in request")
+            return
         years = data.get("years", 5)
         mode = data.get("mode", "series")
         specific_date = data.get("specific_date")
@@ -4365,6 +4466,61 @@ async def export_kml(request: ExportRequest):
         raise HTTPException(status_code=500, detail=f"Export KML gagal: {str(e)}")
 
 
+@app.post("/export/shp")
+async def export_shp(request: ExportRequest):
+    """
+    Export hasil analisis sebagai Shapefile (SHP) dalam ZIP.
+    Menggunakan GEE reduceToVectors untuk setiap tahun.
+    """
+    try:
+        geom = geojson_to_ee_geometry(request.geojson)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in request.data:
+                year = item.get('year', 'unknown')
+                print(f"📦 Export SHP: Generating vectors for {year}...")
+
+                classified = get_classified_image(geom, year)
+                if not classified:
+                    zf.writestr(f"{year}/no_data.txt", "No Sentinel-2 imagery found.")
+                    continue
+
+                try:
+                    vectors = classified.reduceToVectors(
+                        geometry=geom,
+                        crs=classified.projection(),
+                        scale=10,
+                        geometryType='polygon',
+                        eightConnected=False,
+                        labelProperty='label',
+                        reducer=ee.Reducer.countEvery(),
+                        maxPixels=1e10
+                    )
+                    fc_dict = await asyncio.to_thread(vectors.getInfo)
+                    shp_buffers = generate_shapefile_buffer(fc_dict)
+
+                    base_name = f"{year}/{year}_tutupan_lahan"
+                    zf.writestr(f"{base_name}.shp", shp_buffers['shp'])
+                    zf.writestr(f"{base_name}.shx", shp_buffers['shx'])
+                    zf.writestr(f"{base_name}.dbf", shp_buffers['dbf'])
+                    zf.writestr(f"{base_name}.prj", shp_buffers['prj'])
+                    print(f"   ✅ SHP for {year} done")
+                except Exception as e:
+                    print(f"   ⚠️ SHP generation failed for {year}: {e}")
+                    zf.writestr(f"{year}/error.txt", str(e))
+
+        zip_buffer.seek(0)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        filename = f"SHP_Tutupan_Lahan_{timestamp}.zip"
+
+        return Response(
+            content=zip_buffer.read(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export SHP gagal: {str(e)}")
 
 
 @app.post("/change-detection", response_model=ChangeDetectionResponse)
@@ -4723,18 +4879,60 @@ async def get_slope_analysis(request: SlopeRequest):
             return stats
 
         print("   📊 Computing stats for INSIDE...")
-        summary_inside = calc_slope_stats(geometry, "INSIDE")
+        summary_inside = await asyncio.to_thread(lambda: calc_slope_stats(geometry, "INSIDE"))
 
         print("   📊 Computing stats for OUTSIDE (2km)...")
-        summary_outside = calc_slope_stats(outside_mask, "OUTSIDE")
+        summary_outside = await asyncio.to_thread(lambda: calc_slope_stats(outside_mask, "OUTSIDE_2KM"))
+
+        # Persist to DB if history_id provided
+        slope_map_url = None
+        if request.history_id and supabase:
+            try:
+                for record in [summary_inside, summary_outside]:
+                    await asyncio.to_thread(
+                        lambda r=record: supabase.table("analysis_slope_summary")
+                            .upsert({"history_id": request.history_id, **r}, on_conflict="history_id,scope")
+                            .execute()
+                    )
+                print(f"✅ Slope stats saved to DB for history {request.history_id[:8]}")
+
+                # Generate static slope thumbnail and persist locally
+                try:
+                    # Use SLD-styled visualization (same as tile layer) for consistency
+                    viz_slope_inside = slope_pct.clip(geometry).sldStyle(sld_intervals)
+                    thumb_url = await asyncio.to_thread(lambda: viz_slope_inside.getThumbURL({
+                        'region': geometry,
+                        'format': 'png',
+                        'dimensions': 600
+                    }))
+                    if thumb_url:
+                        perm_url = await download_and_save_locally(thumb_url, f"slope_inside_{request.history_id[:8]}")
+                        if perm_url:
+                            slope_map_url = perm_url
+                            await asyncio.to_thread(
+                                lambda: supabase.table("analysis_history")
+                                    .update({"slope_map_url": slope_map_url})
+                                    .eq("id", request.history_id)
+                                    .execute()
+                            )
+                            print(f"✅ Slope thumbnail saved locally: {slope_map_url}")
+                        else:
+                            print(f"⚠️ Slope thumbnail download failed, no URL saved")
+                    else:
+                        print(f"⚠️ Slope getThumbURL returned None")
+                except Exception as map_err:
+                    print(f"⚠️ Slope thumbnail generation failed (non-fatal): {map_err}")
+            except Exception as db_err:
+                print(f"⚠️ Slope DB save failed (non-fatal): {db_err}")
 
         return {
             "status": "success",
             "map_url_inside": map_url_inside,
             "map_url_outside": map_url_outside,
+            "slope_map_url": slope_map_url,
             "db_summary": [summary_inside, summary_outside]
         }
-        
+
     except Exception as e:
         print(f"❌ Slope Analysis Failed: {e}")
         import traceback
@@ -5091,7 +5289,11 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                      "tanah_kosong": float(item.get("tanah_kosong", 0) or 0),
                      "lahan_terbangun": float(item.get("lahan_terbangun", 0) or 0),
                      "air": float(item.get("air", 0) or 0),
-                     "total_area": float(item.get("total_area", 0) or 0)
+                     "total_area": float(item.get("total_area", 0) or 0),
+                     # Transition metrics per year
+                     "deforestation_ha": float(item.get("deforestation_ha", 0) or item.get("forest_loss", 0) or 0),
+                     "reforestation_ha": float(item.get("reforestation_ha", 0) or item.get("forest_gain", 0) or 0),
+                     "builtup_expansion_ha": float(item.get("builtup_expansion", 0) or item.get("builtup_expansion_ha", 0) or 0),
                  }
                  yearly_records.append(record)
 
@@ -5133,6 +5335,20 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                      history_id
                  )
                  print(f"🔄 Scheduled temporal status calculation for history {history_id[:8]}")
+
+             # === PIPELINE: DOWNLOAD TILES TO LOCAL STORAGE IN BACKGROUND ===
+             # Use asyncio.create_task (NOT background_tasks) so download survives
+             # browser refresh / client disconnect. Truly fire-and-forget.
+             if pipeline_manager and history_id and request.geo_data:
+                 asyncio.create_task(
+                     pipeline_manager.run_pipeline(
+                         history_id,
+                         updated_analysis_results,
+                         request.geo_data,
+                         bool(request.geo_data),  # has_slope
+                     )
+                 )
+                 print(f"🗺️ Launched tile download pipeline for history {history_id[:8]}")
 
              return {"status": "success", "data": saved_history}
         else:
@@ -5274,11 +5490,11 @@ async def get_history():
     print(f"🔄 Cache MISS for {CACHE_KEY} - fetching from database...")
         
     try:
-        # Optimasi: Ambil data esensial saja. Hilangkan geom_geojson.
+        # Optimasi: Ambil data esensial. Include master_lahan props untuk fallback lokasi.
         # Include kps_id untuk ambil nama KPS dari master_kps
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("id, filename, file_size, created_at, metadata, analysis_results, kps_id")
+            .select("id, filename, file_size, created_at, metadata, analysis_results, kps_id, center_lat, center_lng, master_lahan(geom_geojson, centroid_lat, centroid_lng)")
             .order("created_at", desc=True)
             .limit(50)
             .execute()
@@ -5287,8 +5503,39 @@ async def get_history():
         # Pruning Agresif untuk List View (Prevent 524 Timeout)
         data = []
         for item in res.data:
-            # 1. Hilangkan GeoJSON Geometri (Terlalu berat untuk list)
-            item['geo_data'] = None
+            # 1. Fallback Location Strategy
+            # Jika center_lat/lng kosong, ambil dari master_lahan
+            ml = item.get('master_lahan')
+            if ml:
+                if item.get('center_lat') is None:
+                    item['center_lat'] = ml.get('centroid_lat')
+                    item['center_lng'] = ml.get('centroid_lng')
+                
+                # Jika masih kosong, hitung centroid dari geom_geojson server-side
+                if item.get('center_lat') is None and ml.get('geom_geojson'):
+                    try:
+                        from shapely.geometry import shape as shp_shape
+                        geo = ml['geom_geojson']
+                        if geo.get("type") == "FeatureCollection":
+                            feats = geo.get("features", [])
+                            if feats:
+                                geo = feats[0].get("geometry", geo)
+                        elif geo.get("type") == "Feature":
+                            geo = geo.get("geometry", geo)
+                        centroid = shp_shape(geo).centroid
+                        item['center_lat'] = centroid.y
+                        item['center_lng'] = centroid.x
+                        item['geo_data'] = None  # No need to send full geometry
+                    except Exception:
+                        item['geo_data'] = ml.get('geom_geojson')  # fallback to frontend parsing
+                else:
+                    item['geo_data'] = None  # Optimize: Hapus geometry jika center sudah ada
+                
+                # Cleanup nested object to keep response flat/clean
+                del item['master_lahan']
+            else:
+                # Tidak ada master_lahan (seharusnya tidak terjadi), set none
+                item['geo_data'] = None
 
             # 2. Normalisasi Analysis Results ke 6 kelas IPSDH final
             if 'analysis_results' in item:
@@ -5342,6 +5589,974 @@ async def get_history():
         print(f"❌ Error fetching history: {e}")
         return []
 
+# ==============================================================================
+# NEW ENDPOINTS FOR DASHBOARD & KPS HISTORY
+# ==============================================================================
+
+@app.get("/api/analysis/history/kps")
+async def get_history_kps(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    search: Optional[str] = None
+):
+    """
+    Get paginated history for KPS analysis.
+    Supports search by name, SK number, or location.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not configured")
+
+    try:
+        # Build query
+        query = supabase.table("analysis_history") \
+            .select("*, master_kps!left(nama_kps, no_sk, provinsi, kab_kota, kps_type), master_lahan!left(geom_geojson, centroid_lat, centroid_lng)", count="exact") \
+            .eq("analysis_scope", "KPS") \
+            .order("created_at", desc=True)
+
+        if search:
+            # Complex search on joined tables via Supabase filtering
+            # Using 'or' with ILIKE.
+            search_filter = f"filename.ilike.%{search}%,master_kps.nama_kps.ilike.%{search}%,master_kps.no_sk.ilike.%{search}%,master_kps.provinsi.ilike.%{search}%"
+            query = query.or_(search_filter)
+
+        # Pagination
+        start = (page - 1) * per_page
+        end = start + per_page - 1
+        query = query.range(start, end)
+
+        res = await supabase_query(lambda: query.execute())
+
+        data = []
+        for item in res.data:
+            # Flatten KPS data
+            kps = item.get('master_kps') or {}
+            item['nama_kps'] = kps.get('nama_kps')
+            item['no_sk'] = kps.get('no_sk')
+            item['provinsi'] = kps.get('provinsi')
+            item['kab_kota'] = kps.get('kab_kota')
+            item['kps_type'] = kps.get('kps_type')
+            
+            # Map center info
+            if item.get('center_lat') is None and item.get('master_lahan'):
+                 ml = item['master_lahan']
+                 item['center_lat'] = ml.get('centroid_lat')
+                 item['center_lng'] = ml.get('centroid_lng')
+            
+            # Simplify Analysis Results
+            if 'analysis_results' in item:
+                results = normalize_analysis_results(item['analysis_results'])
+                # Sort descending by year
+                results.sort(key=lambda x: int(x.get('year', 0)), reverse=True)
+                
+                # Calculate summary fields for table
+                if results:
+                    latest = results[0]
+                    earliest = results[-1]
+                    item['year_series'] = f"{earliest.get('year')}-{latest.get('year')}"
+                    item['area_ha'] = latest.get('total_area', 0)
+                    item['dominant_class'] = latest.get('dominant_class')
+                    item['temporal_status'] = latest.get('temporal_status')
+                    
+                    # Deforestation/Reforestation Logic (Net change)
+                    item['deforestation_ha'] = item.get('deforestation_ha') or sum(float(r.get('deforestation_ha', 0) or 0) for r in results)
+                    item['reforestation_ha'] = item.get('reforestation_ha') or sum(float(r.get('reforestation_ha', 0) or 0) for r in results)
+                
+                # Cleanup heavy fields
+                item['analysis_results'] = None 
+            
+            # Remove heavy geometry
+            item['master_lahan'] = None
+            item['geo_data'] = None 
+            
+            data.append(item)
+
+        return {
+            "data": data,
+            "total": res.count or 0,
+            "page": page,
+            "per_page": per_page
+        }
+
+    except Exception as e:
+        print(f"❌ Error fetching KPS history: {e}")
+        # traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/dashboard/global-stats")
+async def get_global_stats():
+    """Get aggregated stats for dashboard from all analysis_history."""
+    if not supabase:
+        return {}
+
+    try:
+        # Fetch analysis history
+        res = await supabase_query(
+            lambda: supabase.table("analysis_history")
+            .select("id, analysis_results, hotspot_count")
+            .execute()
+        )
+        data = res.data or []
+
+        total_area = 0.0
+        total_forest = 0.0
+        total_hotspots = 0
+        history_ids = []
+
+        for item in data:
+            total_hotspots += int(item.get('hotspot_count') or 0)
+            history_ids.append(item.get('id'))
+
+            # Get latest year from analysis_results
+            results = item.get('analysis_results') or []
+            if results:
+                results = normalize_analysis_results(results)
+                results.sort(key=lambda x: int(x.get('year', 0)), reverse=True)
+                latest = results[0]
+                total_area += float(latest.get('total_area') or 0)
+                total_forest += float(latest.get('hutan_primer') or 0) + float(latest.get('hutan_sekunder') or 0)
+
+        # Fetch slope critical area from analysis_slope_summary table
+        total_slope_critical = 0.0
+        try:
+            slope_res = await supabase_query(
+                lambda: supabase.table("analysis_slope_summary")
+                .select("slope_above_40")
+                .eq("scope", "INSIDE")
+                .execute()
+            )
+            for row in (slope_res.data or []):
+                total_slope_critical += float(row.get('slope_above_40') or 0)
+        except Exception as slope_err:
+            print(f"⚠️ Slope query error (non-fatal): {slope_err}")
+
+        return {
+            "total_kps": len(data),
+            "total_area_ha": round(total_area, 2),
+            "current_forest_ha": round(total_forest, 2),
+            "total_hotspots_all_time": total_hotspots,
+            "total_slope_critical_ha": round(total_slope_critical, 2)
+        }
+    except Exception as e:
+        print(f"Error global stats: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+# ─── Monitoring Terkini (NDVI Delta Early Warning) ──────────────────────────
+
+@app.get("/api/dashboard/monitoring-terkini")
+async def get_monitoring_terkini(id_kps: str = Query(..., description="ID KPS untuk lookup cache")):
+    """Fetch cached monitoring terkini result from Supabase."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    try:
+        res = await supabase_query(
+            lambda: supabase.table("monitoring_terkini")
+            .select("*")
+            .eq("id_kps", id_kps)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Belum ada data monitoring untuk KPS ini. Gunakan tombol Refresh untuk menjalankan analisis.")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error get monitoring_terkini: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/dashboard/monitoring-terkini")
+async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
+    """Run real-time GEE NDVI delta analysis for monitoring terkini."""
+    try:
+        def _gee_analysis():
+            from datetime import datetime, timedelta
+
+            # 1. Parse geometry
+            geometry = geojson_to_ee_geometry(request.geo_data)
+
+            # 2. Total area (hectares)
+            area_img = ee.Image.pixelArea()
+            total_area_m2 = area_img.reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geometry,
+                scale=10,
+                maxPixels=1e9
+            ).get('area')
+            total_area_ha = ee.Number(total_area_m2).divide(10000)
+
+            # Helper: build Sentinel-2 collection with cloud masking
+            def _build_s2_collection(start_date, end_date, cloud_pct=50):
+                return (ee.ImageCollection(SENTINEL2_COLLECTION)
+                    .filterBounds(geometry)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud_pct))
+                    .map(mask_clouds_sentinel2))
+
+            # 3. Baseline composite: Q4 2025 with progressive fallback
+            baseline_windows = [
+                ('2025-10-01', '2025-12-31', 'Q4 2025'),
+                ('2025-07-01', '2025-12-31', 'H2 2025'),
+                ('2025-01-01', '2025-12-31', 'Full 2025'),
+            ]
+
+            baseline_col = None
+            baseline_start = None
+            baseline_end = None
+            baseline_label = None
+            baseline_scene_count = 0
+
+            for b_start, b_end, b_label in baseline_windows:
+                col = _build_s2_collection(b_start, b_end)
+                count = col.size().getInfo()
+                print(f"   Baseline {b_label}: {count} scenes")
+                if count >= 1:
+                    baseline_col = col
+                    baseline_start = b_start
+                    baseline_end = b_end
+                    baseline_label = b_label
+                    baseline_scene_count = count
+                    break
+
+            if baseline_col is None or baseline_scene_count == 0:
+                # Last resort: relax cloud filter to 80%
+                col = _build_s2_collection('2025-01-01', '2025-12-31', cloud_pct=80)
+                count = col.size().getInfo()
+                print(f"   Baseline Full 2025 (relaxed cloud): {count} scenes")
+                if count >= 1:
+                    baseline_col = col
+                    baseline_start = '2025-01-01'
+                    baseline_end = '2025-12-31'
+                    baseline_label = 'Full 2025 (relaxed)'
+                    baseline_scene_count = count
+                else:
+                    raise ValueError(
+                        f"Tidak ada citra Sentinel-2 yang tersedia untuk baseline 2025 di area ini. "
+                        f"Kemungkinan area terlalu berawan atau di luar jangkauan Sentinel-2."
+                    )
+
+            baseline_composite = baseline_col.median().clip(geometry)
+
+            # 4. Recent composite: progressive fallback 30 → 60 → 90 days
+            today = datetime.now()
+            recent_end = today.strftime('%Y-%m-%d')
+
+            recent_windows = [
+                (30, (today - timedelta(days=30)).strftime('%Y-%m-%d')),
+                (60, (today - timedelta(days=60)).strftime('%Y-%m-%d')),
+                (90, (today - timedelta(days=90)).strftime('%Y-%m-%d')),
+            ]
+
+            recent_col = None
+            recent_start = None
+            recent_window_used = 0
+            scene_count_recent = 0
+
+            for window_days, r_start in recent_windows:
+                col = _build_s2_collection(r_start, recent_end)
+                count = col.size().getInfo()
+                print(f"   Recent {window_days}d: {count} scenes")
+                if count >= 1:
+                    recent_col = col
+                    recent_start = r_start
+                    recent_window_used = window_days
+                    scene_count_recent = count
+                    if count >= 2:
+                        break  # Good enough, stop expanding
+
+            if recent_col is None or scene_count_recent == 0:
+                # Last resort: relax cloud filter
+                r_start_90 = (today - timedelta(days=90)).strftime('%Y-%m-%d')
+                col = _build_s2_collection(r_start_90, recent_end, cloud_pct=80)
+                count = col.size().getInfo()
+                print(f"   Recent 90d (relaxed cloud): {count} scenes")
+                if count >= 1:
+                    recent_col = col
+                    recent_start = r_start_90
+                    recent_window_used = 90
+                    scene_count_recent = count
+                else:
+                    raise ValueError(
+                        f"Tidak ada citra Sentinel-2 terbaru (90 hari terakhir) di area ini. "
+                        f"Kemungkinan area terlalu berawan."
+                    )
+
+            recent_composite = recent_col.median().clip(geometry)
+
+            print(f"   Using baseline: {baseline_label} ({baseline_scene_count} scenes)")
+            print(f"   Using recent: {recent_window_used}d window ({scene_count_recent} scenes)")
+
+            # 5. Compute NDVI
+            ndvi_baseline = baseline_composite.normalizedDifference(['B8', 'B4']).rename('ndvi_baseline')
+            ndvi_recent = recent_composite.normalizedDifference(['B8', 'B4']).rename('ndvi_recent')
+
+            # 6. Delta NDVI
+            delta_ndvi = ndvi_recent.subtract(ndvi_baseline).rename('delta_ndvi')
+
+            # 7. Change mask: significant decrease (delta < -0.2)
+            change_mask = delta_ndvi.lt(-0.2)
+
+            # 8. Calculate luas_terindikasi_ha
+            change_area_img = area_img.updateMask(change_mask)
+            change_area_m2 = change_area_img.reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geometry,
+                scale=10,
+                maxPixels=1e9
+            ).get('area')
+            luas_terindikasi_ha = ee.Number(change_area_m2).divide(10000)
+
+            # 9-10. Compute stats on server side then getInfo
+            stats = ee.Dictionary({
+                'total_area_ha': total_area_ha,
+                'luas_terindikasi_ha': luas_terindikasi_ha,
+            }).getInfo()
+
+            total_ha = float(stats.get('total_area_ha') or 0)
+            luas_ha = float(stats.get('luas_terindikasi_ha') or 0)
+            persentase = (luas_ha / total_ha * 100) if total_ha > 0 else 0
+
+            # Determine status
+            if persentase < 5:
+                status = 'HIJAU'
+            elif persentase <= 15:
+                status = 'KUNING'
+            else:
+                status = 'MERAH'
+
+            # 12. Mean NDVI stats
+            ndvi_stats = ndvi_baseline.addBands(ndvi_recent).addBands(delta_ndvi).reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry,
+                scale=10,
+                maxPixels=1e9
+            ).getInfo()
+
+            baseline_ndvi_mean = ndvi_stats.get('ndvi_baseline')
+            recent_ndvi_mean = ndvi_stats.get('ndvi_recent')
+            delta_ndvi_mean = ndvi_stats.get('delta_ndvi')
+
+            # 13. Valid pixel ratio for data quality
+            total_pixels = ndvi_recent.unmask(0).multiply(0).add(1).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geometry,
+                scale=10,
+                maxPixels=1e9
+            ).getInfo()
+            valid_pixels = ndvi_recent.reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=geometry,
+                scale=10,
+                maxPixels=1e9
+            ).getInfo()
+
+            total_px = float(total_pixels.get('ndvi_recent') or 1)
+            valid_px = float(valid_pixels.get('ndvi_recent') or 0)
+            valid_pixel_ratio = valid_px / total_px if total_px > 0 else 0
+
+            data_availability = 'OK' if (valid_pixel_ratio > 0.5 and scene_count_recent >= 2) else 'LOW'
+
+            # Cloud coverage estimate
+            cloud_coverage_pct = round((1 - valid_pixel_ratio) * 100, 1)
+
+            # 11. Extract top 5 patch centroids via reduceToVectors
+            centroid_points = []
+            if luas_ha > 0:
+                try:
+                    vectors = change_mask.selfMask().reduceToVectors(
+                        geometry=geometry,
+                        scale=10,
+                        maxPixels=1e9,
+                        geometryType='polygon',
+                        eightConnected=True,
+                        reducer=ee.Reducer.countEvery(),
+                        labelProperty='patch'
+                    )
+
+                    # Calculate area and sort by largest
+                    def add_area(feat):
+                        a = feat.geometry().area()
+                        return feat.set('area_m2', a)
+
+                    vectors_with_area = vectors.map(add_area)
+                    sorted_vectors = vectors_with_area.sort('area_m2', False)
+                    top5 = sorted_vectors.limit(5)
+                    top5_list = top5.getInfo()
+
+                    for idx, feat in enumerate(top5_list.get('features', [])):
+                        geom = feat.get('geometry', {})
+                        props = feat.get('properties', {})
+                        area_m2 = float(props.get('area_m2', 0))
+
+                        # Skip tiny patches (< 0.25 ha = 2500 m2)
+                        if area_m2 < 2500:
+                            continue
+
+                        # Compute centroid
+                        try:
+                            from shapely.geometry import shape as shapely_shape
+                            shp = shapely_shape(geom)
+                            centroid = shp.centroid
+                            centroid_points.append({
+                                'rank': idx + 1,
+                                'lat': round(centroid.y, 6),
+                                'lng': round(centroid.x, 6),
+                                'area_ha': round(area_m2 / 10000, 3)
+                            })
+                        except Exception as ce:
+                            print(f"   Centroid error for patch {idx}: {ce}")
+                            continue
+                except Exception as vec_err:
+                    print(f"   reduceToVectors failed (non-fatal): {vec_err}")
+
+            # Re-rank centroids after filtering
+            for i, pt in enumerate(centroid_points):
+                pt['rank'] = i + 1
+
+            return {
+                'status': status,
+                'persentase_perubahan': round(persentase, 2),
+                'luas_terindikasi_ha': round(luas_ha, 2),
+                'total_area_kps_ha': round(total_ha, 2),
+                'centroid_points': centroid_points,
+                'baseline_period': f"{baseline_start}_to_{baseline_end}",
+                'recent_period': f"{recent_start}_to_{recent_end}",
+                'baseline_ndvi_mean': round(float(baseline_ndvi_mean or 0), 4),
+                'recent_ndvi_mean': round(float(recent_ndvi_mean or 0), 4),
+                'delta_ndvi_mean': round(float(delta_ndvi_mean or 0), 4),
+                'scene_count_recent': scene_count_recent,
+                'cloud_coverage_pct': cloud_coverage_pct,
+                'data_availability': data_availability,
+                'valid_pixel_ratio': round(valid_pixel_ratio, 3),
+                'recent_window_used': recent_window_used,
+            }
+
+        result = await asyncio.to_thread(_gee_analysis)
+        return result
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"❌ Error monitoring terkini: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Gagal menjalankan analisis: {str(e)}")
+
+
+@app.get("/api/chart/yearly-aggregate", response_model=ChartYearlyAggregateResponse)
+async def get_chart_yearly_aggregate():
+    """
+    Get pre-aggregated yearly statistics from database view.
+    This replaces frontend-side aggregation for better performance.
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not configured")
+
+    try:
+        # Fetch data from the view
+        res = await asyncio.to_thread(
+            lambda: supabase.table("vw_chart_yearly_aggregate")
+            .select("*")
+            .order("year", desc=False)
+            .execute()
+        )
+        
+        data = res.data or []
+        
+        # Calculate totals for metadata
+        total_kps = 0
+        if data:
+            # kps_count in view is already per year, but since it's deduplicated 
+            # across all years, the max kps_count across years represents 
+            # the total unique KPS analyzed (roughly)
+            total_kps = max((item.get('kps_count', 0) for item in data), default=0)
+
+        return ChartYearlyAggregateResponse(
+            status="success",
+            data=data,
+            total_years=len(data),
+            total_kps=total_kps,
+            metadata={
+                "generated_at": datetime.utcnow().isoformat(),
+                "data_source": "vw_chart_yearly_aggregate"
+            }
+        )
+    except Exception as e:
+        print(f"⚠️ Chart Aggregation Error: {e}")
+        # Return empty data instead of failing completely to prevent UI crash
+        return ChartYearlyAggregateResponse(
+            status="error",
+            data=[],
+            total_years=0,
+            metadata={"error": str(e)}
+        )
+
+@app.get("/api/dashboard/global-yearly")
+async def get_global_yearly():
+    """Get aggregated yearly land cover + deforestation/reforestation across all analyses.
+
+    Deforestation/reforestation are transition metrics between year t-1 and year t,
+    already stored per-year in each analysis_results entry (forest_loss / deforestation_ha).
+    """
+    if not supabase:
+        return []
+
+    try:
+        res = await supabase_query(
+            lambda: supabase.table("analysis_history")
+            .select("analysis_results")
+            .execute()
+        )
+        data = res.data or []
+
+        # Aggregate per year across all SHP
+        yearly_agg = {}  # year -> {hutan_primer, hutan_sekunder, ...}
+
+        for item in data:
+            results = item.get('analysis_results')
+            if not results or not isinstance(results, list):
+                continue
+            try:
+                results = normalize_analysis_results(results)
+            except Exception:
+                continue
+
+            # Sort by year to compute transitions if needed
+            results_sorted = sorted(results, key=lambda x: x.get('year', 0) if isinstance(x, dict) else 0)
+
+            for idx, yr_data in enumerate(results_sorted):
+                if not isinstance(yr_data, dict):
+                    continue
+                year = str(yr_data.get('year', 'unknown'))
+                if year == 'unknown':
+                    continue
+
+                if year not in yearly_agg:
+                    yearly_agg[year] = {
+                        "year": year,
+                        "hutan_primer": 0.0,
+                        "hutan_sekunder": 0.0,
+                        "tanah_kering": 0.0,
+                        "tanah_kosong": 0.0,
+                        "lahan_terbangun": 0.0,
+                        "air": 0.0,
+                        "total_area": 0.0,
+                        "deforestation_ha": 0.0,
+                        "reforestation_ha": 0.0,
+                    }
+
+                agg = yearly_agg[year]
+                hp = float(yr_data.get('hutan_primer') or 0)
+                hs = float(yr_data.get('hutan_sekunder') or 0)
+                agg["hutan_primer"] += hp
+                agg["hutan_sekunder"] += hs
+                agg["tanah_kering"] += float(yr_data.get('tanah_kering') or 0)
+                agg["tanah_kosong"] += float(yr_data.get('tanah_kosong') or 0)
+                agg["lahan_terbangun"] += float(yr_data.get('lahan_terbangun') or 0)
+                agg["air"] += float(yr_data.get('air') or 0)
+                agg["total_area"] += float(yr_data.get('total_area') or 0)
+
+                # Defor/refor: try explicit fields first
+                defor = float(yr_data.get('deforestation_ha') or yr_data.get('forest_loss') or 0)
+                refor = float(yr_data.get('reforestation_ha') or yr_data.get('forest_gain') or 0)
+
+                # Fallback: compute from forest cover diff with previous year in same analysis
+                if defor == 0 and refor == 0 and idx > 0:
+                    prev = results_sorted[idx - 1]
+                    if isinstance(prev, dict):
+                        prev_forest = float(prev.get('hutan_primer') or 0) + float(prev.get('hutan_sekunder') or 0)
+                        curr_forest = hp + hs
+                        diff = prev_forest - curr_forest
+                        if diff > 0:
+                            defor = diff
+                        elif diff < 0:
+                            refor = abs(diff)
+
+                agg["deforestation_ha"] += defor
+                agg["reforestation_ha"] += refor
+
+        # Sort by year and round values
+        sorted_years = sorted(yearly_agg.values(), key=lambda x: x["year"])
+
+        # Fallback: If deforestation_ha is all zero but forest data exists,
+        # compute from year-over-year forest cover changes
+        all_defor_zero = all(e.get("deforestation_ha", 0) == 0 for e in sorted_years)
+        has_forest_data = any((e.get("hutan_primer", 0) + e.get("hutan_sekunder", 0)) > 0 for e in sorted_years)
+        if all_defor_zero and has_forest_data and len(sorted_years) > 1:
+            print("⚠️ global-yearly: deforestation_ha all zero, computing from forest cover diff")
+            for i in range(1, len(sorted_years)):
+                prev_forest = sorted_years[i-1].get("hutan_primer", 0) + sorted_years[i-1].get("hutan_sekunder", 0)
+                curr_forest = sorted_years[i].get("hutan_primer", 0) + sorted_years[i].get("hutan_sekunder", 0)
+                diff = prev_forest - curr_forest
+                if diff > 0:
+                    sorted_years[i]["deforestation_ha"] = diff
+                elif diff < 0:
+                    sorted_years[i]["reforestation_ha"] = abs(diff)
+
+        for entry in sorted_years:
+            for key in entry:
+                if key != "year" and isinstance(entry[key], float):
+                    entry[key] = round(entry[key], 2)
+
+        return sorted_years
+    except Exception as e:
+        print(f"Error global yearly: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+async def _build_analysis_export_data() -> dict:
+    """Shared helper: fetch + process analysis data for both Excel and JSON export."""
+    res = await asyncio.to_thread(
+        lambda: supabase.table("analysis_history")
+        .select("*, master_kps(nama_kps, no_sk, provinsi, kab_kota, kps_type)")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    data = res.data
+
+    def safe_float(value):
+        try:
+            return float(value or 0)
+        except Exception:
+            return 0.0
+
+    def safe_int(value):
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    detail_rows = []
+    province_rows = {}  # provinsi -> list of detail rows
+    national_agg = {
+        "shp_count": 0,
+        "total_area": 0.0,
+        "hutan_primer": 0.0,
+        "hutan_sekunder": 0.0,
+        "tanah_kering": 0.0,
+        "tanah_kosong": 0.0,
+        "lahan_terbangun": 0.0,
+        "air": 0.0,
+        "deforestation_ha": 0.0,
+        "reforestation_ha": 0.0,
+        "hotspot_count": 0
+    }
+    province_agg = {}
+
+    for idx, item in enumerate(data, 1):
+        kps = item.get('master_kps') or {}
+        results = item.get('analysis_results') or []
+        if results:
+            results = normalize_analysis_results(results)
+            results.sort(key=lambda x: int(x.get('year', 0)), reverse=True)
+            latest = results[0]
+        else:
+            latest = {}
+
+        provinsi = kps.get('provinsi') or item.get('provinsi') or 'Tidak diketahui'
+        scope = item.get('analysis_scope', 'NON_KPS')
+
+        total_area = safe_float(latest.get('total_area'))
+        hutan_primer = safe_float(latest.get('hutan_primer'))
+        hutan_sekunder = safe_float(latest.get('hutan_sekunder'))
+        tanah_kering = safe_float(latest.get('tanah_kering'))
+        tanah_kosong = safe_float(latest.get('tanah_kosong'))
+        lahan_terbangun = safe_float(latest.get('lahan_terbangun'))
+        air = safe_float(latest.get('air'))
+        deforestation_ha = safe_float(item.get('deforestation_ha'))
+        reforestation_ha = safe_float(item.get('reforestation_ha'))
+
+        # Fallback: jika deforestation_ha == 0 dari DB, hitung dari analysis_results
+        if deforestation_ha == 0 and reforestation_ha == 0 and len(results) > 1:
+            sorted_results = sorted(results, key=lambda x: int(x.get('year', 0)))
+            # Prioritas 1: sum per-year deforestation_ha / forest_loss dari results
+            sum_defor = sum(safe_float(r.get('deforestation_ha', 0)) or safe_float(r.get('forest_loss', 0)) for r in sorted_results)
+            sum_refor = sum(safe_float(r.get('reforestation_ha', 0)) or safe_float(r.get('forest_gain', 0)) for r in sorted_results)
+            if sum_defor > 0 or sum_refor > 0:
+                deforestation_ha = sum_defor
+                reforestation_ha = sum_refor
+            else:
+                # Prioritas 2: hitung dari perubahan tutupan hutan antara tahun pertama dan terakhir
+                earliest = sorted_results[0]
+                latest_r = sorted_results[-1]
+                early_forest = safe_float(earliest.get('hutan_primer', 0)) + safe_float(earliest.get('hutan_sekunder', 0))
+                late_forest = safe_float(latest_r.get('hutan_primer', 0)) + safe_float(latest_r.get('hutan_sekunder', 0))
+                if early_forest > 0 or late_forest > 0:
+                    diff = early_forest - late_forest
+                    if diff > 0:
+                        deforestation_ha = diff
+                    elif diff < 0:
+                        reforestation_ha = abs(diff)
+
+        hotspot_count = safe_int(item.get('hotspot_count'))
+
+        analysis_date = '-'
+        if item.get('created_at'):
+            analysis_date = datetime.fromisoformat(item['created_at'].replace('Z', '+00:00')).strftime('%Y-%m-%d')
+
+        nama = kps.get('nama_kps') or item.get('filename') or '-'
+
+        row_data = {
+            "nama": nama,
+            "no_sk": kps.get('no_sk') or '-',
+            "tipe": kps.get('kps_type') or scope,
+            "provinsi": provinsi,
+            "kab_kota": kps.get('kab_kota') or '-',
+            "total_area": round(total_area, 2),
+            "hutan_primer": round(hutan_primer, 2),
+            "hutan_sekunder": round(hutan_sekunder, 2),
+            "tanah_kering": round(tanah_kering, 2),
+            "tanah_kosong": round(tanah_kosong, 2),
+            "lahan_terbangun": round(lahan_terbangun, 2),
+            "air": round(air, 2),
+            "deforestation_ha": round(deforestation_ha, 2),
+            "reforestation_ha": round(reforestation_ha, 2),
+            "net_change_ha": round(reforestation_ha - deforestation_ha, 2),
+            "hotspot_count": hotspot_count,
+            "status_temporal": item.get('trend_type') or latest.get('temporal_status', '-'),
+            "dominant_class": latest.get('dominant_class') or calculate_dominant_class(latest) or '-',
+            "analysis_date": analysis_date
+        }
+        detail_rows.append(row_data)
+
+        # Group by province
+        if provinsi not in province_rows:
+            province_rows[provinsi] = []
+        province_rows[provinsi].append(row_data)
+
+        # Province aggregation
+        if provinsi not in province_agg:
+            province_agg[provinsi] = {
+                "shp_count": 0, "total_area": 0.0,
+                "hutan_primer": 0.0, "hutan_sekunder": 0.0,
+                "tanah_kering": 0.0, "tanah_kosong": 0.0,
+                "lahan_terbangun": 0.0, "air": 0.0,
+                "deforestation_ha": 0.0, "reforestation_ha": 0.0,
+                "hotspot_count": 0
+            }
+        prov = province_agg[provinsi]
+        prov["shp_count"] += 1
+        prov["total_area"] += total_area
+        prov["hutan_primer"] += hutan_primer
+        prov["hutan_sekunder"] += hutan_sekunder
+        prov["tanah_kering"] += tanah_kering
+        prov["tanah_kosong"] += tanah_kosong
+        prov["lahan_terbangun"] += lahan_terbangun
+        prov["air"] += air
+        prov["deforestation_ha"] += deforestation_ha
+        prov["reforestation_ha"] += reforestation_ha
+        prov["hotspot_count"] += hotspot_count
+
+        # National aggregation
+        national_agg["shp_count"] += 1
+        national_agg["total_area"] += total_area
+        national_agg["hutan_primer"] += hutan_primer
+        national_agg["hutan_sekunder"] += hutan_sekunder
+        national_agg["tanah_kering"] += tanah_kering
+        national_agg["tanah_kosong"] += tanah_kosong
+        national_agg["lahan_terbangun"] += lahan_terbangun
+        national_agg["air"] += air
+        national_agg["deforestation_ha"] += deforestation_ha
+        national_agg["reforestation_ha"] += reforestation_ha
+        national_agg["hotspot_count"] += hotspot_count
+
+    # Round province aggregations
+    for prov_name in province_agg:
+        pa = province_agg[prov_name]
+        for k in pa:
+            if isinstance(pa[k], float):
+                pa[k] = round(pa[k], 2)
+
+    # Round national aggregation
+    for k in national_agg:
+        if isinstance(national_agg[k], float):
+            national_agg[k] = round(national_agg[k], 2)
+
+    return {
+        "generated_at": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "total_records": len(detail_rows),
+        "national_summary": national_agg,
+        "province_summary": province_agg,
+        "records": detail_rows,
+        "_province_rows": province_rows,
+    }
+
+
+@app.get("/api/analysis/history/kps/export/json")
+async def export_history_kps_json():
+    """Export all analysis history as JSON."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not configured")
+
+    try:
+        export_data = await _build_analysis_export_data()
+        return JSONResponse(content=export_data["records"])
+    except Exception as e:
+        print(f"JSON Export Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analysis/history/kps/export/excel")
+async def export_history_kps_excel():
+    """Export all analysis history to Excel with national + per-province sheets."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not configured")
+
+    try:
+        export_data = await _build_analysis_export_data()
+        detail_rows = export_data["records"]
+        national_agg = export_data["national_summary"]
+        province_agg = export_data["province_summary"]
+        province_rows = export_data["_province_rows"]
+
+        # ── Excel Workbook ──
+        wb = openpyxl.Workbook()
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="2F855A", end_color="2F855A", fill_type="solid")
+        summary_font = Font(bold=True)
+        summary_fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
+        number_fmt = '#,##0.00'
+
+        detail_headers = [
+            "No", "Nama SHP / KPS", "No SK", "Tipe", "Provinsi", "Kab/Kota",
+            "Luas (Ha)", "Hutan Primer (Ha)", "Hutan Sekunder (Ha)",
+            "Tanah Kering (Ha)", "Tanah Kosong (Ha)", "Lahan Terbangun (Ha)",
+            "Air (Ha)", "Deforestasi (Ha)", "Reforestasi (Ha)", "Net Perubahan (Ha)",
+            "Jumlah Hotspot", "Status Temporal", "Kelas Dominan", "Tanggal Analisis"
+        ]
+
+        summary_headers = [
+            "Keterangan", "Jumlah SHP", "Total Luas (Ha)",
+            "Hutan Primer (Ha)", "Hutan Sekunder (Ha)",
+            "Tanah Kering (Ha)", "Tanah Kosong (Ha)", "Lahan Terbangun (Ha)",
+            "Air (Ha)", "Deforestasi (Ha)", "Reforestasi (Ha)", "Jumlah Hotspot"
+        ]
+
+        def apply_header_style(ws, headers, row=1):
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+        def write_summary_row(ws, row_num, label, agg):
+            values = [
+                label, agg["shp_count"],
+                round(agg["total_area"], 2), round(agg["hutan_primer"], 2),
+                round(agg["hutan_sekunder"], 2), round(agg["tanah_kering"], 2),
+                round(agg["tanah_kosong"], 2), round(agg["lahan_terbangun"], 2),
+                round(agg["air"], 2), round(agg["deforestation_ha"], 2),
+                round(agg["reforestation_ha"], 2), agg["hotspot_count"]
+            ]
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col, value=val)
+                cell.font = summary_font
+                cell.fill = summary_fill
+                if isinstance(val, float):
+                    cell.number_format = number_fmt
+
+        def write_detail_rows(ws, rows, start_row):
+            for i, rd in enumerate(rows, 1):
+                r = start_row + i - 1
+                ws.cell(row=r, column=1, value=i)
+                ws.cell(row=r, column=2, value=rd["nama"])
+                ws.cell(row=r, column=3, value=rd["no_sk"])
+                ws.cell(row=r, column=4, value=rd["tipe"])
+                ws.cell(row=r, column=5, value=rd["provinsi"])
+                ws.cell(row=r, column=6, value=rd["kab_kota"])
+                for col_idx, key in enumerate(["total_area", "hutan_primer", "hutan_sekunder",
+                        "tanah_kering", "tanah_kosong", "lahan_terbangun", "air",
+                        "deforestation_ha", "reforestation_ha", "net_change_ha"], 7):
+                    cell = ws.cell(row=r, column=col_idx, value=rd[key])
+                    cell.number_format = number_fmt
+                ws.cell(row=r, column=17, value=rd["hotspot_count"])
+                ws.cell(row=r, column=18, value=rd["status_temporal"])
+                ws.cell(row=r, column=19, value=rd["dominant_class"])
+                ws.cell(row=r, column=20, value=rd["analysis_date"])
+
+        def auto_width(ws):
+            for column_cells in ws.columns:
+                length = max(len(str(cell.value) or "") for cell in column_cells)
+                ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(length + 2, 50)
+
+        # ── Sheet 1: Perhitungan Nasional ──
+        ws_nat = wb.active
+        ws_nat.title = "Perhitungan Nasional"
+
+        # Title
+        ws_nat.cell(row=1, column=1, value="REKAP PERHITUNGAN NASIONAL - SEMUA ANALISIS SHP").font = Font(bold=True, size=14)
+        ws_nat.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+
+        # Summary section
+        apply_header_style(ws_nat, summary_headers, row=3)
+        write_summary_row(ws_nat, 4, "Total Nasional", national_agg)
+
+        # Per-province summary rows
+        for prov_name in sorted(province_agg.keys()):
+            row_num = ws_nat.max_row + 1
+            write_summary_row(ws_nat, row_num, prov_name, province_agg[prov_name])
+
+        # Spacer + detail table
+        detail_start = ws_nat.max_row + 3
+        ws_nat.cell(row=detail_start - 1, column=1,
+                     value="DAFTAR SELURUH SHP YANG TELAH DIANALISIS").font = Font(bold=True, size=12)
+        ws_nat.merge_cells(start_row=detail_start - 1, start_column=1,
+                           end_row=detail_start - 1, end_column=10)
+
+        apply_header_style(ws_nat, detail_headers, row=detail_start)
+        write_detail_rows(ws_nat, detail_rows, detail_start + 1)
+        auto_width(ws_nat)
+
+        # ── Sheet per Provinsi ──
+        for prov_name in sorted(province_rows.keys()):
+            # Sanitize sheet name (max 31 chars, no special chars)
+            safe_name = prov_name[:31].replace('/', '-').replace('\\', '-').replace('*', '').replace('?', '').replace('[', '').replace(']', '').replace(':', '-')
+            if not safe_name.strip():
+                safe_name = "Tidak Diketahui"
+            ws_prov = wb.create_sheet(title=safe_name)
+
+            # Title
+            ws_prov.cell(row=1, column=1, value=f"REKAP ANALISIS - {prov_name.upper()}").font = Font(bold=True, size=14)
+            ws_prov.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+
+            # Province summary
+            apply_header_style(ws_prov, summary_headers, row=3)
+            write_summary_row(ws_prov, 4, prov_name, province_agg[prov_name])
+
+            # Detail table
+            detail_start_prov = 7
+            ws_prov.cell(row=6, column=1,
+                         value=f"DAFTAR SHP - {prov_name.upper()}").font = Font(bold=True, size=12)
+            ws_prov.merge_cells(start_row=6, start_column=1, end_row=6, end_column=10)
+
+            apply_header_style(ws_prov, detail_headers, row=detail_start_prov)
+            write_detail_rows(ws_prov, province_rows[prov_name], detail_start_prov + 1)
+            auto_width(ws_prov)
+
+        # Save to buffer
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        timestamp = datetime.now().strftime('%Y%m%d')
+        filename = f"Laporan_Semua_Analisis_{timestamp}.xlsx"
+
+        headers = {
+            'Content-Disposition': f'attachment; filename="{filename}"'
+        }
+        return Response(buffer.getvalue(), headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    except Exception as e:
+        print(f"❌ Excel Export Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/history/{history_id}")
 async def get_history_detail(history_id: str):
     """
@@ -5364,23 +6579,27 @@ async def get_history_detail(history_id: str):
     try:
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("*, master_lahan(geom_geojson)")
+            .select("*, master_lahan(geom_geojson), master_kps(nama_kps, no_sk, provinsi, kab_kota, kps_type, kecamatan, desa, tgl_sk, luas_sk_ha)")
             .eq("id", history_id)
             .single()
             .execute()
         )
-        
+
         if not res.data:
             raise HTTPException(status_code=404, detail="Riwayat tidak ditemukan")
-            
+
         item = res.data
         master_lahan = item.get('master_lahan')
         geo_data = None
         if master_lahan and isinstance(master_lahan, dict):
             geo_data = master_lahan.get('geom_geojson')
-            
+
         if 'master_lahan' in item:
             del item['master_lahan']
+
+        # Flatten master_kps into item for easy access
+        kps_info = item.pop('master_kps', None) or {}
+        item['kps_info'] = kps_info
 
         item['geo_data'] = geo_data
 
@@ -6577,6 +7796,71 @@ async def export_bundle(report_request: PDFReportRequest, request: Request):
 
 
 
+# ==============================================================================
+# PIPELINE ENDPOINTS: Tile Serving, Status, Recovery
+# ==============================================================================
+
+@app.get("/tiles/{history_id}/{asset_type}/{year}/{z}/{x}/{y}.png")
+async def serve_local_tile(history_id: str, asset_type: str, year: str, z: int, x: int, y: int):
+    """
+    Serve locally cached tiles. Falls back to 404 if tile not found
+    (frontend will fallback to GEE URL).
+    asset_type: 'classified' or 'rgb'
+    """
+    history_id_short = history_id[:8]
+    subdir = year if asset_type == "classified" else f"{year}_rgb"
+    tile_path = os.path.join(TILES_DIR, history_id_short, subdir, str(z), str(x), f"{y}.png")
+
+    if os.path.isfile(tile_path):
+        return FileResponse(
+            tile_path,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "X-Tile-Source": "local",
+            }
+        )
+    raise HTTPException(status_code=404, detail="Tile not found")
+
+
+@app.get("/history/{history_id}/pipeline-status")
+async def get_pipeline_status(history_id: str):
+    """Get pipeline state, manifest, and progress for a history item."""
+    if not pipeline_manager:
+        raise HTTPException(status_code=503, detail="Pipeline manager not available")
+    result = await pipeline_manager.get_pipeline_status(history_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.post("/history/{history_id}/recover")
+async def recover_assets(history_id: str, background_tasks: BackgroundTasks):
+    """
+    Trigger asset recovery for a history item with missing tiles.
+    Scans manifest, downloads only what's missing.
+    """
+    if not pipeline_manager:
+        raise HTTPException(status_code=503, detail="Pipeline manager not available")
+
+    # Quick check: does the history exist?
+    history = await pipeline_manager._get_history(history_id)
+    if not history:
+        raise HTTPException(status_code=404, detail="History not found")
+
+    current_state = history.get("pipeline_state", "LEGACY")
+    if current_state in ("SAVING_ASSETS", "RECOVERING"):
+        return {"status": "already_running", "pipeline_state": current_state}
+
+    # Run recovery in background
+    background_tasks.add_task(pipeline_manager.recover_assets, history_id)
+    return {
+        "status": "recovery_started",
+        "history_id": history_id,
+        "previous_state": current_state,
+    }
+
+
 @app.post("/history/{history_id}/regenerate-visuals")
 async def regenerate_visuals(history_id: str):
     """
@@ -6741,7 +8025,43 @@ async def regenerate_visuals(history_id: str):
             if needs_save:
                 is_modified = True
             updated_results.append(new_item)
-            
+
+        # --- E. Slope Thumbnail (Inside area) ---
+        try:
+            print(f"   🏔️ Regenerating Slope thumbnail...")
+            dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation')
+            slope_deg = ee.Terrain.slope(dem)
+            slope_pct = slope_deg.multiply(math.pi).divide(180).tan().multiply(100).rename('slope_pct')
+            sld_intervals = (
+                '<RasterSymbolizer>'
+                '<ColorMap type="intervals" extended="false">'
+                '<ColorMapEntry color="#31a354" quantity="8" label="0-8% Datar" />'
+                '<ColorMapEntry color="#addd8e" quantity="15" label="8-15% Landai" />'
+                '<ColorMapEntry color="#fee391" quantity="25" label="15-25% Agak Curam" />'
+                '<ColorMapEntry color="#fec44f" quantity="45" label="25-45% Curam" />'
+                '<ColorMapEntry color="#cc4c02" quantity="1000" label=">45% Sangat Curam" />'
+                '</ColorMap>'
+                '</RasterSymbolizer>'
+            )
+            viz_slope = slope_pct.clip(ee_geometry).sldStyle(sld_intervals)
+            slope_thumb = await asyncio.to_thread(lambda: viz_slope.getThumbURL({
+                'region': ee_geometry,
+                'format': 'png',
+                'dimensions': 600
+            }))
+            if slope_thumb:
+                perm_slope = await download_and_save_locally(slope_thumb, f"slope_inside_{history_id[:8]}")
+                if perm_slope:
+                    await asyncio.to_thread(
+                        lambda: supabase.table("analysis_history")
+                            .update({"slope_map_url": perm_slope})
+                            .eq("id", history_id)
+                            .execute()
+                    )
+                    print(f"   ✅ Slope thumbnail persisted: {perm_slope}")
+        except Exception as e:
+            print(f"   ⚠️ Slope thumbnail regeneration failed (non-fatal): {e}")
+
         # 3. Save updates
         if is_modified:
             print("   💾 Saving updated history...")
@@ -6766,7 +8086,16 @@ async def regenerate_visuals(history_id: str):
             # Update cache with fresh complete data
             cache_file(f"history_detail_{history_id}", data)
             invalidate_cache("history_list")  # Refresh list cache too
-            
+
+            # Trigger tile download pipeline after visual regeneration
+            if pipeline_manager and geometry_geojson:
+                asyncio.create_task(
+                    pipeline_manager.run_pipeline(
+                        history_id, updated_results, geometry_geojson
+                    )
+                )
+                print(f"🗺️ Triggered tile download pipeline after regeneration for {history_id[:8]}")
+
             return {"status": "success", "message": "Visuals regenerated and stored permanently", "data": data}
         else:
             print("   ✨ No changes needed.")
@@ -7518,6 +8847,116 @@ async def get_slope_analysis(history_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to fetch slope analysis: {str(e)}")
 
 
+@app.get("/api/slope-image/{history_id}")
+async def get_slope_image(history_id: str):
+    """
+    Return a valid local slope image URL for the given history.
+
+    Logic:
+    1. Check DB for existing slope_map_url
+    2. If URL exists AND physical file exists on disk → return it
+    3. If not → regenerate from GEE DEM, save locally, update DB, return new URL
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+
+    try:
+        # 1. Query DB for existing slope_map_url, geo_data and lahan_id
+        result = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+                .select("id, slope_map_url, geo_data, lahan_id")
+                .eq("id", history_id)
+                .single()
+                .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="History not found")
+
+        history = result.data
+        existing_url = history.get("slope_map_url")
+
+        # 2. Check if file physically exists on disk
+        if existing_url:
+            # existing_url is like /storage/thumbnails/slope_inside_xxx.png
+            relative_path = existing_url.lstrip("/").replace("storage/", "", 1)
+            file_path = os.path.join(STORAGE_ROOT, relative_path)
+            if os.path.isfile(file_path):
+                print(f"✅ Slope image found locally: {existing_url}")
+                return {"url": existing_url, "source": "local"}
+
+        # 3. File not found → regenerate from GEE
+        geo_data = history.get("geo_data")
+
+        # Fallback: if geo_data not in history, try master_lahan
+        if not geo_data and history.get("lahan_id"):
+            try:
+                lahan_result = await asyncio.to_thread(
+                    lambda: supabase.table("master_lahan")
+                        .select("geom_geojson")
+                        .eq("id", history.get("lahan_id"))
+                        .single()
+                        .execute()
+                )
+                if lahan_result.data:
+                    geo_data = lahan_result.data.get("geom_geojson")
+            except Exception as e:
+                print(f"⚠️ Failed to fetch geo_data from master_lahan: {e}")
+
+        if not geo_data:
+            raise HTTPException(status_code=400, detail="No geo_data found in history or master_lahan")
+
+        print(f"🏔️ Slope image not found locally, regenerating from GEE for {history_id[:8]}...")
+
+        ee_geometry = geojson_to_ee_geometry(geo_data)
+
+        dem = ee.Image("NASA/NASADEM_HGT/001").select('elevation')
+        slope_deg = ee.Terrain.slope(dem)
+        slope_pct = slope_deg.multiply(math.pi).divide(180).tan().multiply(100).rename('slope_pct')
+        sld_intervals = (
+            '<RasterSymbolizer>'
+            '<ColorMap type="intervals" extended="false">'
+            '<ColorMapEntry color="#31a354" quantity="8" label="0-8% Datar" />'
+            '<ColorMapEntry color="#addd8e" quantity="15" label="8-15% Landai" />'
+            '<ColorMapEntry color="#fee391" quantity="25" label="15-25% Agak Curam" />'
+            '<ColorMapEntry color="#fec44f" quantity="45" label="25-45% Curam" />'
+            '<ColorMapEntry color="#cc4c02" quantity="1000" label=">45% Sangat Curam" />'
+            '</ColorMap>'
+            '</RasterSymbolizer>'
+        )
+        viz_slope = slope_pct.clip(ee_geometry).sldStyle(sld_intervals)
+        slope_thumb = await asyncio.to_thread(lambda: viz_slope.getThumbURL({
+            'region': ee_geometry,
+            'format': 'png',
+            'dimensions': 600
+        }))
+
+        if not slope_thumb:
+            raise HTTPException(status_code=502, detail="GEE failed to generate slope thumbnail")
+
+        # Download and save locally
+        local_url = await download_and_save_locally(slope_thumb, f"slope_inside_{history_id[:8]}")
+        if not local_url:
+            raise HTTPException(status_code=502, detail="Failed to download and save slope image")
+
+        # Update DB with new local URL
+        await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+                .update({"slope_map_url": local_url})
+                .eq("id", history_id)
+                .execute()
+        )
+
+        print(f"✅ Slope image regenerated and saved: {local_url}")
+        return {"url": local_url, "source": "regenerated"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in slope-image endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get slope image: {str(e)}")
+
+
 @app.post("/history/{history_id}/calculate-temporal-status")
 async def calculate_temporal_status_for_history(history_id: str, background_tasks: BackgroundTasks):
     """
@@ -8212,73 +9651,68 @@ async def admin_regenerate_all(background_tasks: BackgroundTasks):
     return {"status": "started", "message": "Bulk regeneration started in background. Monitor console for progress."}
 
 
-import random
 @app.on_event("startup")
-async def startup_event():
-    """Start background services"""
-    asyncio.create_task(self_healing_daemon())
+async def startup_pipeline_scan():
+    """Startup scan: reset stuck pipelines and recover failed items."""
+    if not supabase or not pipeline_manager:
+        return
 
-async def self_healing_daemon():
-    """
-    Background Task: Continuous Integrity Check.
-    Runs forever as long as server is up.
-    Checks random history items for broken thumbnails and repairs them.
-    """
-    print("🏥 Self-Healing Daemon: INITIALIZED. Waiting 60s before start...")
-    await asyncio.sleep(60) # Wait for server to warm up
-    
-    while True:
+    async def _scan():
+        await asyncio.sleep(30)  # Wait for server warmup
+        print("🔍 Pipeline Startup Scan: Checking for stuck/failed items...")
+
         try:
-            print("🏥 Self-Healing: Starting scan cycle...")
-            if not supabase:
-                print("   ⚠️ No DB connection. Retrying in 5m...")
-                await asyncio.sleep(300)
-                continue
-
-            # Fetch all IDs
+            # Find items stuck in transient states (interrupted by restart)
             res = await asyncio.to_thread(
-                lambda: supabase.table("analysis_history").select("id").execute()
+                lambda: supabase.table("analysis_history")
+                .select("id, pipeline_state")
+                .in_("pipeline_state", ["SAVING_ASSETS", "RECOVERING", "VALIDATING"])
+                .execute()
             )
-            
-            if not res.data:
-                await asyncio.sleep(600)
-                continue
 
-            ids = [item['id'] for item in res.data]
-            random.shuffle(ids) # Randomize to ensure coverage over restarts
-            
-            for idx, history_id in enumerate(ids):
-                # CHECK QUEUE STATUS: Yield to active users
-                while not await analysis_queue.is_idle():
-                    if idx % 10 == 0:
-                        print("🏥 Self-Healing: System BUSY (Analysis in progress). Pausing for 30s...")
-                    await asyncio.sleep(30)
+            stuck_items = res.data if res and res.data else []
+            if stuck_items:
+                print(f"   Found {len(stuck_items)} stuck items, resetting to FAILED...")
+                for item in stuck_items:
+                    await asyncio.to_thread(
+                        lambda hid=item['id']: supabase.table("analysis_history")
+                        .update({"pipeline_state": "FAILED"})
+                        .eq("id", hid)
+                        .execute()
+                    )
+                    print(f"   Reset {item['id'][:8]} ({item['pipeline_state']} -> FAILED)")
 
-                try:
-                    # Reuse the robust regenerate logic
-                    # It internally checks cache/validity and skips if good.
-                    # We just call it blindly.
-                    
-                    # Log less frequently to avoid spam
-                    if idx % 10 == 0: 
-                        print(f"   🏥 Scan progress: {idx}/{total}")
-                        
-                    await regenerate_visuals(history_id)
-                    
-                except Exception as e:
-                    # Ignore errors to keep daemon alive
-                    pass
-                
-                # Slow pace: 1 item every 10 seconds = 8,600 items/day
-                # Low impact on server/GEE
-                await asyncio.sleep(10)
-                
-            print("🏥 Self-Healing: Cycle Complete. Resting 1 hour...")
-            await asyncio.sleep(3600)
-            
+            # Auto-recover FAILED items (with valid GEE URLs)
+            failed_res = await asyncio.to_thread(
+                lambda: supabase.table("analysis_history")
+                .select("id")
+                .eq("pipeline_state", "FAILED")
+                .execute()
+            )
+
+            failed_items = failed_res.data if failed_res and failed_res.data else []
+            if failed_items:
+                print(f"   Found {len(failed_items)} FAILED items, attempting recovery...")
+                for item in failed_items:
+                    try:
+                        if not await analysis_queue.is_idle():
+                            print("   System busy, stopping recovery scan.")
+                            break
+                        await pipeline_manager.recover_assets(item['id'])
+                        await asyncio.sleep(5)
+                    except Exception as e:
+                        print(f"   Recovery failed for {item['id'][:8]}: {e}")
+
+            total = len(stuck_items) + len(failed_items)
+            if total == 0:
+                print("   All pipelines healthy.")
+            else:
+                print(f"🔍 Pipeline Startup Scan complete. Processed {total} items.")
+
         except Exception as e:
-            print(f"❌ Self-Healing Crashed: {e}. Restarting in 1 min...")
-            await asyncio.sleep(60)
+            print(f"❌ Pipeline Startup Scan error: {e}")
+
+    asyncio.create_task(_scan())
 
 @app.post("/map/slope")
 async def get_slope_mapid(request: Request):

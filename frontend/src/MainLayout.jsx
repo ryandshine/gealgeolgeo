@@ -1,22 +1,27 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
-import { Upload, BarChart3, ChevronUp, ChevronDown, ChevronLeft, ArrowLeft, Layers, Activity, AlertCircle, Satellite, Download, RefreshCw, Calendar, Eye, EyeOff, Sliders, MapPin, Grid, ArrowRight, TrendingDown, TrendingUp, CheckCircle2, Info, Sparkles, FileText, Database, Split, Menu, X, ShieldCheck, List, Maximize, Flame, Image as ImageIcon, Clock } from 'lucide-react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, LineChart, Line, AreaChart, Area, ReferenceLine, LabelList } from 'recharts';
-import { MapContainer, TileLayer, GeoJSON, ImageOverlay, Marker, Popup, useMap, useMapEvents, WMSTileLayer, CircleMarker } from 'react-leaflet';
+import { Upload, BarChart3, ChevronUp, ChevronDown, ChevronLeft, ArrowLeft, Layers, Activity, AlertCircle, AlertTriangle, Satellite, Download, RefreshCw, Calendar, Eye, EyeOff, Sliders, MapPin, Grid, ArrowRight, TrendingDown, TrendingUp, CheckCircle2, Info, Sparkles, FileText, Database, Split, Menu, X, ShieldCheck, List, Maximize, Flame, Image as ImageIcon, Clock, Copy, Check, LogOut } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, LineChart, Line, ReferenceLine, LabelList } from 'recharts';
+import { TileLayer, GeoJSON, ImageOverlay, Marker, Popup, useMap, useMapEvents, WMSTileLayer, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import LeafletMapContainer from './components/LeafletMapContainer';
 import {
     calculateTrends,
     generateVerbalNarrative,
     fetchTemporalStatus,
     getOpacityByTemporalStatus,
     getTemporalStatusStyle,
-    createYearOpacityMap
+    createYearOpacityMap,
+    resolveThumbUrl
 } from './utils/analysisUtils';
+import { generateNarrative } from './utils/narrativeEngine';
+import { generateAnalysisReport } from './utils/pdfGenerator';
 import HistoryDashboard from './HistoryDashboard';
 import AttributeTag from './AttributeTag';
 import CalibrationPanel from './CalibrationPanel';
-import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures, CustomPinsManager } from './MapComponents';
+import { DynamicTileLayer, SwipeMapControl, MapRecenter, IdentifySigapFeatures, HistoryPinsLayer } from './MapComponents';
 import { LAND_COVER_CONFIG, MAP_TILES, CALIBRATION_DEFAULTS, SIGAP_CONFIG, NASA_FIRMS_CONFIG, API_URL } from './constants';
+import { supabase } from './lib/supabaseClient';
 
 
 // Helper for Enhanced Floating Badge Icon - Color aware
@@ -38,88 +43,26 @@ const createPinIcon = (label, color = '#10b981') => L.divIcon({
 });
 
 // Helper to resolve thumbnail URL (handle relative paths from VPS storage)
-const resolveThumbUrl = (url) => {
-    if (!url) return null;
-
-    try {
-        if (url.startsWith('/')) {
-            // Remove trailing /api if present in API_URL to get server root
-            const root = API_URL.replace(/\/api\/?$/, '');
-            const fullUrl = `${root}${url}`;
-            console.debug(`[Thumbnail] Resolved local path: ${url} → ${fullUrl.substring(0, 80)}...`);
-            return fullUrl;
-        }
-
-        // Absolute URL (Supabase or external)
-        console.debug(`[Thumbnail] Using absolute URL: ${url.substring(0, 80)}...`);
-        return url;
-    } catch (e) {
-        console.error(`[Thumbnail] Failed to resolve URL: ${url}`, e);
-        return url; // Return original as fallback
-    }
-};
 
 // Component to auto-zoom map to fit all history pin
+const INDONESIA_CENTER = [-2.5, 118.0];
+const INDONESIA_ZOOM = 5;
+
 const MapAutoFitAll = ({ items, active }) => {
     const map = useMap();
-    const hasInteracted = useRef(false);
-    const lastActive = useRef(active);
+    const isAutoMoving = useRef(false);
+    const lastActive = useRef(false);
 
     useEffect(() => {
-        const onInteraction = () => {
-            if (active && !hasInteracted.current) {
-                console.log('📍 MapAutoFitAll: Manual Interaction detected - Freezing Auto-fit');
-                hasInteracted.current = true;
-            }
-        };
-        map.on('movestart', onInteraction);
-        map.on('zoomstart', onInteraction);
-        return () => {
-            map.off('movestart', onInteraction);
-            map.off('zoomstart', onInteraction);
-        };
-    }, [map, active]);
-
-    useEffect(() => {
-        // Reset interaction flag when entering this mode
+        // Show full Indonesia map when entering global view
         if (active && !lastActive.current) {
-            console.log('🚩 MapAutoFitAll: Entering Global Mode - Resetting interaction flag');
-            hasInteracted.current = false;
+            isAutoMoving.current = true;
+            map.setView(INDONESIA_CENTER, INDONESIA_ZOOM);
+            setTimeout(() => { isAutoMoving.current = false; }, 500);
         }
         lastActive.current = active;
+    }, [active, map]);
 
-        if (!active) return;
-        if (hasInteracted.current) {
-            console.log('🚫 MapAutoFitAll: Auto-fit skipped due to user interaction');
-            return;
-        }
-
-        console.log('📐 MapAutoFitAll: Performing auto-fit for items:', items?.length);
-        // Forced Global View for Indonesia if no data
-        if (!items || items.length === 0) {
-            map.setView([-2.5, 118.0], 5);
-            return;
-        }
-
-        try {
-            const bounds = L.latLngBounds([]);
-            items.forEach(item => {
-                if (item.geo_data) {
-                    const layer = L.geoJSON(item.geo_data);
-                    bounds.extend(layer.getBounds());
-                }
-            });
-            if (bounds.isValid()) {
-                map.fitBounds(bounds, { padding: [100, 100], maxZoom: 15 });
-            } else {
-                // Fallback to Indonesia if bounds invalid
-                map.setView([-2.5, 118.0], 5);
-            }
-        } catch (e) {
-            console.error("Error fitting bounds:", e);
-            map.setView([-2.5, 118.0], 5);
-        }
-    }, [items, active, map]);
     return null;
 };
 
@@ -303,7 +246,7 @@ const SlopeDataPanel = ({ summary, title, variant = 'inside' }) => {
                 <div className="text-right">
                     <div className="text-[8px] font-bold text-slate-400 uppercase tracking-tighter">Scope</div>
                     <div className={`text-[10px] font-black ${textColor} ${badgeBg} px-2 py-0.5 rounded-full`}>
-                        {summary.scope === 'INSIDE' ? 'DALAM' : summary.scope === 'OUTSIDE' ? 'BUFFER 2KM' : (summary.scope || 'Wilayah')}
+                        {summary.scope === 'INSIDE' ? 'DALAM' : summary.scope === 'OUTSIDE_2KM' ? 'BUFFER 2KM' : (summary.scope || 'Wilayah')}
                     </div>
                 </div>
             </div>
@@ -344,47 +287,106 @@ const SlopeDataPanel = ({ summary, title, variant = 'inside' }) => {
 
 const MainLayout = (props) => {
     const {
-        file, loading, showChart, setShowChart, data, geoData, setData, setGeoData, setFile, setMapUrl, setRgbMapUrl, setVectorLayerData, setError,
-        vectorLayerData, mapUrl, rgbMapUrl, error,
-        analysisMode, setAnalysisMode, specificDate, setSpecificDate, mapType, setMapType, chartType, setChartType,
-        selectedYear, setSelectedYear, showOverlay, setShowOverlay, showRgb, setShowRgb, polygonOpacity, setPolygonOpacity,
-        showConfidenceInfo, setShowConfidenceInfo, showMetadata, setShowMetadata,
-        progress, progressStep, progressDetail, showCalibration, setShowCalibration, thresholds, setThresholds, timeLeft,
-        expandedAttributes, setExpandedAttributes, historyData, loadingHistory,
-        showSidebar, setShowSidebar, sidebarRef,
-        isCompareMode, setIsCompareMode, compareYear, setCompareYear, compareMapUrl, setCompareMapUrl, compareRgbMapUrl, setCompareRgbMapUrl,
-        handleFileChange, handleAnalyze, handleDeleteHistory, handleUpdateHistoryItem, handleHistorySelect, handleHistoryReanalyze, handleReset, handleExportBundle, exportToExcel, exportToGeoJSON,
-        selectedYearData, yearStats, dominantLandCover,
-        // States from props
-        showAllPins, setShowAllPins, showHistoryTable, setShowHistoryTable,
-        // Analysis completion popup
-        // Analysis completion popup
-        showAnalysisComplete, setShowAnalysisComplete,
-        // Cloud Prob
-        cloudProbThreshold, setCloudProbThreshold,
-        // Batch Mode
+        file, setFile,
+        loading,
+        data, setData,
+        geoData, setGeoData,
+        vectorLayerData,
+        mapUrl, setMapUrl,
+        rgbMapUrl, setRgbMapUrl,
+        localMapTileUrl, localRgbTileUrl,
+        pipelineState,
+        error, setError,
+        startYear, setStartYear,
+        endYear, setEndYear,
+        analysisMode, setAnalysisMode,
+        specificDate, setSpecificDate,
+        showMetadata, setShowMetadata,
+        progress,
+        progressStep,
+        progressDetail,
+        analysisConflict,
+        handleAnalyze,
+        handleDeleteHistory,
+        handleHistorySelect,
+        handleHistoryReanalyze,
+        onExportToExcel,
+        onExportToGeoJSON,
+        onExportAllToExcel,
+        onExportShp,
+        fetchHistory,
+        handleLogin,
+        showCalibration, setShowCalibration,
+        thresholds, setThresholds,
+        expandedAttributes, setExpandedAttributes,
+        historyData,
+        loadingHistory,
+        loadingGeometries,
+        showSidebar, setShowSidebar,
+        sidebarRef,
+        isCompareMode, setIsCompareMode,
+        compareYear, setCompareYear,
+        compareMapUrl, setCompareMapUrl,
+        compareRgbMapUrl, setCompareRgbMapUrl,
+        analysisModeForCalibration,
+        currentJobId,
+        isBatchRunning,
         isBatchMode, setIsBatchMode,
-        // Year Range
-        startYear, setStartYear, endYear, setEndYear,
-        handleCancel,
+        handleFileChange,
+
+        // Global View
+        showAllPins, setShowAllPins,
+        showHistoryTable, setShowHistoryTable,
+
+        // Completion Popups
+        showAnalysisComplete, setShowAnalysisComplete,
+        showBatchComplete, setShowBatchComplete,
+
+        // UI States
+        selectedYear, setSelectedYear,
+        mapType, setMapType,
+        showOverlay, setShowOverlay,
+        showRgb, setShowRgb,
+        polygonOpacity, setPolygonOpacity,
+        showConfidenceInfo, setShowConfidenceInfo,
+
         // SIGAP Interaktif
-        showKawasanHutan, setShowKawasanHutan, kawasanHutanOpacity, setKawasanHutanOpacity,
-        showDAS, setShowDAS, dasOpacity, setDasOpacity,
-        // Slope Analysis
-        showSlopeLayer, setShowSlopeLayer, slopeOpacityInside, setSlopeOpacityInside, slopeOpacityOutside, setSlopeOpacityOutside, slopeMapUrlInside, slopeMapUrlOutside, slopeDbSummary, slopeDbSummaryOutside,
+        showKawasanHutan, setShowKawasanHutan,
+        kawasanHutanOpacity, setKawasanHutanOpacity,
+        showDAS, setShowDAS,
+        dasOpacity, setDasOpacity,
+
+        // Slope Layer
+        showSlopeLayer, setShowSlopeLayer,
+        slopeOpacityInside, setSlopeOpacityInside,
+        slopeOpacityOutside, setSlopeOpacityOutside,
+        slopeMapUrlInside, setSlopeMapUrlInside,
+        slopeMapUrlOutside, setSlopeMapUrlOutside,
+        slopeStaticMapUrl, setSlopeStaticMapUrl,
+        slopeDbSummary, slopeDbSummaryOutside,
 
         onOpenCarbonMode,
         queuePosition,
-        // Custom Pins
-        customPins,
-        isAddingPin,
-        setIsAddingPin,
-        handleAddCustomPin,
-        handleDeleteCustomPin,
-        handleUpdateCustomPin,
+
+        // Derived data from App
+        selectedYearData,
+        yearStats,
+        dominantLandCover,
+        timeLeft,
+        handleCancel,
+        handleReset,
+
         // Bulk Upload
-        setShowBulkUploadDialog
+        setShowBulkUploadDialog,
+        // Monitoring Terkini
+        onOpenMonitoringTerkini,
+        detectedKps
     } = props;
+
+    // Smart Narrative Modal State
+    const [showNarrativeModal, setShowNarrativeModal] = useState(false);
+    const [narrativeCopied, setNarrativeCopied] = useState(false);
+
 
     // Debug: Verify bulk upload prop is available
     useEffect(() => {
@@ -398,11 +400,23 @@ const MainLayout = (props) => {
     // Local State for SIGAP Panel Visibility
     const [showSigapPanel, setShowSigapPanel] = useState(false);
 
+    // History Pins Layer State
+    const [showHistoryPins, setShowHistoryPins] = useState(true);
+
+    // 🔄 SYNC HISTORY PINS VISIBILITY (NEW)
+    // Hide pins when entering specific dashboard (showAllPins = false)
+    // Show pins when returning to main layout (showAllPins = true)
+    useEffect(() => {
+        setShowHistoryPins(showAllPins);
+    }, [showAllPins]);
+
     // NASA FIRMS Hotspot Layer States (Fire Information for Resource Management System)
     const [showNasaHotspot, setShowNasaHotspot] = useState(false);
     const [nasaHotspotData, setNasaHotspotData] = useState([]);
     const [nasaLoading, setNasaLoading] = useState(false);
     const [nasaError, setNasaError] = useState(null);
+
+
 
     // 🔄 TEMPORAL STATUS STATES (NEW)
     const [temporalStatusData, setTemporalStatusData] = useState(null);
@@ -416,6 +430,42 @@ const MainLayout = (props) => {
 
     // Chart Tab State (summary, bar, area)
     const [chartTab, setChartTab] = useState('bar');
+    const [chartMinimized, setChartMinimized] = useState(false);
+
+    // Re-trigger background tasks state
+    const [retriggerLoading, setRetriggerLoading] = useState(null); // 'hotspot' | 'slope' | 'both' | null
+
+    // PDF export state
+    const [pdfLoading, setPdfLoading] = useState(false);
+    const [pdfStatus, setPdfStatus] = useState('');
+
+    // Chart Data from API (untuk Global View)
+    const [aggregateChartData, setAggregateChartData] = useState([]);
+    const [loadingChartData, setLoadingChartData] = useState(false);
+
+    useEffect(() => {
+        const fetchAggregateData = async () => {
+            if (!showAllPins) return;
+
+            setLoadingChartData(true);
+            try {
+                const response = await fetch(`${API_URL}/api/chart/yearly-aggregate`);
+                if (response.ok) {
+                    const result = await response.json();
+                    setAggregateChartData(result.data || []);
+                } else {
+                    console.error('Failed to fetch aggregate chart data:', response.statusText);
+                }
+            } catch (err) {
+                console.error('Error fetching aggregate chart data. Is backend running?', err);
+            } finally {
+                setLoadingChartData(false);
+            }
+        };
+
+        fetchAggregateData();
+    }, [showAllPins]);
+
 
     // Reset tab when context changes (Global vs Single)
     useEffect(() => {
@@ -470,6 +520,217 @@ const MainLayout = (props) => {
     }, [data?.id, vectorLayerData?.properties?.history_id]);
     // END FETCH TEMPORAL STATUS
 
+    // Re-trigger background tasks (hotspot & slope)
+    const handleRetriggerData = async (type) => {
+        const historyId = file?.id;
+        if (!historyId) return;
+        setRetriggerLoading(type);
+        try {
+            const tasks = [];
+            if (type === 'hotspot' || type === 'both') {
+                tasks.push(fetch(`${API_URL}/history/${historyId}/populate-hotspots`, { method: 'POST' }));
+            }
+            if (type === 'slope' || type === 'both') {
+                tasks.push(fetch(`${API_URL}/history/${historyId}/analyze-slope`, { method: 'POST' }));
+            }
+            await Promise.all(tasks);
+        } catch (err) {
+            console.error('Re-trigger error:', err);
+        } finally {
+            setRetriggerLoading(null);
+        }
+    };
+
+    // Export PDF report for current KPS detail
+    const handleExportPdf = async () => {
+        if (!file?.id || !data?.length) return;
+        setPdfLoading(true);
+        setPdfStatus('Memeriksa kelengkapan data...');
+        try {
+            const item = {
+                id: file.id,
+                display_name: file.name,
+                filename: file.name,
+                analysis_results: data,
+                geo_data: geoData,
+                kps_info: file.kps_info || null,
+            };
+
+            // Convert DB slope format to PDF generator format
+            const mapDbSlopeToPdf = (dbRecord) => {
+                if (!dbRecord) return null;
+                return {
+                    avg_slope: dbRecord.avg_slope || 0,
+                    klasifikasi: {
+                        datar_0_8: dbRecord.slope_0_8 || 0,
+                        landai_8_15: dbRecord.slope_8_15 || 0,
+                        agak_curam_15_25: dbRecord.slope_15_25 || 0,
+                        curam_25_45: dbRecord.slope_25_40 || 0,
+                        sangat_curam_45_plus: dbRecord.slope_above_40 || 0,
+                    }
+                };
+            };
+
+            // ── Step 1: Auto-fetch KPS info if missing ──
+            if (!item.kps_info && file?.id) {
+                setPdfStatus('Mengambil identitas KPS...');
+                try {
+                    const detailRes = await fetch(`${API_URL}/history/${file.id}`);
+                    const detailJson = await detailRes.json();
+                    if (detailJson.kps_info) {
+                        item.kps_info = detailJson.kps_info;
+                        setFile(prev => prev ? { ...prev, kps_info: detailJson.kps_info } : prev);
+                    }
+                    // Also grab slope_map_url from DB if available
+                    if (detailJson.slope_map_url && !slopeStaticMapUrl) {
+                        setSlopeStaticMapUrl(detailJson.slope_map_url);
+                    }
+                } catch (e) {
+                    console.warn('PDF: KPS info fetch failed:', e.message);
+                }
+            }
+
+            // ── Step 2: Auto-generate slope data if missing ──
+            let currentSlopeInside = slopeDbSummary;
+            let currentSlopeOutside = slopeDbSummaryOutside;
+            let currentSlopeMapUrl = slopeStaticMapUrl;
+
+            if (geoData && (!currentSlopeInside || !currentSlopeMapUrl)) {
+                setPdfStatus('Menghitung analisis kelerengan (DEM)...');
+                try {
+                    console.log('📐 PDF Auto-Generate: Fetching slope from GEE...');
+                    const slopeRes = await fetch(`${API_URL}/map/slope`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ geo_data: geoData, history_id: file?.id || null })
+                    });
+                    const slopeJson = await slopeRes.json();
+                    if (slopeJson?.status === 'success' && slopeJson.db_summary?.length > 0) {
+                        currentSlopeInside = slopeJson.db_summary.find(r => r.scope === 'INSIDE') || slopeJson.db_summary[0];
+                        currentSlopeOutside = slopeJson.db_summary.find(r => r.scope === 'OUTSIDE_2KM')
+                            || slopeJson.db_summary.find(r => r.scope === 'OUTSIDE');
+                        setSlopeDbSummary(currentSlopeInside);
+                        setSlopeDbSummaryOutside(currentSlopeOutside);
+                        if (slopeJson.slope_map_url) {
+                            currentSlopeMapUrl = slopeJson.slope_map_url;
+                            setSlopeStaticMapUrl(slopeJson.slope_map_url);
+                        }
+                        console.log('✅ Slope auto-generated for PDF');
+                    }
+                } catch (slopeErr) {
+                    console.warn('PDF: Slope GEE fetch failed:', slopeErr.message);
+                }
+            }
+
+            // ── Step 2b: Fallback — fetch slope image via dedicated endpoint ──
+            if (!currentSlopeMapUrl && file?.id) {
+                setPdfStatus('Mengambil gambar kelerengan...');
+                try {
+                    console.log('🏔️ PDF Step 2b: Fetching slope image via /api/slope-image...');
+                    const slopeImgRes = await fetch(`${API_URL.replace(/\/api\/?$/, '')}/api/slope-image/${file.id}`);
+                    if (slopeImgRes.ok) {
+                        const slopeImgJson = await slopeImgRes.json();
+                        if (slopeImgJson?.url) {
+                            currentSlopeMapUrl = slopeImgJson.url;
+                            setSlopeStaticMapUrl(slopeImgJson.url);
+                            console.log(`✅ Slope image URL obtained: ${slopeImgJson.url} (${slopeImgJson.source})`);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('PDF Step 2b: slope-image fetch failed:', e.message);
+                }
+            }
+
+            // ── Step 3: Auto-fetch hotspot data if missing ──
+            let hotspotPayload = null;
+
+            // First: use live NASA data from state if available
+            if (nasaHotspotData?.length > 0) {
+                hotspotPayload = {
+                    total_hotspots: nasaHotspotData.length,
+                    yearly_hotspots: nasaHotspotData,
+                };
+            }
+
+            // If no live data, try DB hotspots
+            if (!hotspotPayload && file?.id) {
+                setPdfStatus('Mengambil data hotspot...');
+                try {
+                    const hsRes = await fetch(`${API_URL}/history/${file.id}/hotspots`);
+                    const hsJson = await hsRes.json();
+                    if (hsJson.total > 0 && hsJson.yearly_stats) {
+                        // Convert yearly_stats { year: { total } } to { year: count }
+                        const yearlyMap = {};
+                        Object.entries(hsJson.yearly_stats).forEach(([yr, stats]) => {
+                            yearlyMap[yr] = stats.total || 0;
+                        });
+                        hotspotPayload = {
+                            total_hotspots: hsJson.total,
+                            yearly_hotspots: yearlyMap,
+                        };
+                        console.log(`✅ Hotspot data loaded from DB: ${hsJson.total} points`);
+                    }
+                } catch (e) {
+                    console.warn('PDF: Hotspot DB fetch failed:', e.message);
+                }
+            }
+
+            // If still no hotspots and we have geometry, trigger background populate then fetch
+            if (!hotspotPayload && file?.id && geoData) {
+                setPdfStatus('Mengambil data hotspot dari NASA FIRMS...');
+                try {
+                    // Trigger populate in background
+                    const populateRes = await fetch(`${API_URL}/history/${file.id}/populate-hotspots`, { method: 'POST' });
+                    if (!populateRes.ok) {
+                        console.warn(`PDF: Hotspot populate returned ${populateRes.status}`);
+                    }
+                    // Poll for result with retry (max 3 attempts, 2s interval)
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        const hsRes2 = await fetch(`${API_URL}/history/${file.id}/hotspots`);
+                        if (!hsRes2.ok) continue;
+                        const hsJson2 = await hsRes2.json();
+                        if (hsJson2.total > 0 && hsJson2.yearly_stats) {
+                            const yearlyMap = {};
+                            Object.entries(hsJson2.yearly_stats).forEach(([yr, stats]) => {
+                                yearlyMap[yr] = stats.total || 0;
+                            });
+                            hotspotPayload = {
+                                total_hotspots: hsJson2.total,
+                                yearly_hotspots: yearlyMap,
+                            };
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('PDF: Hotspot populate failed:', e.message);
+                }
+            }
+
+            // ── Step 4: Assign all collected data and generate PDF ──
+            if (currentSlopeMapUrl) {
+                item.slope_map_url = currentSlopeMapUrl;
+            }
+
+            const slopePayload = currentSlopeInside ? {
+                slope_analysis: {
+                    INSIDE: mapDbSlopeToPdf(currentSlopeInside),
+                    OUTSIDE_2KM: mapDbSlopeToPdf(currentSlopeOutside),
+                },
+                slope_map_url: currentSlopeMapUrl,
+                enriched_kps: file.kps_info || item.kps_info || {},
+            } : null;
+
+            setPdfStatus('Membuat file PDF...');
+            await generateAnalysisReport(item, slopePayload, hotspotPayload);
+        } catch (err) {
+            console.error('PDF export error:', err);
+        } finally {
+            setPdfLoading(false);
+            setPdfStatus('');
+        }
+    };
+
     // Fetch NASA FIRMS Hotspot data filtered by user's polygon bounding box
     // Uses time series: 1 January - 31 December of selected year
     const fetchNasaHotspot = async (geoDataInput, year) => {
@@ -490,12 +751,14 @@ const MainLayout = (props) => {
             const geometry = geoDataInput.features[0].geometry;
             let allCoords = [];
 
-            if (geometry.type === 'Polygon') {
-                allCoords = geometry.coordinates[0];
-            } else if (geometry.type === 'MultiPolygon') {
+            if (geometry.type === 'Polygon' && Array.isArray(geometry.coordinates)) {
+                allCoords = geometry.coordinates[0] || [];
+            } else if (geometry.type === 'MultiPolygon' && Array.isArray(geometry.coordinates)) {
                 // Flatten all polygons
                 geometry.coordinates.forEach(poly => {
-                    allCoords = allCoords.concat(poly[0]);
+                    if (Array.isArray(poly) && poly[0]) {
+                        allCoords = allCoords.concat(poly[0]);
+                    }
                 });
             }
 
@@ -698,14 +961,15 @@ const MainLayout = (props) => {
         [...historyData].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).forEach(item => {
             latestMap.set(item.filename, item); // Overwrites older versions of the same file
         });
-        return Array.from(latestMap.values());
+        const result = Array.from(latestMap.values());
+        return result;
     }, [historyData]);
 
     // Global Hotspot Aggregation for Dashboard (NASA FIRMS)
     // Uses time series: 1 January - 31 December of current year
     useEffect(() => {
         const aggregateGlobalHotspots = async () => {
-            if (!showChart || !showAllPins || uniqueHistoryData.length === 0) {
+            if (!showAllPins || uniqueHistoryData.length === 0) {
                 return;
             }
 
@@ -726,30 +990,40 @@ const MainLayout = (props) => {
                 // Fetch hotspots for each unique history item (KPS)
                 // Using sequential for stability
                 for (const item of uniqueHistoryData) {
-                    if (!item.geo_data?.features?.[0]?.geometry) continue;
+                    // ⚡ OPTIMIZATION: Use pre-calculated bounds from database
+                    // Eliminates need to parse GeoJSON and loop thousands of coordinates
+                    let bounds = item.bounds;
 
-                    const geometry = item.geo_data.features[0].geometry;
-                    let allCoords = [];
+                    // Fallback to geometry if bounds not available (legacy data)
+                    if (!bounds && item.geo_data?.features?.[0]?.geometry) {
+                        const geometry = item.geo_data.features[0].geometry;
+                        let allCoords = [];
 
-                    if (geometry.type === 'Polygon') {
-                        allCoords = geometry.coordinates[0];
-                    } else if (geometry.type === 'MultiPolygon') {
-                        geometry.coordinates.forEach(poly => {
-                            allCoords = allCoords.concat(poly[0]);
-                        });
+                        if (geometry.type === 'Polygon') {
+                            allCoords = geometry.coordinates[0];
+                        } else if (geometry.type === 'MultiPolygon') {
+                            geometry.coordinates.forEach(poly => {
+                                allCoords = allCoords.concat(poly[0]);
+                            });
+                        }
+
+                        if (allCoords.length > 0) {
+                            const lngs = allCoords.map(c => c[0]);
+                            const lats = allCoords.map(c => c[1]);
+                            bounds = {
+                                minLon: Math.min(...lngs),
+                                minLat: Math.min(...lats),
+                                maxLon: Math.max(...lngs),
+                                maxLat: Math.max(...lats)
+                            };
+                        }
                     }
 
-                    if (allCoords.length === 0) continue;
+                    if (!bounds) continue;
 
-                    // Calculate bounding box
-                    const lngs = allCoords.map(c => c[0]);
-                    const lats = allCoords.map(c => c[1]);
-                    const bounds = {
-                        minLon: Math.min(...lngs),
-                        minLat: Math.min(...lats),
-                        maxLon: Math.max(...lngs),
-                        maxLat: Math.max(...lats)
-                    };
+                    // Get geometry for point-in-polygon check
+                    const geometry = item.geo_data?.features?.[0]?.geometry;
+                    if (!geometry) continue;
 
                     try {
                         const response = await fetch(NASA_FIRMS_CONFIG.PROXY_URL, {
@@ -787,55 +1061,26 @@ const MainLayout = (props) => {
         };
 
         aggregateGlobalHotspots();
-    }, [showChart, showAllPins, uniqueHistoryData]);
-
-    const aggregateHistoryData = useMemo(() => {
-        if (uniqueHistoryData.length === 0) return [];
-        const yearMap = {};
-
-        // IMPORTANT: Use uniqueHistoryData to prevent double counting in the timeline
-        uniqueHistoryData.forEach(item => {
-            if (!item.analysis_results) return;
-            item.analysis_results.forEach(res => {
-                const y = Number(res.year);
-                if (!yearMap[y]) {
-                    yearMap[y] = {
-                        year: y,
-                        hutan_primer: 0,
-                        hutan_sekunder: 0,
-                        tanah_kering: 0,
-                        tanah_kosong: 0,
-                        air: 0,
-                        lahan_terbangun: 0,
-                        total_ha: 0,
-                        shp_count: 0
-                    };
-                }
-
-                // Accumulate all 6 classes
-                yearMap[y].hutan_primer += (Number(res.hutan_primer) || 0);
-                yearMap[y].hutan_sekunder += (Number(res.hutan_sekunder) || 0);
-                yearMap[y].tanah_kering += (Number(res.tanah_kering) || 0);
-                yearMap[y].tanah_kosong += (Number(res.tanah_kosong) || 0);
-                yearMap[y].air += (Number(res.air) || 0);
-                yearMap[y].lahan_terbangun += (Number(res.lahan_terbangun) || 0);
-
-                yearMap[y].shp_count += 1;
-            });
-        });
-
-        // Return TOTAL SUMS for the 'Whole Data' perspective
-        return Object.values(yearMap).map(d => ({
-            ...d,
-            total_ha: d.hutan_primer + d.hutan_sekunder + d.tanah_kering +
-                d.tanah_kosong + d.air + d.lahan_terbangun
-        })).sort((a, b) => a.year - b.year);
-    }, [uniqueHistoryData]);
+    }, [showAllPins, uniqueHistoryData]);
 
     // Adaptive data source for the charts
-    const activeChartData = showAllPins ? aggregateHistoryData : data;
+    const activeChartData = showAllPins ? aggregateChartData : data;
+
+    // 🐛 DEBUG: Log chart data untuk investigasi
+    useEffect(() => {
+        console.log('📊 Chart Data Debug:', {
+            showAllPins,
+            loadingChartData,
+            aggregateChartDataLength: aggregateChartData.length,
+            activeChartDataLength: activeChartData?.length || 0,
+            activeChartDataSample: activeChartData?.[0],
+            chartTab,
+            dataSource: showAllPins ? 'API (vw_chart_yearly_aggregate)' : 'Single KPS'
+        });
+    }, [showAllPins, loadingChartData, aggregateChartData, activeChartData, chartTab]);
+
     const activeYear = showAllPins
-        ? (activeChartData.find(d => d.year === selectedYear) ? selectedYear : activeChartData[activeChartData.length - 1]?.year)
+        ? (activeChartData?.find(d => d.year === selectedYear) ? selectedYear : activeChartData?.[activeChartData?.length - 1]?.year)
         : selectedYear;
     const activeYearData = useMemo(() => activeChartData?.find(d => d.year === activeYear), [activeChartData, activeYear]);
 
@@ -852,7 +1097,7 @@ const MainLayout = (props) => {
     const globalStats = useMemo(() => {
         if (!uniqueHistoryData || uniqueHistoryData.length === 0) return null;
 
-        const targetYear = Number(activeYear) || (aggregateHistoryData.length > 0 ? Number(aggregateHistoryData[aggregateHistoryData.length - 1].year) : 2024);
+        const targetYear = Number(activeYear) || (aggregateChartData.length > 0 ? Number(aggregateChartData[aggregateChartData.length - 1].year) : 2024);
 
         let totalKPS = uniqueHistoryData.length;
         let yearlyHutanHa = 0;
@@ -870,7 +1115,10 @@ const MainLayout = (props) => {
         let ekspansiTerbangunCount = 0;
 
         uniqueHistoryData.forEach(item => {
-            const results = [...(item.analysis_results || [])].sort((a, b) => Number(a.year) - Number(b.year));
+            const results = (Array.isArray(item.analysis_results)
+                ? [...item.analysis_results]
+                : (item.analysis_results ? [item.analysis_results] : [])
+            ).sort((a, b) => Number(a.year) - Number(b.year));
             if (results.length === 0) return;
 
             // First Total Forest (Primer + Sekunder)
@@ -930,7 +1178,7 @@ const MainLayout = (props) => {
             ekspansiTerbangunCount,
             targetYear
         };
-    }, [uniqueHistoryData, activeYear, aggregateHistoryData]);
+    }, [uniqueHistoryData, activeYear, aggregateChartData]);
 
     const globalNarrative = useMemo(() => {
         if (!globalStats) return null;
@@ -947,6 +1195,118 @@ const MainLayout = (props) => {
             return `Kondisi tutupan kawasan cenderung stabil seimbang antara aktivitas deforestasi (-${defo} Ha) dan reforestasi (+${refo} Ha).`;
         }
     }, [globalStats]);
+
+    // 🤖 SMART NARRATIVE ENGINE INTEGRATION
+    const smartNarrative = useMemo(() => {
+        if (showAllPins || !data || data.length === 0) return null;
+
+        const mapDbSlopeToEngine = (dbRecord) => {
+            if (!dbRecord) return null;
+            return {
+                avg_slope: dbRecord.avg_slope || 0,
+                klasifikasi: {
+                    datar_0_8: dbRecord.slope_0_8 || 0,
+                    landai_8_15: dbRecord.slope_8_15 || 0,
+                    agak_curam_15_25: dbRecord.slope_15_25 || 0,
+                    curam_25_45: dbRecord.slope_25_40 || 0,
+                    sangat_curam_45_plus: dbRecord.slope_above_40 || 0,
+                }
+            };
+        };
+
+        const slopePayload = slopeDbSummary ? {
+            slope_analysis: {
+                INSIDE: mapDbSlopeToEngine(slopeDbSummary),
+                OUTSIDE_2KM: mapDbSlopeToEngine(slopeDbSummaryOutside),
+            },
+            enriched_kps: { erosion_risk: slopeDbSummary.erosion_risk }
+        } : null;
+
+        // Process hotspot data into the format expected by the engine
+        let hotspotPayload = null;
+        if (nasaHotspotData && nasaHotspotData.length > 0) {
+            const yearlyMap = {};
+            nasaHotspotData.forEach(f => {
+                const year = new Date(f.properties?.acq_date || f.properties?.ACQ_DATE).getFullYear();
+                if (year) yearlyMap[year] = (yearlyMap[year] || 0) + 1;
+            });
+
+            hotspotPayload = {
+                total_hotspots: nasaHotspotData.length,
+                yearly_hotspots: yearlyMap
+            };
+        }
+
+        return generateNarrative({
+            analysisResults: data,
+            slopeData: slopePayload,
+            hotspotData: hotspotPayload,
+            lang: 'id'
+        });
+    }, [showAllPins, data, slopeDbSummary, slopeDbSummaryOutside, nasaHotspotData]);
+
+    // Save narrative to Supabase when it changes
+    useEffect(() => {
+        const saveNarrative = async () => {
+            // Skip if in global view, no narrative, or no history item ID
+            if (showAllPins || !smartNarrative || !file?.id || !data?.length) {
+                return;
+            }
+
+            try {
+                const analysisId = `${file.id}_${selectedYear || 'latest'}`;
+
+                const payload = {
+                    analysis_id: analysisId,
+                    executive_summary: smartNarrative.executiveSummary,
+                    trend_narrative: smartNarrative.trendNarrative,
+                    hotspot_narrative: smartNarrative.hotspotNarrative,
+                    terrain_narrative: smartNarrative.terrainNarrative,
+                    metadata: smartNarrative._meta,
+                    updated_at: new Date().toISOString()
+                };
+
+                const { data: result, error } = await supabase
+                    .from('ai_summaries')
+                    .upsert(payload, { onConflict: 'analysis_id' });
+
+                if (error) {
+                    console.error('Error saving narrative:', error.message);
+                }
+            } catch (err) {
+                console.error('Failed to save narrative:', err.message);
+            }
+        };
+
+        saveNarrative();
+    }, [smartNarrative, file?.id, selectedYear, showAllPins]);
+
+    // Copy narrative to clipboard handler
+    const handleCopyNarrative = () => {
+        if (!smartNarrative) return;
+
+        const fullText = `
+RINGKASAN EKSEKUTIF
+${smartNarrative.executiveSummary}
+
+ANALISIS TREN TUTUPAN
+${smartNarrative.trendNarrative}
+
+ANALISIS HOTSPOT (NASA FIRMS)
+${smartNarrative.hotspotNarrative}
+
+KARAKTERISTIK MEDAN (TERRAIN)
+${smartNarrative.terrainNarrative}
+        `.trim();
+
+        navigator.clipboard.writeText(fullText).then(() => {
+            setNarrativeCopied(true);
+            setTimeout(() => setNarrativeCopied(false), 2000);
+        }).catch(err => {
+            console.error('Failed to copy:', err);
+        });
+    };
+
 
     // 📊 CALCULATE DYNAMIC OPACITY BASED ON TEMPORAL STATUS (NEW)
     const layerOpacity = useMemo(() => {
@@ -1057,6 +1417,7 @@ const MainLayout = (props) => {
 
     // Component for Option 3: Analytical Grid
     const GlobalGridDashboard = ({ stats }) => {
+        // If no stats at all, show empty state
         if (!stats) return (
             <div className="h-full flex flex-col items-center justify-center text-slate-400 gap-2 opacity-60">
                 <Database size={32} className="animate-pulse" />
@@ -1064,12 +1425,14 @@ const MainLayout = (props) => {
             </div>
         );
 
+        const finalStats = stats;
+
         const cards = [
             {
                 label: 'Luas Areal Pantauan',
-                shpCount: stats.totalKPS || '-',
+                shpCount: finalStats.totalKPS || '-',
                 shpUnit: 'KPS',
-                value: stats.totalHektar.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+                value: finalStats.totalHektar.toLocaleString(undefined, { maximumFractionDigits: 1 }),
                 unit: 'Ha',
                 percent: '100',
                 icon: <Database size={24} />,
@@ -1078,33 +1441,33 @@ const MainLayout = (props) => {
             },
             {
                 label: 'Deforestasi Tahunan',
-                shpCount: stats.deforestasiCount || 0,
+                shpCount: finalStats.deforestasiCount || 0,
                 shpUnit: 'KPS',
-                value: stats.deforestasiAreaHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+                value: finalStats.deforestasiAreaHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
                 unit: 'Ha',
-                percent: ((stats.deforestasiAreaHa / (stats.totalHektar || 1)) * 100).toFixed(1),
+                percent: ((finalStats.deforestasiAreaHa / (finalStats.totalHektar || 1)) * 100).toFixed(1),
                 icon: <TrendingDown size={24} />,
                 color: 'bg-red-50 text-red-600',
                 border: 'border-red-100'
             },
             {
                 label: 'Reforestasi / Pemulihan',
-                shpCount: stats.reforestasiCount || 0,
+                shpCount: finalStats.reforestasiCount || 0,
                 shpUnit: 'KPS',
-                value: stats.reforestasiAreaHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+                value: finalStats.reforestasiAreaHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
                 unit: 'Ha',
-                percent: ((stats.reforestasiAreaHa / (stats.totalHektar || 1)) * 100).toFixed(1),
+                percent: ((finalStats.reforestasiAreaHa / (finalStats.totalHektar || 1)) * 100).toFixed(1),
                 icon: <TrendingUp size={24} />,
                 color: 'bg-emerald-50 text-emerald-600',
                 border: 'border-emerald-100'
             },
             {
                 label: 'Ekspansi Terbangun',
-                shpCount: stats.ekspansiTerbangunCount || 0,
+                shpCount: finalStats.ekspansiTerbangunCount || 0,
                 shpUnit: 'KPS',
-                value: stats.ekspansiTerbangunAreaHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+                value: (finalStats.ekspansi_terbangun_area_ha || finalStats.ekspansiTerbangunAreaHa || 0).toLocaleString(undefined, { maximumFractionDigits: 1 }),
                 unit: 'Ha',
-                percent: ((stats.ekspansiTerbangunAreaHa / (stats.totalHektar || 1)) * 100).toFixed(1),
+                percent: (((finalStats.ekspansi_terbangun_area_ha || finalStats.ekspansiTerbangunAreaHa || 0) / (finalStats.totalHektar || 1)) * 100).toFixed(1),
                 icon: <ImageIcon size={24} />,
                 color: 'bg-slate-100 text-slate-500',
                 border: 'border-slate-200'
@@ -1112,12 +1475,12 @@ const MainLayout = (props) => {
             {
                 label: 'Perubahan Tutupan (Transisi)',
                 shpCount: null,
-                value: (stats.perubahanBersihHa >= 0 ? '+' : '') + stats.perubahanBersihHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+                value: (finalStats.perubahanBersihHa >= 0 ? '+' : '') + finalStats.perubahanBersihHa.toLocaleString(undefined, { maximumFractionDigits: 1 }),
                 unit: 'Ha',
-                percent: ((Math.abs(stats.perubahanBersihHa) / (stats.totalHektar || 1)) * 100).toFixed(1),
+                percent: ((Math.abs(finalStats.perubahanBersihHa) / (finalStats.totalHektar || 1)) * 100).toFixed(1),
                 icon: <BarChart3 size={24} />,
-                color: stats.perubahanBersihHa >= 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600',
-                border: stats.perubahanBersihHa >= 0 ? 'border-emerald-100' : 'border-red-100'
+                color: finalStats.perubahanBersihHa >= 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600',
+                border: finalStats.perubahanBersihHa >= 0 ? 'border-emerald-100' : 'border-red-100'
             },
             {
                 label: 'TOTAL TITIK TERDETEKSI',
@@ -1125,10 +1488,10 @@ const MainLayout = (props) => {
                 shpUnit: 'Titik',
                 value: isHotspotsLoading ? '...' : uniqueHistoryData.length,
                 unit: 'Lokasi',
-                status: totalGlobalHotspots > 0 ? 'HIGH RISK' : 'AMAN',
-                statusColor: totalGlobalHotspots > 0 ? 'text-red-600' : 'text-emerald-600',
-                statusBg: totalGlobalHotspots > 0 ? 'bg-red-50' : 'bg-emerald-50',
-                statusBorder: totalGlobalHotspots > 0 ? 'border-red-100' : 'border-emerald-100',
+                status: (totalGlobalHotspots > 0) ? 'HIGH RISK' : 'AMAN',
+                statusColor: (totalGlobalHotspots > 0) ? 'text-red-600' : 'text-emerald-600',
+                statusBg: (totalGlobalHotspots > 0) ? 'bg-red-50' : 'bg-emerald-50',
+                statusBorder: (totalGlobalHotspots > 0) ? 'border-red-100' : 'border-emerald-100',
                 icon: <Flame size={24} />,
                 color: (totalGlobalHotspots > 0) ? 'bg-orange-50 text-orange-600' : 'bg-slate-100 text-slate-500',
                 border: (totalGlobalHotspots > 0) ? 'border-orange-100' : 'border-slate-200'
@@ -1139,7 +1502,7 @@ const MainLayout = (props) => {
             <div className="flex flex-col gap-4 py-2">
                 {/* Executive Briefing Banner */}
                 <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 flex items-start gap-3 shadow-sm mb-2">
-                    <div className={`p-1.5 rounded-lg mt-0.5 ${stats.perubahanBersihHa < 0 ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}`}>
+                    <div className={`p-1.5 rounded-lg mt-0.5 ${finalStats.perubahanBersihHa < 0 ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}`}>
                         <Sparkles size={16} />
                     </div>
                     <div className="flex flex-col gap-0.5">
@@ -1387,6 +1750,7 @@ const MainLayout = (props) => {
                         } else {
                             setShowHistoryTable(true);
                             setShowAllPins(false);
+                            setShowSidebar(false); // Tutup sidebar agar history dashboard bisa muncul
                         }
                     }}
                     className={`p-2.5 rounded-full transition-all active:scale-95 flex items-center justify-center gap-2 ${showHistoryTable
@@ -1402,19 +1766,7 @@ const MainLayout = (props) => {
                 <div className="w-px h-5 bg-slate-300/50 mx-0.5"></div>
 
                 {/* 4. Toggle Add Custom Pin Mode */}
-                <button
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        setIsAddingPin(!isAddingPin);
-                    }}
-                    className={`p-2.5 rounded-full transition-all active:scale-95 ${isAddingPin
-                        ? 'bg-red-100 text-red-600'
-                        : 'bg-slate-100 text-slate-400 hover:bg-red-50 hover:text-red-600'
-                        }`}
-                    title={isAddingPin ? "Selesai Tambah Pin" : "Tambah Pin Custom"}
-                >
-                    <MapPin size={20} />
-                </button>
+
             </div>
 
 
@@ -1454,6 +1806,20 @@ const MainLayout = (props) => {
                             <X size={18} />
                         </button>
                     </div>
+                    {/* Back to History button - visible when viewing detail (data loaded, not in history table) */}
+                    {data && !showAllPins && !showHistoryTable && (
+                        <button
+                            onClick={() => {
+                                setShowHistoryTable(true);
+                                setShowAllPins(false);
+                                setShowSidebar(false);
+                            }}
+                            className="mt-3 w-full flex items-center justify-center gap-2 py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-800 rounded-xl text-xs font-bold transition-all active:scale-[0.98]"
+                        >
+                            <Database size={14} />
+                            Kembali ke Riwayat
+                        </button>
+                    )}
                 </div>
 
                 <div className="p-5 flex-1 flex flex-col gap-6 overflow-y-auto no-scrollbar">
@@ -1589,6 +1955,17 @@ const MainLayout = (props) => {
                                     </div>
                                 </div>
                             )}
+
+                            {/* Monitoring Terkini Button - Show when analysis data exists */}
+                            {data && data.length > 0 && onOpenMonitoringTerkini && (
+                                <button
+                                    onClick={() => onOpenMonitoringTerkini(detectedKps?.id_kps_api || null, detectedKps?.nama_kps || file?.name || 'Analisis')}
+                                    className="w-full py-3 rounded-xl flex items-center justify-center gap-2 text-[11px] font-black uppercase tracking-widest transition-all shadow-sm bg-gradient-to-r from-orange-500 to-amber-500 text-white hover:from-orange-600 hover:to-amber-600 hover:shadow-lg active:scale-95"
+                                >
+                                    <AlertTriangle size={14} />
+                                    Monitoring Perubahan Terkini
+                                </button>
+                            )}
                         </div>
 
                         {/* SECTION 2: VISUALIZATION SETTINGS (Now Secondary) */}
@@ -1685,15 +2062,25 @@ const MainLayout = (props) => {
                                 <div className="flex flex-col gap-3 mb-2">
                                     <span className="text-[10px] md:text-[9px] font-black text-slate-400 uppercase tracking-widest">Ekspor & Laporan</span>
                                     <div className="flex flex-wrap items-center gap-2">
-                                        <button onClick={exportToExcel} className="bg-white border border-slate-200 text-emerald-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-emerald-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-bold">
-                                            <Download size={12} /> EXCEL (.xlsx)
-                                        </button>
-                                        <button onClick={exportToGeoJSON} className="bg-white border border-slate-200 text-blue-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-blue-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-bold">
+                                        <button onClick={onExportToGeoJSON} className="bg-white border border-slate-200 text-blue-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-blue-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-bold">
                                             <Download size={12} /> GeoJSON
                                         </button>
-                                        <button onClick={handleExportBundle} className="bg-white border border-indigo-200 text-indigo-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-indigo-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-black shadow-sm">
-                                            <Download size={12} /> HTML + SHP (Lengkap)
+                                        <button onClick={onExportShp} className="bg-white border border-indigo-200 text-indigo-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-indigo-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-black shadow-sm">
+                                            <Download size={12} /> SHP (.zip)
                                         </button>
+                                        {!showAllPins && (
+                                            <button
+                                                onClick={handleExportPdf}
+                                                disabled={pdfLoading}
+                                                className={`border text-[10px] md:text-[9px] flex items-center gap-1.5 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-black shadow-sm ${pdfLoading
+                                                    ? 'bg-red-50 border-red-200 text-red-400 cursor-wait'
+                                                    : 'bg-white border-red-200 text-red-700 hover:bg-red-50'
+                                                    }`}
+                                            >
+                                                {pdfLoading ? <RefreshCw size={12} className="animate-spin" /> : <FileText size={12} />}
+                                                {pdfLoading ? (pdfStatus || 'Generating...') : 'PDF Laporan'}
+                                            </button>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -1707,7 +2094,7 @@ const MainLayout = (props) => {
                                         onChange={(e) => setSelectedYear(parseInt(e.target.value))}
                                         className="w-full pl-7 pr-2 py-1.5 border border-slate-200 rounded text-xs bg-white appearance-none focus:outline-none focus:ring-1 focus:ring-emerald-500"
                                     >
-                                        {data.map(d => <option key={d.year} value={d.year}>Tahun {d.year}</option>)}
+                                        {(data || []).map(d => <option key={d.year} value={d.year}>Tahun {d.year}</option>)}
                                     </select>
                                 </div>
                             )}
@@ -1920,8 +2307,17 @@ const MainLayout = (props) => {
 
                 </div>
 
-                <div className="p-2 border-t border-slate-100 text-[9px] text-center text-slate-400">v2.0</div>
-            </aside>
+                <div className="p-4 border-t border-slate-100 mt-auto bg-slate-50/50">
+                    <button
+                        onClick={props.onLogout}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-white border border-red-100 hover:bg-red-50 text-red-600 hover:text-red-700 rounded-xl transition-all font-bold text-[10px] md:text-xs group shadow-sm hover:shadow active:scale-95"
+                    >
+                        <LogOut size={14} className="group-hover:-translate-x-0.5 transition-transform" />
+                        KELUAR APLIKASI
+                    </button>
+                    <div className="mt-3 text-[8px] text-center text-slate-400 font-mono opacity-60 uppercase tracking-widest">v1.0 Release</div>
+                </div>
+            </aside >
 
 
 
@@ -1935,14 +2331,10 @@ const MainLayout = (props) => {
                         <div className="absolute inset-0 z-[2500] bg-slate-900/10 backdrop-blur-[2px]">
                             <div className="absolute inset-0 overflow-y-auto bg-slate-50/95 backdrop-blur-xl animate-in fade-in slide-in-from-bottom duration-500">
                                 <HistoryDashboard
-                                    history={historyData}
-                                    loading={loadingHistory}
                                     isSidebarOpen={showSidebar}
                                     onDelete={handleDeleteHistory}
-                                    onUpdateItem={handleUpdateHistoryItem}
                                     onSelect={handleHistorySelect}
                                     onReanalyze={handleHistoryReanalyze}
-                                    onOpenCarbonMode={onOpenCarbonMode}
                                 />
                             </div>
                         </div>
@@ -1951,7 +2343,17 @@ const MainLayout = (props) => {
 
                 {/* MAP AREA */}
                 <div className="flex-1 relative w-full h-full overflow-hidden bg-slate-900">
-                    <MapContainer
+                    {/* Geometry Loading Indicator (Non-blocking) */}
+                    {loadingGeometries && (
+                        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-[4000] animate-in fade-in slide-in-from-top-4 duration-500">
+                            <div className="bg-white/90 backdrop-blur-md border border-emerald-200 px-4 py-2 rounded-2xl shadow-xl flex items-center gap-3">
+                                <div className="w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin" />
+                                <span className="text-[10px] font-black uppercase tracking-widest text-emerald-800">Memuat Pin & Geometri...</span>
+                            </div>
+                        </div>
+                    )}
+
+                    <LeafletMapContainer
                         center={[-2.5, 118.0]}
                         zoom={5}
                         className="w-full h-full"
@@ -1974,6 +2376,16 @@ const MainLayout = (props) => {
                                 attributed={MAP_TILES[mapType].attribution || ''}
                                 subdomains={MAP_TILES[mapType].subdomains || []}
                                 zIndex={1}
+                                maxNativeZoom={18}
+                                maxZoom={18}
+                            />
+                        )}
+                        {/* Fallback basemap when SENTINEL_RGB selected but GEE tiles expired (history mode) */}
+                        {mapType === 'SENTINEL_RGB' && !rgbMapUrl && (
+                            <TileLayer
+                                key="basemap-fallback-satellite"
+                                url={MAP_TILES.satellite.url}
+                                zIndex={0}
                                 maxNativeZoom={18}
                                 maxZoom={18}
                             />
@@ -2012,11 +2424,11 @@ const MainLayout = (props) => {
 
                                     {/* Select Input */}
                                     <select
-                                        value={selectedYear}
+                                        value={selectedYear || ''}
                                         onChange={(e) => setSelectedYear(Number(e.target.value))}
-                                        className="appearance-none bg-transparent hover:bg-white/50 pl-9 pr-8 py-1.5 rounded-full text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 cursor-pointer transition-all uppercase tracking-wider"
+                                        className="appearance-none bg-transparent hover:bg-white/50 pl-9 pr-8 py-2.5 rounded-full text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 cursor-pointer transition-all uppercase tracking-wider"
                                     >
-                                        {data.map(d => (
+                                        {(data || []).map(d => (
                                             <option key={d.year} value={d.year}>Tahun {d.year}</option>
                                         ))}
                                     </select>
@@ -2036,77 +2448,33 @@ const MainLayout = (props) => {
                                 {historyData.map((item) => {
                                     if (!item.geo_data) return null;
                                     try {
-                                        const bounds = L.geoJSON(item.geo_data).getBounds();
-                                        if (!bounds.isValid()) return null;
-                                        const center = bounds.getCenter();
+                                        // ⚡ PERFORMANCE: Avoid L.geoJSON in the loop for Points
+                                        let center;
+                                        if (item.geo_data.type === 'Point') {
+                                            center = { lat: item.geo_data.coordinates[1], lng: item.geo_data.coordinates[0] };
+                                        } else {
+                                            // Fallback for full polygons if they exist
+                                            const bounds = L.geoJSON(item.geo_data).getBounds();
+                                            if (!bounds.isValid()) return null;
+                                            center = bounds.getCenter();
+                                        }
 
                                         // Determine Status Color based on Trend
                                         const trendData = calculateTrends(item.analysis_results);
-                                        const statusColor = trendData?.trendInfo?.hex || '#94a3b8'; // hex is added in utils or we map it here
-
-                                        // Simple Mapping if hex not available in trendInfo
                                         const finalColor = trendData?.trendInfo?.hex || '#94a3b8';
 
                                         return (
                                             <React.Fragment key={`global-${item.id}`}>
-                                                <GeoJSON
-                                                    data={item.geo_data}
-                                                    style={{ color: finalColor, weight: 1.5, fillOpacity: 0.1, dashArray: '4, 4' }}
-                                                />
-                                                {/* HASIL ANALISA: Gunakan ImageOverlay (Thumbnail) karena bersifat PERMANEN (Base64 di Cache/DB) */}
-                                                {item.analysis_results?.[item.analysis_results.length - 1]?.thumb_url && (
-                                                    <ImageOverlay
-                                                        url={resolveThumbUrl(item.analysis_results[item.analysis_results.length - 1].thumb_url)}
-                                                        bounds={bounds}
-                                                        opacity={0.7}
-                                                        zIndex={5}
+                                                {/* Only render geojson if it's not a Point (to show boundaries in global view if available) */}
+                                                {item.geo_data.type !== 'Point' && (
+                                                    <GeoJSON
+                                                        data={item.geo_data}
+                                                        style={{ color: finalColor, weight: 1.5, fillOpacity: 0.1, dashArray: '4, 4' }}
                                                     />
                                                 )}
-                                                <Marker position={center} icon={createPinIcon(item.filename, finalColor)}>
-                                                    <Popup className="custom-popup">
-                                                        <div className="p-1 min-w-[180px]">
-                                                            <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Riwayat Lahan</div>
-                                                            <div className="text-xs font-bold text-slate-800 mb-2">{item.display_name || item.filename}</div>
 
-                                                            {/* Latest Analysis Info */}
-                                                            {item.analysis_results && item.analysis_results.length > 0 && (() => {
-                                                                const latestAnalysis = item.analysis_results[item.analysis_results.length - 1];
-                                                                const totalArea = latestAnalysis.class_stats ?
-                                                                    Object.values(latestAnalysis.class_stats).reduce((sum, val) => sum + (val || 0), 0) : 0;
-
-                                                                return (
-                                                                    <div className="mb-2 pb-2 border-b border-slate-200">
-                                                                        <div className="flex items-center justify-between mb-1">
-                                                                            <span className="text-[9px] text-slate-500 font-semibold">Tahun Analisis:</span>
-                                                                            <span className="text-[10px] font-bold text-emerald-700">{latestAnalysis.year}</span>
-                                                                        </div>
-                                                                        <div className="flex items-center justify-between mb-1">
-                                                                            <span className="text-[9px] text-slate-500 font-semibold">Total Luas:</span>
-                                                                            <span className="text-[10px] font-bold text-slate-700">{totalArea.toFixed(2)} ha</span>
-                                                                        </div>
-                                                                        {trendData?.trendInfo && (
-                                                                            <div className="flex items-center justify-between">
-                                                                                <span className="text-[9px] text-slate-500 font-semibold">Status:</span>
-                                                                                <span className="text-[9px] font-bold" style={{ color: finalColor }}>
-                                                                                    {trendData.trendInfo.label}
-                                                                                </span>
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-                                                                );
-                                                            })()}
-
-                                                            <div className="flex flex-col gap-2">
-                                                                <button
-                                                                    onClick={() => handleHistorySelect(item)}
-                                                                    className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-black uppercase rounded shadow-md transition-colors"
-                                                                >
-                                                                    Buka Analisis
-                                                                </button>
-                                                            </div>
-                                                        </div>
-                                                    </Popup>
-                                                </Marker>
+                                                {/* Thumbnails are now tricky to position without bounds for a Point, 
+                                                    we might skip thumbnails in Global View if it's just a Point list for performance */}
                                             </React.Fragment>
                                         );
                                     } catch (e) { return null; }
@@ -2114,21 +2482,31 @@ const MainLayout = (props) => {
                             </>
                         )}
 
+                        {/* 4. HISTORY PINS LAYER (Global or Contextual) */}
+                        {showHistoryPins && (
+                            <HistoryPinsLayer
+                                historyData={uniqueHistoryData}
+                                onSelect={handleHistorySelect}
+                            />
+                        )}
+
                         {/* DYNAMIC TILE LAYERS (HIGH RES GEE TILES) */}
                         {!isCompareMode && (
                             <>
                                 {/* Bottom: Original Sentinel-2 RGB */}
-                                {rgbMapUrl && showRgb && (
+                                {(rgbMapUrl || localRgbTileUrl) && showRgb && (
                                     <DynamicTileLayer
                                         url={rgbMapUrl}
+                                        localTileUrl={localRgbTileUrl}
                                         show={true}
                                         opacity={1}
                                         zIndex={195}
                                     />
                                 )}
-                                {mapUrl && (
+                                {(mapUrl || localMapTileUrl) && (
                                     <DynamicTileLayer
                                         url={mapUrl}
+                                        localTileUrl={localMapTileUrl}
                                         show={showOverlay}
                                         opacity={layerOpacity}
                                         zIndex={205}
@@ -2284,7 +2662,7 @@ const MainLayout = (props) => {
                                             {selectedYearData?.rgb_thumb_url && !rgbMapUrl && (
                                                 <ImageOverlay
                                                     key={`rgb-thumb-${selectedYear}`}
-                                                    url={resolveThumbUrl(selectedYearData.rgb_thumb_url)}
+                                                    url={resolveThumbUrl(selectedYearData.rgb_thumb_url, API_URL)}
                                                     bounds={bounds}
                                                     opacity={1}
                                                     zIndex={190}
@@ -2295,7 +2673,7 @@ const MainLayout = (props) => {
                                             {selectedYearData?.thumb_url && showOverlay && !mapUrl && (
                                                 <ImageOverlay
                                                     key={`class-thumb-${selectedYear}`}
-                                                    url={resolveThumbUrl(selectedYearData.thumb_url)}
+                                                    url={resolveThumbUrl(selectedYearData.thumb_url, API_URL)}
                                                     bounds={bounds}
                                                     opacity={polygonOpacity}
                                                     zIndex={200}
@@ -2334,8 +2712,9 @@ const MainLayout = (props) => {
                                             return {
                                                 fillColor: color,
                                                 fillOpacity: polygonOpacity,
-                                                weight: 0,
-                                                color: 'transparent'
+                                                weight: 0.5,
+                                                color: color,
+                                                opacity: 0.6
                                             };
                                         }}
                                     />
@@ -2378,14 +2757,7 @@ const MainLayout = (props) => {
                             onResult={(latlng, features) => setIdentifyResult({ latlng, features })}
                         />
 
-                        {/* Custom Pins Manager */}
-                        <CustomPinsManager
-                            pins={customPins || []}
-                            isAddingPin={isAddingPin}
-                            onAddPin={handleAddCustomPin}
-                            onDeletePin={handleDeleteCustomPin}
-                            onUpdatePin={handleUpdateCustomPin}
-                        />
+
 
                         {identifyResult && (
                             <Popup position={identifyResult.latlng} onClose={() => setIdentifyResult(null)}>
@@ -2423,51 +2795,53 @@ const MainLayout = (props) => {
                             </Popup>
                         )}
 
-                    </MapContainer>
+                    </LeafletMapContainer>
 
-                    {isCompareMode && data && (
-                        <div className="absolute top-14 left-1/2 transform -translate-x-1/2 bg-white/95 backdrop-blur rounded-xl px-4 py-2 shadow-2xl border border-indigo-200 z-[1000] flex items-center gap-4">
-                            <div className="text-center">
-                                <div className="text-[10px] text-slate-500 uppercase font-bold">Kiri (Sebelum)</div>
-                                <select
-                                    value={compareYear}
-                                    onChange={(e) => {
-                                        const y = parseInt(e.target.value);
-                                        setCompareYear(y);
-                                        const d = data.find(item => item.year === y);
-                                        setCompareMapUrl(d?.map_url);
-                                        setCompareRgbMapUrl(d?.rgb_url);
-                                    }}
-                                    className="text-xs border-none bg-transparent font-bold text-indigo-600 focus:ring-0 p-0 text-center cursor-pointer"
-                                >
-                                    {data.map(d => <option key={d.year} value={d.year}>{d.year}</option>)}
-                                </select>
+                    {
+                        isCompareMode && data && (
+                            <div className="absolute top-14 left-1/2 transform -translate-x-1/2 bg-white/95 backdrop-blur rounded-xl px-4 py-2 shadow-2xl border border-indigo-200 z-[1000] flex items-center gap-4">
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500 uppercase font-bold">Kiri (Sebelum)</div>
+                                    <select
+                                        value={compareYear || ''}
+                                        onChange={(e) => {
+                                            const y = parseInt(e.target.value);
+                                            setCompareYear(y);
+                                            const d = (data || []).find(item => item.year === y);
+                                            setCompareMapUrl(d?.map_url);
+                                            setCompareRgbMapUrl(d?.rgb_url);
+                                        }}
+                                        className="text-xs border-none bg-transparent font-bold text-indigo-600 focus:ring-0 p-0 text-center cursor-pointer"
+                                    >
+                                        {(data || []).map(d => <option key={d.year} value={d.year}>{d.year}</option>)}
+                                    </select>
+                                </div>
+                                <div className="text-slate-300"><Split size={20} /></div>
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500 uppercase font-bold">Kanan (Sesudah)</div>
+                                    <select
+                                        value={selectedYear || ''}
+                                        onChange={(e) => {
+                                            const y = parseInt(e.target.value);
+                                            setSelectedYear(y);
+                                            // The useEffect in App.jsx will take care of sync
+                                        }}
+                                        className="text-xs border-none bg-transparent font-bold text-emerald-600 focus:ring-0 p-0 text-center cursor-pointer"
+                                    >
+                                        {(data || []).map(d => <option key={d.year} value={d.year}>{d.year}</option>)}
+                                    </select>
+                                </div>
                             </div>
-                            <div className="text-slate-300"><Split size={20} /></div>
-                            <div className="text-center">
-                                <div className="text-[10px] text-slate-500 uppercase font-bold">Kanan (Sesudah)</div>
-                                <select
-                                    value={selectedYear}
-                                    onChange={(e) => {
-                                        const y = parseInt(e.target.value);
-                                        setSelectedYear(y);
-                                        // The useEffect in App.jsx will take care of sync
-                                    }}
-                                    className="text-xs border-none bg-transparent font-bold text-emerald-600 focus:ring-0 p-0 text-center cursor-pointer"
-                                >
-                                    {data.map(d => <option key={d.year} value={d.year}>{d.year}</option>)}
-                                </select>
-                            </div>
-                        </div>
-                    )}
-                </div>
+                        )
+                    }
+                </div >
 
                 {/* SIGAP LAYER CONTROLS (Floating Panel) */}
-                <div className={`absolute z-[3001] flex flex-col pointer-events-none gap-2 transition-all duration-300 ${showSidebar ? 'opacity-0' : 'opacity-100'} 
+                < div className={`absolute z-[3001] flex flex-col pointer-events-none gap-2 transition-all duration-300 ${showSidebar ? 'opacity-0' : 'opacity-100'} 
                     top-20 left-6 items-start`}>
 
                     {/* Collapsible Panel */}
-                    <div className={`transition-all duration-300 origin-top-left ${showSigapPanel ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4 pointer-events-none h-0 overflow-hidden'}`}>
+                    < div className={`transition-all duration-300 origin-top-left ${showSigapPanel ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4 pointer-events-none h-0 overflow-hidden'}`}>
                         <div className="bg-white/95 backdrop-blur-xl p-3 rounded-2xl shadow-xl border border-white/50 pointer-events-auto w-[260px] max-h-[65vh] md:max-h-[80vh] overflow-y-auto no-scrollbar ring-1 ring-black/5">
                             <div className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest px-1 sticky top-0 bg-white/50 backdrop-blur-sm pb-2 z-10 border-b border-slate-100 flex justify-between items-center">
                                 <span>Layer & Legenda</span>
@@ -2689,17 +3063,20 @@ const MainLayout = (props) => {
                                 </div>
                             </div>
                         </div>
-                    </div>
-                </div>
+                    </div >
+                </div >
 
                 {/* FLOATING CHART PANEL - Compact & Proportional */}
                 {
-                    ((activeChartData && activeChartData.length > 0) || loading || showAllPins) && (
+                    (!showHistoryTable) && ( // Always visible when chart is enabled and not in history table view
                         <div className={`absolute bottom-6 left-1/2 -translate-x-1/2 z-[1000] w-[95%] max-w-5xl transition-all duration-500 ${showSidebar ? 'md:translate-x-[20px] md:max-w-4xl' : ''}`}>
-                            <div className={`bg-white/95 backdrop-blur-xl border border-emerald-100/50 rounded-[2rem] shadow-[0_10px_40px_rgba(0,0,0,0.15)] transition-all duration-700 overflow-hidden ${showChart ? 'h-[85vh] md:h-[26rem]' : 'h-16'}`}>
+                            <div className={`bg-white/95 backdrop-blur-xl border border-emerald-100/50 rounded-[2rem] shadow-[0_10px_40px_rgba(0,0,0,0.15)] transition-all duration-700 overflow-hidden ${chartMinimized ? 'h-[3.5rem] md:h-[3.5rem]' : 'h-[85vh] md:h-[26rem]'}`}>
 
                                 {/* Header Toggle */}
-                                <div className="flex items-center justify-between px-4 md:px-5 py-4 md:py-3 cursor-pointer hover:bg-slate-50/50 transition-colors" onClick={() => setShowChart(!showChart)}>
+                                <div
+                                    className="flex items-center justify-between px-4 md:px-5 py-4 md:py-3 hover:bg-slate-50/50 transition-colors cursor-pointer"
+                                    onClick={() => setChartMinimized(!chartMinimized)}
+                                >
                                     <div className="flex items-center gap-2 md:gap-4 overflow-hidden">
                                         {!loading && (
                                             <div className="flex items-center gap-2 md:gap-3 animate-in fade-in duration-300 overflow-hidden">
@@ -2713,7 +3090,7 @@ const MainLayout = (props) => {
                                                         <ArrowLeft size={14} className="md:w-[16px] md:h-[16px]" />
                                                     </button>
                                                 )}
-                                                <div className={`p-1.5 md:p-2 rounded-xl shadow-sm transition-all duration-500 ${showChart ? 'bg-emerald-600 text-white rotate-0' : 'bg-white border border-slate-100 text-emerald-600 rotate-0'}`}>
+                                                <div className={`p-1.5 md:p-2 rounded-xl shadow-sm transition-all duration-500 bg-emerald-600 text-white rotate-0`}>
                                                     <BarChart3 size={16} className="md:w-[18px] md:h-[18px]" />
                                                 </div>
                                                 <div className="flex-1 min-w-0 flex flex-col justify-center">
@@ -2727,79 +3104,84 @@ const MainLayout = (props) => {
                                         )}
                                     </div>
 
-                                    <div className="flex items-center gap-2">
-                                        <div className={`p-1.5 md:p-2 rounded-full transition-transform duration-300 ${showChart ? 'rotate-180 bg-slate-100 text-slate-500' : 'rotate-0 text-emerald-500'}`}>
-                                            <ChevronUp size={16} className="md:w-[18px] md:h-[18px]" />
-                                        </div>
-                                    </div>
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); setChartMinimized(!chartMinimized); }}
+                                        className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-all shrink-0"
+                                        title={chartMinimized ? "Perbesar Panel" : "Perkecil Panel"}
+                                    >
+                                        {chartMinimized ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                                    </button>
+
                                 </div>
 
-                                {showChart && (
-                                    <div className="px-6 pb-5 h-[calc(100%-4rem)] animate-in fade-in slide-in-from-bottom-10 duration-700 overflow-y-auto">
-                                        {loading ? (
-                                            <div className="h-full flex flex-col items-center justify-center px-12 gap-8 animate-in fade-in duration-500">
-                                                <div className="w-full max-w-2xl space-y-4">
-                                                    <div className="flex items-center justify-between px-2">
-                                                        <div className="flex flex-col">
-                                                            <span className="text-[10px] font-black text-emerald-600 uppercase tracking-[0.2em] animate-pulse">
-                                                                {progressStep || "Sedang Memproses"}
-                                                            </span>
-                                                            <span className="text-sm font-black text-slate-800 tracking-tight">
-                                                                {progressDetail || "Menghubungkan ke satelit..."}
-                                                            </span>
-                                                        </div>
-                                                        <div className="flex items-end gap-1">
-                                                            <span className="text-3xl font-black text-emerald-600 tracking-tighter">{progress}</span>
-                                                            <span className="text-sm font-bold text-emerald-400 mb-1.5">%</span>
-                                                        </div>
-                                                    </div>
 
-                                                    <div className="relative h-4 w-full bg-slate-100 rounded-full overflow-hidden shadow-inner p-1 border border-slate-200/50">
-                                                        <div
-                                                            className="h-full bg-gradient-to-r from-emerald-400 via-emerald-600 to-teal-700 rounded-full transition-all duration-700 ease-out relative shadow-[0_0_20px_rgba(16,185,129,0.3)]"
-                                                            style={{ width: `${progress}%` }}
-                                                        >
-                                                            <div className="absolute top-0 right-0 bottom-0 w-24 bg-gradient-to-r from-transparent to-white/30 animate-shimmer" />
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="flex justify-between items-center px-2">
-                                                        <div className="flex items-center gap-2 opacity-40">
-                                                            <Satellite size={12} className="animate-bounce" />
-                                                            <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">Sentinel-2 Mission</span>
-                                                        </div>
-                                                        <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest italic flex items-center gap-1.5">
-                                                            {timeLeft !== null && timeLeft !== undefined ? (
-                                                                <>
-                                                                    <Clock size={10} className={timeLeft < 10 ? "text-amber-500 animate-pulse" : "text-slate-400"} />
-                                                                    {timeLeft > 0
-                                                                        ? `Estimasi Selesai: ~${timeLeft} detik`
-                                                                        : <span className="text-emerald-500 animate-pulse">Sedikit lagi... Finalisasi data...</span>}
-                                                                </>
-                                                            ) : (
-                                                                "Harap tunggu, komputasi Cloud GEE sedang berjalan..."
-                                                            )}
+                                <div className="px-6 pb-5 h-[calc(100%-4rem)] animate-in fade-in slide-in-from-bottom-10 duration-700 overflow-y-auto">
+                                    {loading ? (
+                                        <div className="h-full flex flex-col items-center justify-center px-12 gap-8 animate-in fade-in duration-500">
+                                            <div className="w-full max-w-2xl space-y-4">
+                                                <div className="flex items-center justify-between px-2">
+                                                    <div className="flex flex-col">
+                                                        <span className="text-[10px] font-black text-emerald-600 uppercase tracking-[0.2em] animate-pulse">
+                                                            {progressStep || "Sedang Memproses"}
+                                                        </span>
+                                                        <span className="text-sm font-black text-slate-800 tracking-tight">
+                                                            {progressDetail || "Menghubungkan ke satelit..."}
                                                         </span>
                                                     </div>
+                                                    <div className="flex items-end gap-1">
+                                                        <span className="text-3xl font-black text-emerald-600 tracking-tighter">{progress}</span>
+                                                        <span className="text-sm font-bold text-emerald-400 mb-1.5">%</span>
+                                                    </div>
+                                                </div>
+
+                                                <div className="relative h-4 w-full bg-slate-100 rounded-full overflow-hidden shadow-inner p-1 border border-slate-200/50">
+                                                    <div
+                                                        className="h-full bg-gradient-to-r from-emerald-400 via-emerald-600 to-teal-700 rounded-full transition-all duration-700 ease-out relative shadow-[0_0_20px_rgba(16,185,129,0.3)]"
+                                                        style={{ width: `${progress}%` }}
+                                                    >
+                                                        <div className="absolute top-0 right-0 bottom-0 w-24 bg-gradient-to-r from-transparent to-white/30 animate-shimmer" />
+                                                    </div>
+                                                </div>
+
+                                                <div className="flex justify-between items-center px-2">
+                                                    <div className="flex items-center gap-2 opacity-40">
+                                                        <Satellite size={12} className="animate-bounce" />
+                                                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">Sentinel-2 Mission</span>
+                                                    </div>
+                                                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest italic flex items-center gap-1.5">
+                                                        {timeLeft !== null && timeLeft !== undefined ? (
+                                                            <>
+                                                                <Clock size={10} className={timeLeft < 10 ? "text-amber-500 animate-pulse" : "text-slate-400"} />
+                                                                {timeLeft > 0
+                                                                    ? `Estimasi Selesai: ~${timeLeft} detik`
+                                                                    : <span className="text-emerald-500 animate-pulse">Sedikit lagi... Finalisasi data...</span>}
+                                                            </>
+                                                        ) : (
+                                                            "Harap tunggu, komputasi Cloud GEE sedang berjalan..."
+                                                        )}
+                                                    </span>
                                                 </div>
                                             </div>
-                                        ) : (
-                                            <div className="h-full flex flex-col">
-                                                {/* Tab Switcher */}
-                                                {/* Tab Switcher & Year Selector Header */}
-                                                <div className="flex justify-between items-center px-1 mb-2 border-b border-slate-100/50 pb-2 shrink-0">
-                                                    <div className="flex gap-2">
-                                                        {showAllPins && (
-                                                            <button
-                                                                onClick={() => setChartTab('summary')}
-                                                                className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'summary'
-                                                                    ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100 shadow-sm'
-                                                                    : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
-                                                                    }`}
-                                                            >
-                                                                <Grid size={12} /> Ringkasan Data
-                                                            </button>
-                                                        )}
+                                        </div>
+                                    ) : (
+                                        <div className="h-full flex flex-col">
+                                            {/* Tab Switcher */}
+                                            {/* Tab Switcher & Year Selector Header */}
+                                            <div className="flex justify-between items-center px-1 mb-2 border-b border-slate-100/50 pb-2 shrink-0">
+                                                <div className="flex gap-2">
+                                                    {showAllPins && (
+                                                        <button
+                                                            onClick={() => setChartTab('summary')}
+                                                            className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'summary'
+                                                                ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100 shadow-sm'
+                                                                : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
+                                                                }`}
+                                                        >
+                                                            <Grid size={12} /> Ringkasan Data
+                                                        </button>
+                                                    )}
+
+                                                    {!showAllPins && (
                                                         <button
                                                             onClick={() => setChartTab('bar')}
                                                             className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'bar'
@@ -2807,288 +3189,380 @@ const MainLayout = (props) => {
                                                                 : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
                                                                 }`}
                                                         >
-                                                            <BarChart3 size={12} /> Grafik Batang
+                                                            <BarChart3 size={12} /> Chart
                                                         </button>
+                                                    )}
+
+                                                    {slopeDbSummary && (
                                                         <button
-                                                            onClick={() => setChartTab('area')}
-                                                            className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'area'
-                                                                ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100 shadow-sm'
+                                                            onClick={() => setChartTab('slope')}
+                                                            className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'slope'
+                                                                ? 'bg-orange-50 text-orange-600 ring-1 ring-orange-100 shadow-sm'
                                                                 : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
                                                                 }`}
                                                         >
-                                                            <Activity size={12} /> Area Akumulatif
+                                                            <TrendingUp size={12} /> Slope
                                                         </button>
+                                                    )}
 
-                                                        {slopeDbSummary && (
-                                                            <button
-                                                                onClick={() => setChartTab('slope')}
-                                                                className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'slope'
-                                                                    ? 'bg-orange-50 text-orange-600 ring-1 ring-orange-100 shadow-sm'
-                                                                    : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
-                                                                    }`}
-                                                            >
-                                                                <TrendingUp size={12} /> Slope
-                                                            </button>
-                                                        )}
-                                                    </div>
-
-
+                                                    {!showAllPins && (
+                                                        <button
+                                                            onClick={() => setShowNarrativeModal(true)}
+                                                            className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${chartTab === 'narrative'
+                                                                ? 'bg-blue-50 text-blue-600 ring-1 ring-blue-100 shadow-sm'
+                                                                : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'
+                                                                }`}
+                                                        >
+                                                            <FileText size={12} /> Ringkasan
+                                                        </button>
+                                                    )}
                                                 </div>
 
 
-                                                {/* Content Area */}
-                                                <div className="flex-1 min-h-0 overflow-hidden">
-                                                    {chartTab === 'summary' ? (
-                                                        <div className="h-full overflow-y-auto pr-1">
-                                                            <GlobalGridDashboard stats={globalStats} />
-                                                        </div>
-                                                    ) : chartTab === 'slope' ? (
-                                                        <div className="h-full overflow-y-auto pr-1 flex flex-col gap-4">
-                                                            <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest px-1">Statistik Kelerengan (Digital Elevation Model)</div>
+                                            </div>
 
-                                                            {/* Summary Comparison Card */}
-                                                            {slopeDbSummary && slopeDbSummaryOutside && (
-                                                                <div className="bg-gradient-to-r from-orange-50 to-blue-50 rounded-2xl p-4 border border-slate-100 shadow-sm">
-                                                                    <div className="flex items-center gap-2 mb-3">
-                                                                        <Info size={14} className="text-slate-500" />
-                                                                        <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">Ringkasan Perbandingan</span>
-                                                                    </div>
-                                                                    <div className="grid grid-cols-2 gap-4 text-center">
-                                                                        <div>
-                                                                            <div className="text-[9px] text-slate-400 uppercase font-bold">Dalam Kawasan</div>
-                                                                            <div className="text-lg font-black text-orange-600">{slopeDbSummary.avg_slope || 0}%</div>
-                                                                            <div className="text-[9px] text-slate-500">rerata kelerengan</div>
-                                                                        </div>
-                                                                        <div>
-                                                                            <div className="text-[9px] text-slate-400 uppercase font-bold">Buffer 2 KM</div>
-                                                                            <div className="text-lg font-black text-blue-600">{slopeDbSummaryOutside.avg_slope || 0}%</div>
-                                                                            <div className="text-[9px] text-slate-500">rerata kelerengan</div>
-                                                                        </div>
-                                                                    </div>
-                                                                    {(() => {
-                                                                        const diff = (Number(slopeDbSummary.avg_slope) || 0) - (Number(slopeDbSummaryOutside.avg_slope) || 0);
-                                                                        const isHigher = diff > 0;
-                                                                        return (
-                                                                            <div className="mt-3 pt-3 border-t border-slate-200/50 text-center">
-                                                                                <span className={`text-[10px] font-bold ${isHigher ? 'text-orange-600' : 'text-blue-600'}`}>
-                                                                                    Kawasan {isHigher ? 'lebih curam' : 'lebih landai'} {Math.abs(diff).toFixed(1)}% dari area buffer
-                                                                                </span>
-                                                                            </div>
-                                                                        );
-                                                                    })()}
+
+                                            {/* Content Area */}
+                                            <div className="flex-1 min-h-0 overflow-hidden">
+                                                {chartTab === 'summary' ? (
+                                                    <div className="h-full overflow-y-auto pr-1">
+                                                        <GlobalGridDashboard stats={globalStats} />
+
+                                                        {/* Export All Analysis Button */}
+
+                                                    </div>
+                                                ) : chartTab === 'slope' ? (
+                                                    <div className="h-full overflow-y-auto pr-1 flex flex-col gap-4">
+                                                        <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest px-1">Statistik Kelerengan (Digital Elevation Model)</div>
+
+                                                        {/* Summary Comparison Card */}
+                                                        {slopeDbSummary && slopeDbSummaryOutside && (
+                                                            <div className="bg-gradient-to-r from-orange-50 to-blue-50 rounded-2xl p-4 border border-slate-100 shadow-sm">
+                                                                <div className="flex items-center gap-2 mb-3">
+                                                                    <Info size={14} className="text-slate-500" />
+                                                                    <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">Ringkasan Perbandingan</span>
                                                                 </div>
-                                                            )}
-
-                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                                <SlopeDataPanel summary={slopeDbSummary} title="Dalam Kawasan" variant="inside" />
-                                                                {slopeDbSummaryOutside ? (
-                                                                    <SlopeDataPanel summary={slopeDbSummaryOutside} title="Buffer 2 KM" variant="outside" />
-                                                                ) : (
-                                                                    <div className="bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-6 flex flex-col items-center justify-center text-center">
-                                                                        <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 mb-3">
-                                                                            <Info size={20} />
-                                                                        </div>
-                                                                        <div className="text-[10px] font-bold text-slate-500 uppercase">Buffer 2 KM</div>
-                                                                        <p className="text-[9px] text-slate-400 mt-1 max-w-[200px]">Data buffer belum tersedia untuk wilayah ini.</p>
+                                                                <div className="grid grid-cols-2 gap-4 text-center">
+                                                                    <div>
+                                                                        <div className="text-[9px] text-slate-400 uppercase font-bold">Dalam Kawasan</div>
+                                                                        <div className="text-lg font-black text-orange-600">{slopeDbSummary.avg_slope || 0}%</div>
+                                                                        <div className="text-[9px] text-slate-500">rerata kelerengan</div>
                                                                     </div>
-                                                                )}
-                                                            </div>
-
-                                                            <div className="text-[9px] text-slate-400 italic text-center mt-2">
-                                                                Data slope diukur berdasarkan Topografi SRTM v3 dengan resolusi 30 meter.
-                                                            </div>
-                                                        </div>
-                                                    ) : (
-                                                        <div className="flex flex-col md:flex-row gap-4 h-full">
-
-                                                            <div className="flex-1 min-w-0 h-full shrink-0 min-h-[250px] md:min-h-0 relative">
-                                                                {chartTab === 'bar' ? (
-                                                                    <div className="h-full w-full relative group/chart">
-                                                                        <ResponsiveContainer width="100%" height="100%">
-                                                                            <BarChart data={activeChartData} barCategoryGap="15%" barGap={1} margin={{ top: 35, right: 10, left: -20, bottom: 0 }}>
-                                                                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                                                                                <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} dy={10} />
-                                                                                <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} padding={{ top: 30 }} />
-                                                                                <Tooltip
-                                                                                    cursor={{ fill: '#f8fafc' }}
-                                                                                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)', fontSize: '10px', padding: '8px' }}
-                                                                                    content={<CustomTooltip />}
-                                                                                />
-                                                                                {Object.entries(LAND_COVER_CONFIG).map(([key, config]) => (
-                                                                                    <Bar key={key} dataKey={key} name={config.shortLabel} fill={config.color} radius={[4, 4, 1, 1]}>
-                                                                                        <LabelList
-                                                                                            dataKey={key}
-                                                                                            position="top"
-                                                                                            formatter={(val) => {
-                                                                                                if (!val || val < 5) return '';
-                                                                                                return val.toFixed(1);
-                                                                                            }}
-                                                                                            style={{ fontSize: '9px', fontWeight: 'bold', fill: config.color }}
-                                                                                            dy={-3}
-                                                                                        />
-                                                                                    </Bar>
-                                                                                ))}
-
-                                                                            </BarChart>
-                                                                        </ResponsiveContainer>
-                                                                    </div>
-                                                                ) : (
-                                                                    <div className="h-full w-full relative group/chart">
-                                                                        <ResponsiveContainer width="100%" height="100%">
-                                                                            <AreaChart data={activeChartData} margin={{ top: 35, right: 10, left: -20, bottom: 0 }}>
-                                                                                <defs>
-                                                                                    <linearGradient id="colorHutanPrimer" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#006400" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#006400" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                    <linearGradient id="colorHutanSekunder" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#32CD32" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#32CD32" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                    <linearGradient id="colorKering" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#DAA520" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#DAA520" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                    <linearGradient id="colorKosong" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#D2691E" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#D2691E" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                    <linearGradient id="colorTerbangun" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#708090" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#708090" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                    <linearGradient id="colorAir" x1="0" y1="0" x2="0" y2="1">
-                                                                                        <stop offset="5%" stopColor="#1E90FF" stopOpacity={0.8} />
-                                                                                        <stop offset="95%" stopColor="#1E90FF" stopOpacity={0.1} />
-                                                                                    </linearGradient>
-                                                                                </defs>
-                                                                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                                                                                <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} dy={10} />
-                                                                                <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} padding={{ top: 30 }} />
-                                                                                <Tooltip
-                                                                                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)', fontSize: '10px', padding: '8px' }}
-                                                                                    content={<CustomTooltip />}
-                                                                                    cursor={{ stroke: '#94a3b8', strokeWidth: 1, strokeDasharray: '4 4' }}
-                                                                                />
-                                                                                {/* Stacked from Bottom to Top to match PDF visual logic */}
-                                                                                <Area type="monotone" dataKey="air" stackId="1" stroke="#1E90FF" fill="url(#colorAir)" name="Air (Sungai/Danau)" />
-                                                                                <Area type="monotone" dataKey="lahan_terbangun" stackId="1" stroke="#708090" fill="url(#colorTerbangun)" name="Lahan Terbangun (Urban)" />
-                                                                                <Area type="monotone" dataKey="tanah_kosong" stackId="1" stroke="#D2691E" fill="url(#colorKosong)" name="Tanah Kosong" />
-                                                                                <Area type="monotone" dataKey="tanah_kering" stackId="1" stroke="#DAA520" fill="url(#colorKering)" name="Tanah Kering" />
-                                                                                <Area type="monotone" dataKey="hutan_sekunder" stackId="1" stroke="#32CD32" fill="url(#colorHutanSekunder)" name="Hutan Sekunder" />
-                                                                                <Area type="monotone" dataKey="hutan_primer" stackId="1" stroke="#006400" fill="url(#colorHutanPrimer)" name="Hutan Primer" />
-                                                                            </AreaChart>
-                                                                        </ResponsiveContainer>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-
-
-                                                            <div className="w-full md:w-80 flex flex-col gap-2 py-1">
-
-                                                                {/* Total Area Display - Top Position */}
-                                                                <div className="flex justify-between items-center bg-slate-50 p-1.5 rounded-lg border border-slate-100">
-                                                                    <div className="flex items-center gap-2">
-                                                                        <Maximize size={12} className="text-slate-400" />
-                                                                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">Total Luas Wilayah</span>
-                                                                    </div>
-                                                                    <div className="flex items-baseline gap-1">
-                                                                        <span className="text-sm font-black text-slate-700">{(showAllPins && globalStats ? globalStats.totalHektar : activeStats?.total)?.toFixed(1) || '0'}</span>
-                                                                        <span className="text-[9px] font-bold text-slate-400 uppercase">Ha</span>
+                                                                    <div>
+                                                                        <div className="text-[9px] text-slate-400 uppercase font-bold">Buffer 2 KM</div>
+                                                                        <div className="text-lg font-black text-blue-600">{slopeDbSummaryOutside.avg_slope || 0}%</div>
+                                                                        <div className="text-[9px] text-slate-500">rerata kelerengan</div>
                                                                     </div>
                                                                 </div>
-
-                                                                {/* Trend Analysis Section */}
-                                                                {activeChartData.length > 1 && (() => {
-                                                                    const trendData = calculateTrends(activeChartData);
-                                                                    let narrative = generateVerbalNarrative(trendData);
-
-                                                                    // Override with Global Stats if in Global View to ensure consistency with Summary Tab
-                                                                    if (showAllPins && globalNarrative && globalStats) {
-                                                                        narrative = {
-                                                                            ...narrative,
-                                                                            highlight: globalNarrative,
-                                                                            status: {
-                                                                                type: globalStats.perubahanBersihHa < -0.1 ? 'error' : (globalStats.perubahanBersihHa > 0.1 ? 'success' : 'info')
-                                                                            }
-                                                                        };
-                                                                        // Override badge info to match global transition logic
-                                                                        trendData.trendInfo = {
-                                                                            label: globalStats.perubahanBersihHa < -0.1 ? 'Deforestasi Terdeteksi' : (globalStats.perubahanBersihHa > 0.1 ? 'Pemulihan Tutupan' : 'Stabil'),
-                                                                            color: globalStats.perubahanBersihHa < -0.1 ? 'bg-red-500 text-white shadow-sm shadow-red-200' : (globalStats.perubahanBersihHa > 0.1 ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-200' : 'bg-slate-500 text-white')
-                                                                        };
-                                                                    }
-
-                                                                    if (!trendData || !narrative) return null;
-
-                                                                    const statusColors = {
-                                                                        error: 'bg-red-50 text-red-700 border-red-100',
-                                                                        success: 'bg-emerald-50 text-emerald-700 border-emerald-100',
-                                                                        warning: 'bg-orange-50 text-orange-700 border-orange-100',
-                                                                        info: 'bg-slate-50 text-slate-700 border-slate-100'
-                                                                    };
-
+                                                                {(() => {
+                                                                    const diff = (Number(slopeDbSummary.avg_slope) || 0) - (Number(slopeDbSummaryOutside.avg_slope) || 0);
+                                                                    const isHigher = diff > 0;
                                                                     return (
-                                                                        <div className={`p-2 rounded-xl border ${statusColors[narrative.status.type]} flex flex-col gap-1`}>
-                                                                            <div className="flex items-center justify-between">
-                                                                                <span className="text-[9px] font-black uppercase tracking-wider flex items-center gap-1">
-                                                                                    <Activity size={10} /> {showAllPins ? 'Global' : 'Analisis Tren Tutupan'}
-                                                                                </span>
-                                                                                <span className={`px-1.5 py-0.5 rounded-full text-[7px] font-black uppercase ${trendData.trendInfo.color}`}>
-                                                                                    {trendData.trendInfo.label}
-                                                                                </span>
-                                                                            </div>
-                                                                            <div className="text-[10px] md:text-[11px] leading-tight font-bold text-slate-800">
-                                                                                {narrative.highlight}
-                                                                            </div>
-                                                                            <div className="text-[8px] opacity-70 italic">
-                                                                                Periode: {trendData.startYear} - {trendData.endYear} ({trendData.period} thn)
-                                                                            </div>
+                                                                        <div className="mt-3 pt-3 border-t border-slate-200/50 text-center">
+                                                                            <span className={`text-[10px] font-bold ${isHigher ? 'text-orange-600' : 'text-blue-600'}`}>
+                                                                                Kawasan {isHigher ? 'lebih curam' : 'lebih landai'} {Math.abs(diff).toFixed(1)}% dari area buffer
+                                                                            </span>
                                                                         </div>
                                                                     );
                                                                 })()}
+                                                            </div>
+                                                        )}
 
-                                                                {selectedYearData && chartTab === 'bar' && (
-                                                                    <div className="bg-white border border-slate-200 rounded-xl p-2 space-y-1.5 shadow-sm">
-                                                                        <div className="flex items-center gap-1.5 border-b border-slate-50 pb-1.5">
-                                                                            <Split size={12} className="text-emerald-600" />
-                                                                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Ringkasan Transisi ({selectedYear})</span>
-                                                                        </div>
-                                                                        <div className="grid grid-cols-1 gap-1.5">
-                                                                            <div className="flex items-center justify-between bg-red-50/50 p-1.5 rounded-lg border border-red-100/30">
-                                                                                <div className="flex items-center gap-2">
-                                                                                    <TrendingDown size={14} className="text-red-500" />
-                                                                                    <span className="text-[10px] font-bold text-slate-600">Kejadian Deforestasi</span>
-                                                                                </div>
-                                                                                <span className="text-[10px] font-black text-red-700">{(sidebarTransitionStats?.loss || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
-                                                                            </div>
-                                                                            <div className="flex items-center justify-between bg-emerald-50/50 p-1.5 rounded-lg border border-emerald-100/30">
-                                                                                <div className="flex items-center gap-2">
-                                                                                    <TrendingUp size={14} className="text-emerald-500" />
-                                                                                    <span className="text-[10px] font-bold text-slate-600">Pemulihan Tutupan</span>
-                                                                                </div>
-                                                                                <span className="text-[10px] font-black text-emerald-700">{(sidebarTransitionStats?.gain || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
-                                                                            </div>
-                                                                            <div className="flex items-center justify-between bg-slate-50/50 p-1.5 rounded-lg border border-slate-200/50">
-                                                                                <div className="flex items-center gap-2">
-                                                                                    <ImageIcon size={14} className="text-slate-500" />
-                                                                                    <span className="text-[10px] font-bold text-slate-600">Ekspansi Terbangun</span>
-                                                                                </div>
-                                                                                <span className="text-[10px] font-black text-slate-700">{(sidebarTransitionStats?.builtup || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
-                                                                            </div>
-                                                                        </div>
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                            <SlopeDataPanel summary={slopeDbSummary} title="Dalam Kawasan" variant="inside" />
+                                                            {slopeDbSummaryOutside ? (
+                                                                <SlopeDataPanel summary={slopeDbSummaryOutside} title="Buffer 2 KM" variant="outside" />
+                                                            ) : (
+                                                                <div className="bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-6 flex flex-col items-center justify-center text-center">
+                                                                    <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 mb-3">
+                                                                        <Info size={20} />
                                                                     </div>
-                                                                )}
+                                                                    <div className="text-[10px] font-bold text-slate-500 uppercase">Buffer 2 KM</div>
+                                                                    <p className="text-[9px] text-slate-400 mt-1 max-w-[200px]">Data buffer belum tersedia untuk wilayah ini.</p>
+                                                                </div>
+                                                            )}
+                                                        </div>
 
-
+                                                        <div className="text-[9px] text-slate-400 italic text-center mt-2">
+                                                            Data slope diukur berdasarkan Topografi SRTM v3 dengan resolusi 30 meter.
+                                                        </div>
+                                                    </div>
+                                                ) : chartTab === 'narrative' ? (
+                                                    <div className="h-full overflow-y-auto pr-1 flex flex-col gap-4 p-4">
+                                                        <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest flex items-center justify-between">
+                                                            <span>Ringkasan Narasi Analisis</span>
+                                                            <div className="flex items-center gap-1.5 text-emerald-600">
+                                                                <Sparkles size={10} />
+                                                                <span className="text-[8px]">AI Powered</span>
                                                             </div>
                                                         </div>
-                                                    )}
-                                                </div>
+
+                                                        {!smartNarrative ? (
+                                                            <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-3">
+                                                                <FileText size={32} className="opacity-20" />
+                                                                <p className="text-xs font-bold uppercase tracking-widest">Data Tidak Tersedia</p>
+                                                            </div>
+                                                        ) : (
+                                                            <>
+                                                                <div className="bg-blue-50 rounded-2xl p-4 border border-blue-100 shadow-sm animate-in fade-in slide-in-from-bottom duration-500">
+                                                                    <div className="flex items-center gap-2 mb-3 border-b border-blue-100 pb-2">
+                                                                        <Sparkles size={14} className="text-blue-600" />
+                                                                        <span className="text-[11px] font-black text-blue-700 uppercase tracking-wider">Ringkasan Eksekutif</span>
+                                                                    </div>
+                                                                    <p className="text-[11px] text-slate-700 leading-relaxed font-medium">
+                                                                        {smartNarrative.executiveSummary}
+                                                                    </p>
+                                                                </div>
+
+                                                                <div className="grid grid-cols-1 gap-4">
+                                                                    <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm hover:border-emerald-200 transition-colors">
+                                                                        <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                                                            <TrendingUp size={14} className="text-emerald-600" />
+                                                                            <span className="text-[11px] font-black text-slate-700 uppercase tracking-wider">Analisis Tren Tutupan</span>
+                                                                        </div>
+                                                                        <p className="text-[11px] text-slate-600 leading-relaxed">
+                                                                            {smartNarrative.trendNarrative}
+                                                                        </p>
+                                                                    </div>
+
+                                                                    <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm hover:border-orange-200 transition-colors">
+                                                                        <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                                                            <Flame size={14} className="text-orange-600" />
+                                                                            <span className="text-[11px] font-black text-slate-700 uppercase tracking-wider">Analisis Hotspot (NASA FIRMS)</span>
+                                                                        </div>
+                                                                        <p className="text-[11px] text-slate-600 leading-relaxed">
+                                                                            {smartNarrative.hotspotNarrative}
+                                                                        </p>
+                                                                    </div>
+
+                                                                    <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm hover:border-blue-200 transition-colors">
+                                                                        <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                                                            <Layers size={14} className="text-blue-600" />
+                                                                            <span className="text-[11px] font-black text-slate-700 uppercase tracking-wider">Karakteristik Medan (Terrain)</span>
+                                                                        </div>
+                                                                        <p className="text-[11px] text-slate-600 leading-relaxed">
+                                                                            {smartNarrative.terrainNarrative}
+                                                                        </p>
+                                                                    </div>
+                                                                </div>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <div className="flex flex-col md:flex-row gap-4 h-full">
+
+                                                        <div className="flex-1 min-w-0 h-full shrink-0 min-h-[250px] md:min-h-0 relative">
+                                                            {!activeChartData || activeChartData.length === 0 ? (
+                                                                <div className="h-full w-full flex flex-col items-center justify-center gap-4 text-center px-8">
+                                                                    <div className="w-16 h-16 rounded-2xl bg-slate-100 flex items-center justify-center">
+                                                                        {(loadingHistory || loadingChartData) ? (
+                                                                            <RefreshCw size={32} className="text-slate-400 animate-spin" />
+                                                                        ) : (
+                                                                            <BarChart3 size={32} className="text-slate-300" />
+                                                                        )}
+                                                                    </div>
+                                                                    <div>
+                                                                        <p className="text-sm font-bold text-slate-600 mb-1">
+                                                                            {(loadingHistory || loadingChartData) ? 'Memuat Data...' : 'Belum Ada Data Analisis'}
+                                                                        </p>
+                                                                        <p className="text-xs text-slate-400">
+                                                                            {(loadingHistory || loadingChartData)
+                                                                                ? 'Sedang mengambil data dari database'
+                                                                                : showAllPins
+                                                                                    ? 'Upload file KPS untuk memulai analisis'
+                                                                                    : 'Silakan upload file KPS terlebih dahulu'}
+                                                                        </p>
+                                                                    </div>
+                                                                </div>
+                                                            ) : (
+                                                                <div className="h-full w-full relative group/chart">
+                                                                    <ResponsiveContainer width="100%" height="100%">
+                                                                        <BarChart data={activeChartData} barCategoryGap="15%" barGap={1} margin={{ top: 35, right: 10, left: -20, bottom: 0 }}>
+                                                                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                                                                            <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} dy={10} />
+                                                                            <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 600, fill: '#94a3b8' }} padding={{ top: 30 }} />
+                                                                            <Tooltip
+                                                                                cursor={{ fill: '#f8fafc' }}
+                                                                                contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)', fontSize: '10px', padding: '8px' }}
+                                                                                content={<CustomTooltip />}
+                                                                            />
+                                                                            {Object.entries(LAND_COVER_CONFIG).map(([key, config]) => (
+                                                                                <Bar key={key} dataKey={key} name={config.shortLabel} fill={config.color} radius={[4, 4, 1, 1]}>
+                                                                                    <LabelList
+                                                                                        dataKey={key}
+                                                                                        position="top"
+                                                                                        formatter={(val) => {
+                                                                                            if (!val || val < 5) return '';
+                                                                                            return val.toFixed(1);
+                                                                                        }}
+                                                                                        style={{ fontSize: '9px', fontWeight: 'bold', fill: config.color }}
+                                                                                        dy={-3}
+                                                                                    />
+                                                                                </Bar>
+                                                                            ))}
+
+                                                                        </BarChart>
+                                                                    </ResponsiveContainer>
+                                                                </div>
+                                                            )}
+                                                        </div>
+
+
+                                                        <div className="w-full md:w-80 flex flex-col gap-2 py-1">
+
+                                                            {/* Total Area Display - Top Position */}
+                                                            <div className="flex justify-between items-center bg-slate-50 p-1.5 rounded-lg border border-slate-100">
+                                                                <div className="flex items-center gap-2">
+                                                                    <Maximize size={12} className="text-slate-400" />
+                                                                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">Total Luas Wilayah</span>
+                                                                </div>
+                                                                <div className="flex items-baseline gap-1">
+                                                                    <span className="text-sm font-black text-slate-700">{(showAllPins && globalStats ? globalStats.totalHektar : activeStats?.total)?.toFixed(1) || '0'}</span>
+                                                                    <span className="text-[9px] font-bold text-slate-400 uppercase">Ha</span>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Trend Analysis Section */}
+                                                            {activeChartData?.length > 1 && (() => {
+                                                                const trendData = calculateTrends(activeChartData);
+                                                                let narrative = generateVerbalNarrative(trendData);
+
+                                                                // Override with Global Stats if in Global View to ensure consistency with Summary Tab
+                                                                if (showAllPins && globalNarrative && globalStats) {
+                                                                    narrative = {
+                                                                        ...narrative,
+                                                                        highlight: globalNarrative,
+                                                                        status: {
+                                                                            type: globalStats.perubahanBersihHa < -0.1 ? 'error' : (globalStats.perubahanBersihHa > 0.1 ? 'success' : 'info')
+                                                                        }
+                                                                    };
+                                                                    // Override badge info to match global transition logic
+                                                                    trendData.trendInfo = {
+                                                                        label: globalStats.perubahanBersihHa < -0.1 ? 'Deforestasi Terdeteksi' : (globalStats.perubahanBersihHa > 0.1 ? 'Pemulihan Tutupan' : 'Stabil'),
+                                                                        color: globalStats.perubahanBersihHa < -0.1 ? 'bg-red-500 text-white shadow-sm shadow-red-200' : (globalStats.perubahanBersihHa > 0.1 ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-200' : 'bg-slate-500 text-white')
+                                                                    };
+                                                                }
+
+                                                                if (!trendData || !narrative) return null;
+
+                                                                const statusColors = {
+                                                                    error: 'bg-red-50 text-red-700 border-red-100',
+                                                                    success: 'bg-emerald-50 text-emerald-700 border-emerald-100',
+                                                                    warning: 'bg-orange-50 text-orange-700 border-orange-100',
+                                                                    info: 'bg-slate-50 text-slate-700 border-slate-100'
+                                                                };
+
+                                                                return (
+                                                                    <div className={`p-2 rounded-xl border ${statusColors[narrative.status.type]} flex flex-col gap-1`}>
+                                                                        <div className="flex items-center justify-between">
+                                                                            <span className="text-[9px] font-black uppercase tracking-wider flex items-center gap-1">
+                                                                                <Activity size={10} /> {showAllPins ? 'Global' : 'Analisis Tren Tutupan'}
+                                                                            </span>
+                                                                            <span className={`px-1.5 py-0.5 rounded-full text-[7px] font-black uppercase ${trendData.trendInfo.color}`}>
+                                                                                {trendData.trendInfo.label}
+                                                                            </span>
+                                                                        </div>
+                                                                        <div className="text-[10px] md:text-[11px] leading-tight font-bold text-slate-800">
+                                                                            {narrative.highlight}
+                                                                        </div>
+                                                                        <div className="text-[8px] opacity-70 italic">
+                                                                            Periode: {trendData.startYear} - {trendData.endYear} ({trendData.period} thn)
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })()}
+
+                                                            {selectedYearData && chartTab === 'bar' && (
+                                                                <div className="bg-white border border-slate-200 rounded-xl p-2 space-y-1.5 shadow-sm">
+                                                                    <div className="flex items-center gap-1.5 border-b border-slate-50 pb-1.5">
+                                                                        <Split size={12} className="text-emerald-600" />
+                                                                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Ringkasan Transisi ({selectedYear})</span>
+                                                                    </div>
+                                                                    <div className="grid grid-cols-1 gap-1.5">
+                                                                        <div className="flex items-center justify-between bg-red-50/50 p-1.5 rounded-lg border border-red-100/30">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <TrendingDown size={14} className="text-red-500" />
+                                                                                <span className="text-[10px] font-bold text-slate-600">Kejadian Deforestasi</span>
+                                                                            </div>
+                                                                            <span className="text-[10px] font-black text-red-700">{(sidebarTransitionStats?.loss || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
+                                                                        </div>
+                                                                        <div className="flex items-center justify-between bg-emerald-50/50 p-1.5 rounded-lg border border-emerald-100/30">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <TrendingUp size={14} className="text-emerald-500" />
+                                                                                <span className="text-[10px] font-bold text-slate-600">Pemulihan Tutupan</span>
+                                                                            </div>
+                                                                            <span className="text-[10px] font-black text-emerald-700">{(sidebarTransitionStats?.gain || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
+                                                                        </div>
+                                                                        <div className="flex items-center justify-between bg-slate-50/50 p-1.5 rounded-lg border border-slate-200/50">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <ImageIcon size={14} className="text-slate-500" />
+                                                                                <span className="text-[10px] font-bold text-slate-600">Ekspansi Terbangun</span>
+                                                                            </div>
+                                                                            <span className="text-[10px] font-black text-slate-700">{(sidebarTransitionStats?.builtup || 0).toFixed(1)} <span className="text-[8px] font-bold opacity-60 uppercase">Ha</span></span>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Re-trigger Background Tasks */}
+                                                            {!showAllPins && file?.id && (
+                                                                <div className="border-t border-slate-100 pt-2 mt-1">
+                                                                    <div className="text-[8px] font-bold text-slate-400 uppercase tracking-widest mb-1.5">Perbarui Data</div>
+                                                                    <div className="flex gap-1.5">
+                                                                        <button
+                                                                            onClick={() => handleRetriggerData('hotspot')}
+                                                                            disabled={!!retriggerLoading}
+                                                                            className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[9px] font-bold transition-all ${retriggerLoading === 'hotspot' || retriggerLoading === 'both'
+                                                                                ? 'bg-orange-100 text-orange-500 cursor-wait'
+                                                                                : 'bg-slate-50 hover:bg-orange-50 text-slate-500 hover:text-orange-600 border border-slate-200 hover:border-orange-200'
+                                                                                }`}
+                                                                            title="Perbarui data hotspot dari NASA FIRMS"
+                                                                        >
+                                                                            {retriggerLoading === 'hotspot' || retriggerLoading === 'both'
+                                                                                ? <RefreshCw size={10} className="animate-spin" />
+                                                                                : <Flame size={10} />}
+                                                                            Hotspot
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => handleRetriggerData('slope')}
+                                                                            disabled={!!retriggerLoading}
+                                                                            className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[9px] font-bold transition-all ${retriggerLoading === 'slope' || retriggerLoading === 'both'
+                                                                                ? 'bg-orange-100 text-orange-500 cursor-wait'
+                                                                                : 'bg-slate-50 hover:bg-orange-50 text-slate-500 hover:text-orange-600 border border-slate-200 hover:border-orange-200'
+                                                                                }`}
+                                                                            title="Perbarui analisis slope/kelerengan"
+                                                                        >
+                                                                            {retriggerLoading === 'slope' || retriggerLoading === 'both'
+                                                                                ? <RefreshCw size={10} className="animate-spin" />
+                                                                                : <TrendingUp size={10} />}
+                                                                            Slope
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => handleRetriggerData('both')}
+                                                                            disabled={!!retriggerLoading}
+                                                                            className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[9px] font-bold transition-all ${retriggerLoading === 'both'
+                                                                                ? 'bg-emerald-100 text-emerald-500 cursor-wait'
+                                                                                : 'bg-slate-50 hover:bg-emerald-50 text-slate-500 hover:text-emerald-600 border border-slate-200 hover:border-emerald-200'
+                                                                                }`}
+                                                                            title="Perbarui semua data (hotspot + slope)"
+                                                                        >
+                                                                            {retriggerLoading === 'both'
+                                                                                ? <RefreshCw size={10} className="animate-spin" />
+                                                                                : <RefreshCw size={10} />}
+                                                                            Semua
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
-                                        )}
-                                    </div>
-                                )}
+                                        </div>
+                                    )}
+                                </div>
+
                             </div>
                         </div>
                     )
@@ -3098,6 +3572,107 @@ const MainLayout = (props) => {
             </main >
 
 
+            {/* Smart Narrative Modal */}
+            {showNarrativeModal && smartNarrative && (
+                <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+                    onClick={() => setShowNarrativeModal(false)}>
+                    <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+                        onClick={(e) => e.stopPropagation()}>
+
+                        {/* Header */}
+                        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 bg-gradient-to-r from-blue-50 to-white">
+                            <div className="flex items-center gap-3">
+                                <div className="p-2 bg-blue-600 rounded-lg">
+                                    <FileText size={20} className="text-white" />
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-black text-slate-800">Ringkasan Narasi Analisis</h2>
+                                    <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                                        <Sparkles size={10} className="text-emerald-500" />
+                                        AI-Powered Smart Narrative
+                                    </p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={() => setShowNarrativeModal(false)}
+                                className="p-2 hover:bg-slate-100 rounded-lg transition-colors"
+                            >
+                                <X size={20} className="text-slate-500" />
+                            </button>
+                        </div>
+
+                        {/* Content */}
+                        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                            {/* Executive Summary */}
+                            <div className="bg-blue-50 rounded-xl p-4 border border-blue-100">
+                                <div className="flex items-center gap-2 mb-3 border-b border-blue-200 pb-2">
+                                    <Sparkles size={16} className="text-blue-600" />
+                                    <h3 className="text-sm font-black text-blue-700 uppercase tracking-wide">Ringkasan Eksekutif</h3>
+                                </div>
+                                <p className="text-sm text-slate-700 leading-relaxed">
+                                    {smartNarrative.executiveSummary}
+                                </p>
+                            </div>
+
+                            {/* Trend */}
+                            <div className="bg-white rounded-xl p-4 border border-slate-200">
+                                <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                    <TrendingUp size={16} className="text-emerald-600" />
+                                    <h3 className="text-sm font-black text-slate-700 uppercase tracking-wide">Analisis Tren Tutupan</h3>
+                                </div>
+                                <p className="text-sm text-slate-600 leading-relaxed">
+                                    {smartNarrative.trendNarrative}
+                                </p>
+                            </div>
+
+                            {/* Hotspot */}
+                            <div className="bg-white rounded-xl p-4 border border-slate-200">
+                                <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                    <Flame size={16} className="text-orange-600" />
+                                    <h3 className="text-sm font-black text-slate-700 uppercase tracking-wide">Analisis Hotspot (NASA FIRMS)</h3>
+                                </div>
+                                <p className="text-sm text-slate-600 leading-relaxed">
+                                    {smartNarrative.hotspotNarrative}
+                                </p>
+                            </div>
+
+                            {/* Terrain */}
+                            <div className="bg-white rounded-xl p-4 border border-slate-200">
+                                <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
+                                    <Layers size={16} className="text-blue-600" />
+                                    <h3 className="text-sm font-black text-slate-700 uppercase tracking-wide">Karakteristik Medan (Terrain)</h3>
+                                </div>
+                                <p className="text-sm text-slate-600 leading-relaxed">
+                                    {smartNarrative.terrainNarrative}
+                                </p>
+                            </div>
+                        </div>
+
+                        {/* Footer with Copy Button */}
+                        <div className="px-6 py-4 border-t border-slate-200 bg-slate-50">
+                            <button
+                                onClick={handleCopyNarrative}
+                                className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-all ${narrativeCopied
+                                    ? 'bg-emerald-500 text-white'
+                                    : 'bg-blue-600 hover:bg-blue-700 text-white active:scale-95'
+                                    }`}
+                            >
+                                {narrativeCopied ? (
+                                    <>
+                                        <Check size={18} />
+                                        Berhasil Disalin!
+                                    </>
+                                ) : (
+                                    <>
+                                        <Copy size={18} />
+                                        Salin Ringkasan
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div >
     );
 };

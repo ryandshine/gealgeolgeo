@@ -2,19 +2,22 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useMap, useMapEvents, Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet-side-by-side';
-import { SIGAP_CONFIG } from './constants';
+import { SIGAP_CONFIG, API_URL } from './constants';
+import { resolveThumbUrl } from './utils/analysisUtils';
+
 // Map Components
 // Map Components
 export const MapRecenter = ({ data, uniqueKey }) => {
     const map = useMap();
     const isFirstLoad = useRef(true);
     const lastKey = useRef(uniqueKey);
+    const lastDataType = useRef(null);
     const hasInteracted = useRef(false);
+    const isAutoZooming = useRef(false);
 
     useEffect(() => {
         const onInteraction = () => {
-            if (!isFirstLoad.current && !hasInteracted.current) {
-                console.log('📍 MapRecenter: Manual Interaction detected - Auto-zoom disabled');
+            if (!isFirstLoad.current && !hasInteracted.current && !isAutoZooming.current) {
                 hasInteracted.current = true;
             }
         };
@@ -29,28 +32,37 @@ export const MapRecenter = ({ data, uniqueKey }) => {
     }, [map]);
 
     useEffect(() => {
-        // Reset if key changed (new file loaded)
         if (uniqueKey !== lastKey.current) {
-            console.log('🚩 MapRecenter: UniqueKey changed - Resetting state', { from: lastKey.current, to: uniqueKey });
             isFirstLoad.current = true;
             hasInteracted.current = false;
+            lastDataType.current = null;
             lastKey.current = uniqueKey;
         }
 
-        if (data && isFirstLoad.current && !hasInteracted.current) {
-            console.log('📐 MapRecenter: Performing initial zoom to data');
+        if (!data || hasInteracted.current) return;
+
+        // Detect data type: Point (centroid) vs Polygon/MultiPolygon (full geometry)
+        const currentType = data?.type === 'Point' ? 'point'
+            : (data?.type === 'FeatureCollection' || data?.type === 'Polygon' || data?.type === 'MultiPolygon' || data?.features) ? 'polygon'
+            : 'other';
+
+        // Zoom jika: pertama kali ATAU upgrade dari Point ke Polygon (full geo loaded)
+        const shouldZoom = isFirstLoad.current || (lastDataType.current === 'point' && currentType === 'polygon');
+
+        if (shouldZoom) {
             try {
                 const geojsonLayer = L.geoJSON(data);
                 const bounds = geojsonLayer.getBounds();
                 if (bounds.isValid()) {
+                    isAutoZooming.current = true;
                     map.fitBounds(bounds, { padding: [100, 100], maxZoom: 16 });
+                    setTimeout(() => { isAutoZooming.current = false; }, 500);
                     isFirstLoad.current = false;
-                    console.log('✅ MapRecenter: Zoom complete - firstLoad set to false');
                 }
-            } catch (err) { console.error('Error:', err); }
-        } else if (hasInteracted.current) {
-            console.log('🚫 MapRecenter: Auto-zoom skipped (user has interacted)');
+            } catch (err) { console.error('MapRecenter error:', err); }
         }
+
+        lastDataType.current = currentType;
     }, [data, map, uniqueKey]);
 
     return null;
@@ -85,7 +97,8 @@ const injectMapPerformanceStyles = () => {
 
 // Dynamic TileLayer that responds to opacity changes
 // Updated to strictly recreate layer on URL change to prevent "stacking" of old tiles
-export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIndex = 10 }) => {
+// Supports localTileUrl for cache-first tile serving with GEE fallback
+export const DynamicTileLayer = ({ url, localTileUrl, opacity, show, pane = 'overlayPane', zIndex = 10 }) => {
     const map = useMap();
     const layerRef = useRef(null);
 
@@ -96,21 +109,61 @@ export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIn
 
     // 1. Manage Layer Lifecycle (Create / Destroy)
     useEffect(() => {
-        if (!show || !url) {
+        if (!show || (!url && !localTileUrl)) {
             return;
         }
 
-        // Create new layer
-        const layer = L.tileLayer(url, {
-            opacity: opacity, // Initial opacity
-            pane: pane,
-            zIndex: zIndex,
-            maxNativeZoom: 18,
-            maxZoom: 18,
-            keepBuffer: 3,     // Optimal buffer for smooth zoom
-            updateWhenZooming: false, // Don't update tiles during zoom animation
-            updateWhenIdle: true,     // Update tiles after zoom completes
-        });
+        let layer;
+
+        if (localTileUrl && url) {
+            // Cache-first: use custom TileLayer that tries local first, falls back to GEE
+            const CacheTileLayer = L.TileLayer.extend({
+                createTile: function(coords, done) {
+                    const tile = document.createElement('img');
+                    tile.alt = '';
+                    tile.setAttribute('role', 'presentation');
+
+                    const localSrc = L.Util.template(localTileUrl, {
+                        ...coords, z: coords.z, x: coords.x, y: coords.y
+                    });
+                    const geeSrc = L.Util.template(url, {
+                        ...coords, z: coords.z, x: coords.x, y: coords.y
+                    });
+
+                    tile.onload = function() { done(null, tile); };
+                    tile.onerror = function() {
+                        // Local tile not found, fallback to GEE
+                        tile.onerror = function() { done(new Error('Both tile sources failed'), tile); };
+                        tile.src = geeSrc;
+                    };
+                    tile.src = localSrc;
+                    return tile;
+                }
+            });
+
+            layer = new CacheTileLayer(localTileUrl, {
+                opacity: opacity,
+                pane: pane,
+                zIndex: zIndex,
+                maxNativeZoom: MAX_ZOOM_TILES,
+                maxZoom: 18,
+                keepBuffer: 3,
+                updateWhenZooming: false,
+                updateWhenIdle: true,
+            });
+        } else {
+            // Standard tile layer (GEE only or local only)
+            layer = L.tileLayer(localTileUrl || url, {
+                opacity: opacity,
+                pane: pane,
+                zIndex: zIndex,
+                maxNativeZoom: 18,
+                maxZoom: 18,
+                keepBuffer: 3,
+                updateWhenZooming: false,
+                updateWhenIdle: true,
+            });
+        }
 
         layer.addTo(map);
         layerRef.current = layer;
@@ -124,7 +177,7 @@ export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIn
         };
         // Dependencies: Re-run only when critical identity props change.
         // We exclude opacity/zIndex to prevent recreation (handled by 2nd effect)
-    }, [url, show, map, pane]);
+    }, [url, localTileUrl, show, map, pane]);
 
     // 2. Handle Dynamic Updates (Opacity / ZIndex) without recreation
     useEffect(() => {
@@ -136,6 +189,9 @@ export const DynamicTileLayer = ({ url, opacity, show, pane = 'overlayPane', zIn
 
     return null;
 };
+
+// Max zoom level for locally cached tiles
+const MAX_ZOOM_TILES = 15;
 
 // SideBySide Component
 export const SwipeMapControl = ({ leftUrl, rightUrl, show }) => {
@@ -353,134 +409,193 @@ export const IdentifySigapFeatures = ({ activeLayers, onResult }) => {
     return null;
 };
 
-// Custom Pins Manager Component
-export const CustomPinsManager = ({ pins, isAddingPin, onAddPin, onDeletePin, onUpdatePin }) => {
-    const map = useMap();
-    const [editingPinId, setEditingPinId] = useState(null);
-    const [editLabel, setEditLabel] = useState('');
 
-    // Handle map click to add new pin
-    useMapEvents({
-        click(e) {
-            if (isAddingPin) {
-                const label = prompt('Masukkan label untuk pin (opsional):');
-                if (label !== null) { // User didn't cancel
-                    onAddPin(e.latlng, label || '');
+
+// History Pins Layer - Visualizes analyzed locations
+export const HistoryPinsLayer = ({ historyData, onSelect }) => {
+    // Deduplicate history items by geometry to avoid stacked pins
+    // Choose the most recent one for metadata
+    const uniqueLocations = React.useMemo(() => {
+        if (!historyData || historyData.length === 0) {
+            return [];
+        }
+
+        const locMap = new Map();
+
+        historyData.forEach((item, idx) => {
+            try {
+                // ⚡ OPTIMIZATION: Use pre-calculated center from database
+                // Eliminates need to parse GeoJSON polygon for every pin
+                let center;
+
+                if (item.center_lat != null && item.center_lng != null) {
+                    // ✅ Use pre-calculated center from database (instant!)
+                    center = { lat: item.center_lat, lng: item.center_lng };
+                } else if (item.geo_data?.type === 'Point') {
+                    // Fallback 1: Already a Point (optimized API response)
+                    center = { lat: item.geo_data.coordinates[1], lng: item.geo_data.coordinates[0] };
+                } else if (item.geo_data) {
+                    // Fallback 2: Full polygon parsing (expensive, only for legacy data)
+                    console.warn(`⚠️ Item ${item.filename} missing center_lat/center_lng, falling back to GeoJSON parsing`);
+                    try {
+                        // Normalize: if geo_data is raw geometry (no type=Feature/FeatureCollection), wrap it
+                        let geoInput = item.geo_data;
+                        const gType = geoInput?.type;
+                        if (gType && gType !== 'Feature' && gType !== 'FeatureCollection') {
+                            geoInput = { type: 'Feature', geometry: geoInput, properties: {} };
+                        }
+                        const layer = L.geoJSON(geoInput);
+                        const bounds = layer.getBounds();
+                        if (!bounds.isValid()) return;
+                        center = bounds.getCenter();
+                    } catch (geoErr) {
+                        console.warn(`⚠️ GeoJSON parse failed for ${item.filename}:`, geoErr.message);
+                        return;
+                    }
+                } else {
+                    // No valid location data
+                    console.warn(`⚠️ Item ${item.filename} has no location data (no center_lat/center_lng or geo_data)`);
+                    return;
                 }
+
+                if (!center) return;
+                center = { lat: Number(center.lat), lng: Number(center.lng) };
+                if (!Number.isFinite(center.lat) || !Number.isFinite(center.lng)) return;
+
+                const key = `${center.lat.toFixed(4)},${center.lng.toFixed(4)}`;
+
+                // If not exists or this item is newer, update
+                if (!locMap.has(key) || new Date(item.created_at) > new Date(locMap.get(key).created_at)) {
+                    locMap.set(key, { ...item, center });
+                }
+            } catch (e) {
+                console.error(`Error processing geometry for item ${idx}:`, e);
             }
-        }
-    });
-
-    // Change cursor when in adding mode
-    useEffect(() => {
-        if (isAddingPin) {
-            map.getContainer().style.cursor = 'crosshair';
-        } else {
-            map.getContainer().style.cursor = '';
-        }
-    }, [isAddingPin, map]);
-
-    // Create custom marker icon
-    const createCustomPinIcon = (label) => {
-        return L.divIcon({
-            className: 'custom-pin-marker',
-            html: `
-                <div style="position: relative;">
-                    <svg width="32" height="40" viewBox="0 0 32 40" style="filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));">
-                        <path d="M16 0C7.163 0 0 7.163 0 16c0 8.837 16 24 16 24s16-15.163 16-24C32 7.163 24.837 0 16 0z" fill="#ef4444"/>
-                        <circle cx="16" cy="16" r="6" fill="white"/>
-                    </svg>
-                    ${label ? `<div style="position: absolute; top: 42px; left: 50%; transform: translateX(-50%); background: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 1px 3px rgba(0,0,0,0.2);">${label}</div>` : ''}
-                </div>
-            `,
-            iconSize: [32, 40],
-            iconAnchor: [16, 40],
-            popupAnchor: [0, -40]
         });
-    };
+
+        return Array.from(locMap.values());
+    }, [historyData]);
+
+    const validLocations = React.useMemo(() => {
+        return uniqueLocations.filter(item => {
+            const lat = Number(item.center?.lat);
+            const lng = Number(item.center?.lng);
+            return Number.isFinite(lat) && Number.isFinite(lng);
+        });
+    }, [uniqueLocations]);
+
+    const createHistoryIcon = (label, thumbUrl, color = '#10b981') => L.divIcon({
+        className: 'history-pin-marker',
+        html: `
+            <div style="position: relative; display: flex; flex-direction: column; align-items: center;">
+                <div style="background: ${color}; opacity: 0.9; backdrop-filter: blur(4px); border: 2px solid white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                </div>
+                <div style="width: 2px; height: 10px; background: ${color}; opacity: 0.6;"></div>
+                <div style="width: 8px; height: 4px; background: rgba(0,0,0,0.2); border-radius: 50%;"></div>
+
+                ${label ? `
+                <div style="position: absolute; left: 16px; top: 0px; background: white; padding: 4px 10px; border-radius: 20px; font-size: 10px; font-weight: 800; white-space: nowrap; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); color: ${color}; border: 1px solid #E2E8F0; z-index: 50; display: flex; items-center; gap: 4px; transform: translateX(10px);">
+
+                   <span>${label}</span>
+                </div>
+                ` : ''}
+            </div>
+        `,
+        iconSize: [24, 40],
+        iconAnchor: [12, 40],
+        popupAnchor: [0, -40]
+    });
 
     return (
         <>
-            {pins.map(pin => (
-                <Marker
-                    key={pin.id}
-                    position={[pin.lat, pin.lng]}
-                    icon={createCustomPinIcon(pin.label)}
-                >
-                    <Popup>
-                        <div className="p-2 min-w-[160px]">
-                            {editingPinId === pin.id ? (
-                                <div className="space-y-2">
-                                    <input
-                                        type="text"
-                                        value={editLabel}
-                                        onChange={(e) => setEditLabel(e.target.value)}
-                                        className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
-                                        placeholder="Label pin..."
-                                        autoFocus
-                                    />
-                                    <div className="flex gap-1">
-                                        <button
-                                            onClick={() => {
-                                                onUpdatePin(pin.id, { label: editLabel });
-                                                setEditingPinId(null);
-                                            }}
-                                            className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold uppercase rounded"
-                                        >
-                                            Simpan
-                                        </button>
-                                        <button
-                                            onClick={() => setEditingPinId(null)}
-                                            className="flex-1 py-1 bg-slate-400 hover:bg-slate-500 text-white text-[9px] font-bold uppercase rounded"
-                                        >
-                                            Batal
-                                        </button>
+            {validLocations.map((item, idx) => {
+                // Find latest thumbnail from analysis_results
+                let thumbUrl = null;
+                if (item.analysis_results && Array.isArray(item.analysis_results)) {
+                    // Sort by year desc and take the first one with a thumb_url
+                    const latestResult = [...item.analysis_results]
+                        .sort((a, b) => b.year - a.year)
+                        .find(r => r.thumb_url);
+
+                    if (latestResult) {
+                        thumbUrl = resolveThumbUrl(latestResult.thumb_url, API_URL);
+                    }
+                }
+
+                return (
+                    <Marker
+                        key={`hist-${item.id}-${idx}`}
+                        position={item.center}
+                        icon={createHistoryIcon(item.display_name || item.filename, thumbUrl, item.color)}
+                    >
+                        <Popup>
+                            <div className="p-1 min-w-[200px]">
+                                <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-100">
+                                    <div className="p-1 bg-emerald-50 text-emerald-600 rounded">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12l-18 0" /><path d="M3 12l6 -6" /><path d="M3 12l6 6" /></svg>
+                                    </div>
+                                    <div>
+                                        <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Lokasi Teranalisis</div>
+                                        <div className="text-xs font-bold text-slate-800 line-clamp-1" title={item.filename}>{item.display_name || item.filename}</div>
                                     </div>
                                 </div>
-                            ) : (
-                                <>
-                                    <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Custom Pin</div>
-                                    <div className="text-xs font-bold text-slate-800 mb-2">{pin.label || 'No Label'}</div>
-                                    <div className="text-[9px] text-slate-500 mb-2">
-                                        <div>Lat: {pin.lat.toFixed(6)}</div>
-                                        <div>Lng: {pin.lng.toFixed(6)}</div>
+
+                                <div className="space-y-1 mb-3 pt-1">
+                                    <div className="flex justify-between text-[10px]">
+                                        <span className="text-slate-500 font-medium">Data Analisis:</span>
+                                        <span className="font-bold text-slate-700">{item.metadata?.start_year} - {item.metadata?.end_year}</span>
                                     </div>
-                                    <div className="flex gap-1 mb-2">
-                                        <button
-                                            onClick={() => {
-                                                setEditingPinId(pin.id);
-                                                setEditLabel(pin.label);
-                                            }}
-                                            className="flex-1 py-1 bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-bold uppercase rounded"
-                                        >
-                                            Edit
-                                        </button>
-                                        <button
-                                            onClick={() => {
-                                                if (window.confirm('Hapus pin ini?')) {
-                                                    onDeletePin(pin.id);
-                                                }
-                                            }}
-                                            className="flex-1 py-1 bg-red-600 hover:bg-red-700 text-white text-[9px] font-bold uppercase rounded"
-                                        >
-                                            Hapus
-                                        </button>
+                                    <div className="flex justify-between text-[10px]">
+                                        <span className="text-slate-500 font-medium">Luas Wilayah:</span>
+                                        <span className="font-bold text-slate-700">{item.metadata?.total_area_ha ? Number(item.metadata.total_area_ha).toLocaleString() + ' Ha' : '-'}</span>
                                     </div>
-                                    <button
-                                        onClick={() => {
-                                            const googleMapsUrl = `https://maps.google.com/?q=${pin.lat},${pin.lng}&z=15`;
-                                            window.open(googleMapsUrl, '_blank');
-                                        }}
-                                        className="w-full py-1 bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 text-white text-[9px] font-bold uppercase rounded"
-                                    >
-                                        🗺️ Google Maps
-                                    </button>
-                                </>
-                            )}
-                        </div>
-                    </Popup>
-                </Marker>
-            ))}
+                                </div>
+
+                                {item.metadata?.transition_summary && (
+                                    <div className="grid grid-cols-2 gap-2 mb-3 p-2 bg-slate-50 rounded-lg border border-slate-100">
+                                        <div className="space-y-0.5">
+                                            <div className="text-[8px] font-black text-slate-400 uppercase tracking-tighter">Deforestasi</div>
+                                            <div className="text-[11px] font-bold text-red-600">-{Number(item.metadata.transition_summary.total_deforestation_ha || 0).toFixed(2)} Ha</div>
+                                        </div>
+                                        <div className="space-y-0.5">
+                                            <div className="text-[8px] font-black text-slate-400 uppercase tracking-tighter">Reforestasi</div>
+                                            <div className="text-[11px] font-bold text-emerald-600">+{Number(item.metadata.transition_summary.total_reforestation_ha || 0).toFixed(2)} Ha</div>
+                                        </div>
+
+                                        {/* 📈 DATA SLOPE (NEW) */}
+                                        {item.slope_summary && item.slope_summary.length > 0 && (
+                                            <div className="col-span-2 pt-1 mt-1 border-t border-slate-200/60 flex justify-between items-center">
+                                                <div className="text-[8px] font-black text-slate-500 uppercase tracking-tighter">Rata-rata Kelerengan</div>
+                                                <div className="text-[11px] font-bold text-indigo-700">
+                                                    {Number(item.slope_summary.find(s => s.scope === 'INSIDE')?.avg_slope || 0).toFixed(1)}%
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <div className="col-span-2 pt-1 mt-1 border-t border-slate-200/60 flex justify-between items-center">
+                                            <div className="text-[8px] font-black text-slate-500 uppercase tracking-tighter">Perubahan Tutupan</div>
+                                            <div className={`text-[11px] font-extrabold ${item.metadata.transition_summary.net_forest_change_ha >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                                                {item.metadata.transition_summary.net_forest_change_ha >= 0 ? '+' : ''}{Number(item.metadata.transition_summary.net_forest_change_ha || 0).toFixed(2)} Ha
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                <button
+                                    onClick={() => onSelect(item)}
+                                    className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold uppercase rounded shadow-sm hover:shadow transition-all flex items-center justify-center gap-1.5"
+                                >
+                                    <span>Buka Analisis</span>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12l14 0" /><path d="M13 18l6 -6" /><path d="M13 6l6 6" /></svg>
+                                </button>
+                            </div>
+                        </Popup>
+                    </Marker>
+                );
+            })}
         </>
     );
 };

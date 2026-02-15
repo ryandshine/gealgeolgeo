@@ -1,0 +1,121 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.Python
+get-pip.py
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Node (frontend build happens separately)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDEs & Editors
+.vscode/
+.idea/
+.idx/
+.cursor/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Sensitive keys (injected via env vars / volume in Dokploy)
+gee-service-account-key.json
+geoanalyzer-*.json
+secrets.json
+credentials.json
+auth.json
+
+# Runtime directories
+storage/
+cache/
+app_data/
+temp_shp/
+uploads/
+
+# Logs
+*.log
+backend_logs.txt
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Data and Temp files
+*.xlsx
+debug_*.json
+debug_*.txt
+big_*_metadata.json
+response.json
+nul
+slope_lines.txt
+sync_final*.txt
+sync_results.txt
+
+# Generated docs
+*.md
+!README.md
+
+# Diagrams
+diagram_*.png
+
+# One-off / utility scripts
+apply_migration_direct.py
+diagnose_lahan.py
+main_aggregation_snippet.py
+migrate_existing_tiles.py
+generate_diagram_helper.py
+generate_methodology.py
+final_audit.py
+list_tables.py
+frontend/src/clean_jsx.py
+pack_*.py
+patch_*.py
+fix_*.py
+*_fix.py
+run_*.py
+backfill_*.py
+sync_*.py
+*_sync.py
+repro_*.py
+verify_*.py
+inspect_*.py
+check_*.py
+convert_*.py
+test_*.py
+*_test.py
+simulate_test.py
+
+# SQL migrations
+*.sql
+
+# Windows batch scripts
+*.bat
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore

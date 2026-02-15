@@ -10,7 +10,7 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
     const [saving, setSaving] = useState(false);
     const [localResults, setLocalResults] = useState(validationResults);
 
-    const handleKpsConfirm = (kpsData) => {
+    const handleKpsConfirm = (kpsData, linkMethod) => {
         if (editingIdx !== null) {
             const updated = [...localResults];
             updated[editingIdx] = {
@@ -18,7 +18,8 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                 kps_id: kpsData.id_kps_api,
                 kps_name: kpsData.nama_kps,
                 kps_no_sk: kpsData.no_sk,
-                status: 'valid'
+                status: 'valid',
+                link_method: linkMethod
             };
             setLocalResults(updated);
             setEditingIdx(null);
@@ -51,8 +52,15 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
             setSaving(true);
 
             // Prepare bulk save items from validation results and file items
+            if (!bulkFileItems || bulkFileItems.length !== localResults.length) {
+                throw new Error(`Data mismatch: ${localResults.length} results vs ${bulkFileItems?.length ?? 0} file items`);
+            }
             const bulkSaveItems = localResults.map((result, idx) => {
                 const fileItem = bulkFileItems[idx];
+                if (!fileItem || !fileItem.geo_data) {
+                    console.warn(`Skipping item ${idx} (${result.filename}): missing geo_data`);
+                    return null;
+                }
                 return {
                     filename: result.filename,
                     file_size: 0,
@@ -68,7 +76,7 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                     link_method: result.status === 'valid' ? 'AUTO_DETECTED' : (result.status === 'needs_manual' ? 'MANUAL' : 'NONE'),
                     analysis_scope: result.kps_id ? 'KPS' : 'NON_KPS'
                 };
-            });
+            }).filter(Boolean);
 
             // Note: This is just saving geometry. Full analysis happens in normal flow.
             // For now, we're storing the validated geometries and metadata.
@@ -173,11 +181,15 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                                     <td className="px-4 py-3 text-xs">
                                         {result.status === 'needs_manual' && (
                                             <button
-                                                onClick={() => {
+                                                type="button"
+                                                onClick={(e) => {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
                                                     setEditingIdx(idx);
                                                     setShowKpsSearch(true);
                                                 }}
-                                                className="text-blue-500 hover:text-blue-700 font-medium"
+                                                className="px-3 py-1 bg-blue-50 text-blue-600 hover:bg-blue-100 font-medium rounded transition-colors cursor-pointer pointer-events-auto"
+                                                aria-label={`Search KPS for ${result.filename}`}
                                             >
                                                 Search KPS
                                             </button>
@@ -224,7 +236,9 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                 {/* KPS Search Modal */}
                 {showKpsSearch && (
                     <KpsDetectionDialog
-                        initialNoSk={localResults[editingIdx]?.no_sk}
+                        show={showKpsSearch}
+                        detectedKps={null}
+                        extractedNoSk={localResults[editingIdx]?.no_sk}
                         onConfirm={handleKpsConfirm}
                         onSkip={() => {
                             if (editingIdx !== null) {
@@ -240,7 +254,7 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                             }
                             setShowKpsSearch(false);
                         }}
-                        onCancel={() => setShowKpsSearch(false)}
+                        onClose={() => setShowKpsSearch(false)}
                     />
                 )}
             </div>

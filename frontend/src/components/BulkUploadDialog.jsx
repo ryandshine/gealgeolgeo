@@ -4,6 +4,7 @@ import shp from 'shpjs';
 import JSZip from 'jszip';
 import { Upload, Loader, AlertCircle, FileText, CheckCircle2 } from 'lucide-react';
 import { API_URL } from '../constants';
+import '../utils/geoUtils'; // Register Proj4 definitions
 
 const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
     const [files, setFiles] = useState([]);
@@ -100,10 +101,20 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                     // Parse SHP to GeoJSON
                     const geoJson = await shp(arrayBuffer);
 
+                    if (!geoJson || (!geoJson.features && !Array.isArray(geoJson))) {
+                        console.warn(`Skipping ${basename}: shp() returned invalid data`);
+                        continue;
+                    }
+
+                    // Handle case where shp() returns array of FeatureCollections
+                    const features = Array.isArray(geoJson)
+                        ? geoJson.flatMap(fc => fc?.features || [])
+                        : (geoJson.features || []);
+
                     // Extract NO_SK from properties
                     let noSk = null;
-                    if (geoJson.features && geoJson.features.length > 0) {
-                        const props = geoJson.features[0].properties || {};
+                    if (features.length > 0) {
+                        const props = features[0].properties || {};
                         const priorityFields = ['NO_SK', 'NO_KPS', 'NOSK', 'NOSK_KPS', 'SK_NUMBER'];
 
                         for (const field of priorityFields) {
@@ -130,7 +141,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                     // Create feature collection with combined geometry
                     const featureCollection = {
                         type: 'FeatureCollection',
-                        features: geoJson.features || []
+                        features: features
                     };
 
                     bulkFileItems.push({

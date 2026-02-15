@@ -11,3 +11,5 @@ shapely
 scipy
 diskcache>=5.6.0
 Pillow>=10.0.0
+openpyxl>=3.0.0
+aiohttp>=3.9.0

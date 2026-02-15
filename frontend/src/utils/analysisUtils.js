@@ -9,10 +9,17 @@
  * @returns {Object} Trends per class and period info
  */
 export const calculateTrends = (analysisResults) => {
-    if (!analysisResults || analysisResults.length < 2) return null;
+    if (!analysisResults) return null;
+
+    // Normalize to array if single object, or return null if empty/invalid
+    const resultsArray = Array.isArray(analysisResults)
+        ? analysisResults
+        : (typeof analysisResults === 'object' ? [analysisResults] : []);
+
+    if (resultsArray.length < 2) return null;
 
     // Sort by year to ensure correct comparison (first year vs latest year)
-    const sorted = [...analysisResults].sort((a, b) =>
+    const sorted = [...resultsArray].sort((a, b) =>
         (Number(a.year) || 0) - (Number(b.year) || 0)
     );
 
@@ -22,7 +29,7 @@ export const calculateTrends = (analysisResults) => {
 
     const calcPct = (curr, old) => old > 0 ? (((curr - old) / old) * 100).toFixed(1) : 0;
 
-    const classes = ['hutan', 'tanah_kering', 'tanah_kosong', 'air'];
+    const classes = ['hutan_primer', 'hutan_sekunder', 'tanah_kering', 'tanah_kosong', 'air', 'lahan_terbangun'];
     const trends = {};
 
     classes.forEach(cls => {
@@ -34,6 +41,16 @@ export const calculateTrends = (analysisResults) => {
             end: latestData[cls] || 0
         };
     });
+
+    // Add aggregate 'hutan' trend for overall status logic
+    const firstHutan = (firstData.hutan_primer || 0) + (firstData.hutan_sekunder || 0);
+    const latestHutan = (latestData.hutan_primer || 0) + (latestData.hutan_sekunder || 0);
+    trends.hutan = {
+        diff: latestHutan - firstHutan,
+        pct: calcPct(latestHutan, firstHutan),
+        start: firstHutan,
+        end: latestHutan
+    };
 
     // Main Trend Logic
     // Color schema: background + matching shadow color for consistency
@@ -49,7 +66,28 @@ export const calculateTrends = (analysisResults) => {
         trendInfo = { type: 'warn', label: 'Degradasi (Kering)', color: 'bg-orange-500 text-white shadow-sm shadow-orange-200', hex: '#f59e0b' };
     }
 
-    return { trends, trendInfo, period, startYear: firstData.year, endYear: latestData.year };
+    // Year-over-year breakdown for narrative engine
+    const yearlyBreakdown = [];
+    for (let i = 1; i < sorted.length; i++) {
+        const prev = sorted[i - 1];
+        const curr = sorted[i];
+        const yoyClasses = {};
+        classes.forEach(cls => {
+            const prevVal = prev[cls] || 0;
+            const currVal = curr[cls] || 0;
+            yoyClasses[cls] = { prev: prevVal, curr: currVal, diff: currVal - prevVal };
+        });
+        const prevHutan = (prev.hutan_primer || 0) + (prev.hutan_sekunder || 0);
+        const currHutan = (curr.hutan_primer || 0) + (curr.hutan_sekunder || 0);
+        yoyClasses.hutan = { prev: prevHutan, curr: currHutan, diff: currHutan - prevHutan };
+        yearlyBreakdown.push({
+            fromYear: prev.year,
+            toYear: curr.year,
+            classes: yoyClasses
+        });
+    }
+
+    return { trends, trendInfo, period, startYear: firstData.year, endYear: latestData.year, yearlyBreakdown };
 };
 
 /**
@@ -57,7 +95,7 @@ export const calculateTrends = (analysisResults) => {
  */
 export const generateVerbalNarrative = (trendData) => {
     if (!trendData) return null;
-    const { trends } = trendData;
+    const { trends, startYear, endYear } = trendData;
     const forestTrend = trends.hutan;
 
     let status = { text: 'Kondisi Stabil', type: 'info' };
@@ -65,13 +103,19 @@ export const generateVerbalNarrative = (trendData) => {
 
     if (forestTrend.diff < -0.5) {
         status = { text: 'Kejadian Deforestasi', type: 'error' };
-        highlight = `Terjadi penurunan tutupan hutan seluas ${Math.abs(forestTrend.diff).toFixed(1)} Ha (${Math.abs(forestTrend.pct)}%).`;
+        highlight = `Terjadi penurunan tutupan hutan total seluas ${Math.abs(forestTrend.diff).toFixed(1)} Ha (${Math.abs(forestTrend.pct)}%) pada periode ${startYear}-${endYear}.`;
     } else if (forestTrend.diff > 0.5) {
         status = { text: 'Pemulihan Tutupan Teridentifikasi', type: 'success' };
-        highlight = `Teridentifikasi kenaikan tutupan hutan seluas ${forestTrend.diff.toFixed(1)} Ha (${forestTrend.pct}%).`;
-    } else if (trends.tanah_kering.diff > 2) {
+        highlight = `Teridentifikasi kenaikan tutupan hutan total seluas ${forestTrend.diff.toFixed(1)} Ha (${forestTrend.pct}%) pada periode ${startYear}-${endYear}.`;
+    } else if ((trends.tanah_kosong?.diff || 0) > 2) {
         status = { text: 'Degradasi Terdeteksi', type: 'warning' };
-        highlight = `Terdeteksi peningkatan luasan area terbuka/lahan kering sebesar (${trends.tanah_kering.diff.toFixed(1)} Ha).`;
+        highlight = `Terdeteksi peningkatan luasan area terbuka/tanah kosong sebesar ${trends.tanah_kosong.diff.toFixed(1)} Ha pada periode ${startYear}-${endYear}.`;
+    } else if ((trends.lahan_terbangun?.diff || 0) > 1) {
+        status = { text: 'Ekspansi Lahan Terbangun', type: 'warning' };
+        highlight = `Terdeteksi peningkatan lahan terbangun sebesar ${trends.lahan_terbangun.diff.toFixed(1)} Ha pada periode ${startYear}-${endYear}.`;
+    } else {
+        // Default: kondisi stabil — tetap berikan ringkasan bermakna
+        highlight = `Tutupan hutan relatif stabil dengan perubahan ${forestTrend.diff >= 0 ? '+' : ''}${forestTrend.diff.toFixed(1)} Ha (${startYear}-${endYear}). Total hutan saat ini: ${forestTrend.end.toFixed(1)} Ha.`;
     }
 
     return { status, highlight };
@@ -173,4 +217,68 @@ export const createYearOpacityMap = (yearlyData) => {
     });
 
     return opacityMap;
+};
+
+/**
+ * Fetch slope analysis data for a history from backend
+ * @param {string} historyId - History ID
+ * @param {string} apiUrl - API base URL
+ * @returns {Promise<object>} Slope analysis data
+ */
+export const fetchSlopeAnalysis = async (historyId, apiUrl) => {
+    try {
+        const response = await fetch(`${apiUrl}/history/${historyId}/slope`);
+        if (!response.ok) {
+            console.warn(`Failed to fetch slope analysis for history ${historyId}:`, response.status);
+            return null;
+        }
+        const data = await response.json();
+        return data;
+    } catch (error) {
+        console.error(`Error fetching slope analysis for history ${historyId}:`, error);
+        return null;
+    }
+};
+
+/**
+ * Fetch hotspot summary data for a history from backend
+ * @param {string} historyId - History ID
+ * @param {string} apiUrl - API base URL
+ * @returns {Promise<object>} Hotspot summary data
+ */
+export const fetchHotspotSummary = async (historyId, apiUrl) => {
+    try {
+        const response = await fetch(`${apiUrl}/history/${historyId}/hotspots-summary`);
+        if (!response.ok) {
+            console.warn(`Failed to fetch hotspots summary for history ${historyId}:`, response.status);
+            return null;
+        }
+        const data = await response.json();
+        return data;
+    } catch (error) {
+        console.error(`Error fetching hotspots summary for history ${historyId}:`, error);
+        return null;
+    }
+};
+
+/**
+ * Resolves local or remote thumbnail URLs to absolute URLs
+ * @param {string} url - The URL to resolve
+ * @param {string} apiUrl - The API base URL
+ * @returns {string|null} - Resolved absolute URL or null
+ */
+export const resolveThumbUrl = (url, apiUrl) => {
+    if (!url) return null;
+    try {
+        if (url.startsWith('/') && apiUrl) {
+            const root = apiUrl.replace(/\/api\/?$/, '');
+            const fullUrl = `${root}${url}`;
+            console.debug(`[Thumbnail] Resolved local path: ${url} → ${fullUrl.substring(0, 80)}...`);
+            return fullUrl;
+        }
+        return url;
+    } catch (e) {
+        console.error(`[Thumbnail] Failed to resolve URL: ${url}`, e);
+        return url; // Return original as fallback
+    }
 };
