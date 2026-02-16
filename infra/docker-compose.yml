@@ -1,0 +1,57 @@
+services:
+  app:
+    image: gealgeolgeo:infra-latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        BUILD_VITE_API_URL: ${BUILD_VITE_API_URL:-}
+        BUILD_VITE_SUPABASE_URL: ${BUILD_VITE_SUPABASE_URL:-}
+        BUILD_VITE_SUPABASE_ANON_KEY: ${BUILD_VITE_SUPABASE_ANON_KEY:-}
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - geal_storage:/app/storage
+      - geal_cache:/app/cache
+      - ${GEE_KEY_FILE_HOST:-../gee-service-account-key.json}:/app/gee-service-account-key.json:ro
+    expose:
+      - "80"
+    networks:
+      - geal_web
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - geal_web
+
+networks:
+  geal_web:
+    driver: bridge
+
+volumes:
+  geal_storage:
+  geal_cache:
+  caddy_data:
+  caddy_config:
