@@ -331,7 +331,6 @@ const MainLayout = (props) => {
         analysisModeForCalibration,
         currentJobId,
         isBatchRunning,
-        isBatchMode, setIsBatchMode,
         handleFileChange,
 
         // Global View
@@ -380,7 +379,8 @@ const MainLayout = (props) => {
         setShowBulkUploadDialog,
         // Monitoring Terkini
         onOpenMonitoringTerkini,
-        detectedKps
+        detectedKps,
+        canDeleteHistory
     } = props;
 
     // Smart Narrative Modal State
@@ -1248,8 +1248,8 @@ const MainLayout = (props) => {
     // Save narrative to Supabase when it changes
     useEffect(() => {
         const saveNarrative = async () => {
-            // Skip if in global view, no narrative, or no history item ID
-            if (showAllPins || !smartNarrative || !file?.id || !data?.length) {
+            // Skip if in global view, no narrative, no history item ID, or supabase not configured
+            if (showAllPins || !smartNarrative || !file?.id || !data?.length || !supabase) {
                 return;
             }
 
@@ -1704,12 +1704,12 @@ ${smartNarrative.terrainNarrative}
 
             {/* Sidebar Toggle Button (Visible even in Draw Mode, as requested) */}
             {/* FLOATING CONTROL DOCK (Unified Navigation) */}
-            <div className={`fixed top-6 left-6 z-[3002] flex items-center p-1.5 gap-1 rounded-full bg-white/80 backdrop-blur-md border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.1)] transition-all duration-500 ease-[cubic-bezier(0.34,1.56,0.64,1)] ${showSidebar ? '-translate-x-[150%] opacity-0' : 'translate-x-0 opacity-100'}`}>
+            <div className={`fixed top-3 left-3 md:top-6 md:left-6 z-[3002] flex items-center p-1 md:p-1.5 gap-0.5 md:gap-1 rounded-full bg-white/80 backdrop-blur-md border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.1)] transition-all duration-500 ease-[cubic-bezier(0.34,1.56,0.64,1)] ${showSidebar ? '-translate-x-[150%] opacity-0' : 'translate-x-0 opacity-100'}`}>
 
                 {/* 1. Menu Trigger */}
                 <button
                     onClick={() => setShowSidebar(true)}
-                    className="p-2.5 rounded-full hover:bg-emerald-50 text-slate-600 hover:text-emerald-600 transition-all active:scale-95"
+                    className="p-2 md:p-2.5 rounded-full hover:bg-emerald-50 text-slate-600 hover:text-emerald-600 transition-all active:scale-95"
                     title="Buka Menu"
                 >
                     <Menu size={20} />
@@ -1724,7 +1724,7 @@ ${smartNarrative.terrainNarrative}
                         e.stopPropagation();
                         setShowSigapPanel(!showSigapPanel);
                     }}
-                    className={`p-2.5 rounded-full transition-all active:scale-95 relative ${showSigapPanel
+                    className={`p-2 md:p-2.5 rounded-full transition-all active:scale-95 relative ${showSigapPanel
                         ? 'bg-emerald-100 text-emerald-700 shadow-inner'
                         : 'hover:bg-emerald-50 text-slate-600 hover:text-emerald-600'
                         }`}
@@ -1753,7 +1753,7 @@ ${smartNarrative.terrainNarrative}
                             setShowSidebar(false); // Tutup sidebar agar history dashboard bisa muncul
                         }
                     }}
-                    className={`p-2.5 rounded-full transition-all active:scale-95 flex items-center justify-center gap-2 ${showHistoryTable
+                    className={`p-2 md:p-2.5 rounded-full transition-all active:scale-95 flex items-center justify-center gap-2 ${showHistoryTable
                         ? 'bg-emerald-100 text-emerald-700 shadow-inner'
                         : 'hover:bg-emerald-50 text-slate-600 hover:text-emerald-600'
                         }`}
@@ -1784,18 +1784,18 @@ ${smartNarrative.terrainNarrative}
             {/* FLOATING SIDEBAR - Responsive & Glassmorphism */}
             <aside
                 ref={sidebarRef}
-                className={`fixed top-6 bottom-6 left-6 md:left-6 w-[85vw] md:w-96 bg-white/95 backdrop-blur-2xl flex flex-col shadow-[0_20px_60px_rgba(0,0,0,0.3)] z-[3001] rounded-[2.5rem] border border-white/40 transition-all duration-500 ease-[cubic-bezier(0.34,1.56,0.64,1)] ${showSidebar ? 'translate-x-0 opacity-100' : '-translate-x-[calc(110%)] opacity-0'
+                className={`fixed top-3 bottom-3 left-3 right-3 md:top-6 md:bottom-6 md:left-6 md:right-auto w-auto md:w-96 bg-white/95 backdrop-blur-2xl flex flex-col shadow-[0_20px_60px_rgba(0,0,0,0.3)] z-[3001] rounded-[2rem] md:rounded-[2.5rem] border border-white/40 transition-all duration-500 ease-[cubic-bezier(0.34,1.56,0.64,1)] ${showSidebar ? 'translate-x-0 opacity-100' : '-translate-x-[calc(110%)] opacity-0'
                     }`}
             >
-                <div className="px-6 py-5 border-b border-slate-100/50 shrink-0">
+                <div className="px-4 py-4 md:px-6 md:py-5 border-b border-slate-100/50 shrink-0">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
                             <div className="p-2 bg-emerald-50 text-emerald-600 rounded-xl">
                                 <Satellite size={20} />
                             </div>
                             <div>
-                                <h1 className="font-black text-lg tracking-tight leading-none text-slate-800">GealGeolGeo</h1>
-                                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Direktorat Pengendalian Perhutanan Sosial</p>
+                                <h1 className="font-black text-base md:text-lg tracking-tight leading-none text-slate-800">GealGeolGeo</h1>
+                                <p className="hidden sm:block text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Direktorat Pengendalian Perhutanan Sosial</p>
                             </div>
                         </div>
                         <button
@@ -1822,7 +1822,7 @@ ${smartNarrative.terrainNarrative}
                     )}
                 </div>
 
-                <div className="p-5 flex-1 flex flex-col gap-6 overflow-y-auto no-scrollbar">
+                <div className="p-4 md:p-5 flex-1 flex flex-col gap-5 md:gap-6 overflow-y-auto no-scrollbar">
                     {/* SECTION 1: MAP CONTROLS & ANALYSIS INPUT (Reordered) */}
                     <div className="space-y-6">
                         {/* Segmented Control for Map Type */}
@@ -1849,18 +1849,6 @@ ${smartNarrative.terrainNarrative}
                                 <span className="h-px bg-slate-100 flex-1" />
                             </div>
 
-                            {/* Batch Mode Toggle */}
-                            <div className="flex items-center justify-between px-1 mb-2">
-                                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest cursor-pointer flex items-center gap-2">
-                                    <div className="relative inline-flex items-center cursor-pointer">
-                                        <input type="checkbox" className="sr-only peer" checked={isBatchMode} onChange={(e) => setIsBatchMode(e.target.checked)} />
-                                        <div className="w-7 h-4 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500"></div>
-                                    </div>
-                                    Batch Mode
-                                </label>
-                                {isBatchMode && <span className="text-[9px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-bold">ON</span>}
-                            </div>
-
                             {/* Upload Area */}
                             <div className="flex gap-3">
                                 <label className="group flex-1 border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 hover:border-emerald-400 transition-all cursor-pointer relative bg-slate-50/50">
@@ -1870,7 +1858,7 @@ ${smartNarrative.terrainNarrative}
                                             <Upload size={16} />
                                         </div>
                                         <span className={`text-[10px] font-bold uppercase tracking-wide mt-1 ${file ? "text-emerald-600" : "text-slate-400"}`}>
-                                            {file ? file.name : "Upload KPS / GeoJSON"}
+                                            {file ? file.name : "Upload"}
                                         </span>
                                     </div>
                                 </label>
@@ -1994,7 +1982,7 @@ ${smartNarrative.terrainNarrative}
                                 <span className="text-[11px] font-bold text-slate-600">Citra Satelit Asli</span>
                                 <button
                                     onClick={() => setShowRgb(!showRgb)}
-                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showRgb ? 'bg-indigo-500' : 'bg-slate-200'}`}
+                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showRgb ? 'bg-emerald-500' : 'bg-slate-200'}`}
                                 >
                                     <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${showRgb ? 'translate-x-4' : 'translate-x-1'}`} />
                                 </button>
@@ -2062,10 +2050,10 @@ ${smartNarrative.terrainNarrative}
                                 <div className="flex flex-col gap-3 mb-2">
                                     <span className="text-[10px] md:text-[9px] font-black text-slate-400 uppercase tracking-widest">Ekspor & Laporan</span>
                                     <div className="flex flex-wrap items-center gap-2">
-                                        <button onClick={onExportToGeoJSON} className="bg-white border border-slate-200 text-blue-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-blue-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-bold">
+                                        <button onClick={onExportToGeoJSON} className="bg-white border border-slate-200 text-emerald-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-emerald-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-bold">
                                             <Download size={12} /> GeoJSON
                                         </button>
-                                        <button onClick={onExportShp} className="bg-white border border-indigo-200 text-indigo-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-indigo-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-black shadow-sm">
+                                        <button onClick={onExportShp} className="bg-white border border-emerald-200 text-emerald-700 text-[10px] md:text-[9px] flex items-center gap-1.5 hover:bg-emerald-50 px-4 py-2 md:px-2 md:py-1 rounded-xl md:rounded transition-all font-black shadow-sm">
                                             <Download size={12} /> SHP (.zip)
                                         </button>
                                         {!showAllPins && (
@@ -2335,6 +2323,7 @@ ${smartNarrative.terrainNarrative}
                                     onDelete={handleDeleteHistory}
                                     onSelect={handleHistorySelect}
                                     onReanalyze={handleHistoryReanalyze}
+                                    canDelete={canDeleteHistory}
                                 />
                             </div>
                         </div>
@@ -2348,7 +2337,7 @@ ${smartNarrative.terrainNarrative}
                         <div className="absolute top-20 left-1/2 -translate-x-1/2 z-[4000] animate-in fade-in slide-in-from-top-4 duration-500">
                             <div className="bg-white/90 backdrop-blur-md border border-emerald-200 px-4 py-2 rounded-2xl shadow-xl flex items-center gap-3">
                                 <div className="w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin" />
-                                <span className="text-[10px] font-black uppercase tracking-widest text-emerald-800">Memuat Pin & Geometri...</span>
+                                <span className="text-[10px] font-black uppercase tracking-widest text-emerald-800">Geometri</span>
                             </div>
                         </div>
                     )}
@@ -2369,27 +2358,30 @@ ${smartNarrative.terrainNarrative}
                         scrollWheelZoom={true}
                     >
                         {/* 1. LAYER DASAR (BASEMAP) */}
-                        {((mapType === 'SENTINEL_RGB' && rgbMapUrl) || MAP_TILES[mapType].url) && (
-                            <TileLayer
-                                key={`basemap-${mapType}-${mapType === 'SENTINEL_RGB' ? rgbMapUrl : 'static'}`}
-                                url={mapType === 'SENTINEL_RGB' ? rgbMapUrl : MAP_TILES[mapType].url}
-                                attributed={MAP_TILES[mapType].attribution || ''}
-                                subdomains={MAP_TILES[mapType].subdomains || []}
-                                zIndex={1}
-                                maxNativeZoom={18}
-                                maxZoom={18}
-                            />
-                        )}
-                        {/* Fallback basemap when SENTINEL_RGB selected but GEE tiles expired (history mode) */}
-                        {mapType === 'SENTINEL_RGB' && !rgbMapUrl && (
-                            <TileLayer
-                                key="basemap-fallback-satellite"
-                                url={MAP_TILES.satellite.url}
-                                zIndex={0}
-                                maxNativeZoom={18}
-                                maxZoom={18}
-                            />
-                        )}
+                        {(() => {
+                            // Make RGB toggle effective even when mapType is SENTINEL_RGB.
+                            const sentinelRgbEnabled = mapType === 'SENTINEL_RGB' && showRgb && !!rgbMapUrl;
+                            const basemapMeta = mapType === 'SENTINEL_RGB'
+                                ? (sentinelRgbEnabled ? MAP_TILES.SENTINEL_RGB : MAP_TILES.satellite)
+                                : MAP_TILES[mapType];
+                            const basemapUrl = mapType === 'SENTINEL_RGB'
+                                ? (sentinelRgbEnabled ? rgbMapUrl : MAP_TILES.satellite.url)
+                                : basemapMeta?.url;
+
+                            if (!basemapUrl) return null;
+
+                            return (
+                                <TileLayer
+                                    key={`basemap-${mapType}-${showRgb ? 'rgb-on' : 'rgb-off'}-${sentinelRgbEnabled ? rgbMapUrl : 'fallback'}`}
+                                    url={basemapUrl}
+                                    attributed={basemapMeta?.attribution || ''}
+                                    subdomains={basemapMeta?.subdomains || []}
+                                    zIndex={1}
+                                    maxNativeZoom={18}
+                                    maxZoom={18}
+                                />
+                            );
+                        })()}
 
                         {/* 3. MAP CLICK HANDLER */}
                         <MapFitToGeoData
@@ -2415,18 +2407,18 @@ ${smartNarrative.terrainNarrative}
 
                         {/* YEAR SELECTOR OVERLAY (Floating Top-Right) - DROPDOWN MODE */}
                         {data?.length > 1 && !showAllPins && geoData && (
-                            <div className="absolute top-6 right-6 z-[1000] animate-in slide-in-from-top-2 fade-in duration-500">
-                                <div className="relative group bg-white/80 backdrop-blur-md rounded-full border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.1)] p-1">
+                            <div className="absolute top-3 right-3 md:top-6 md:right-6 z-[1000] animate-in slide-in-from-top-2 fade-in duration-500">
+                                <div className="relative group bg-white/80 backdrop-blur-md rounded-full border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.1)] p-0.5 md:p-1">
                                     {/* Icon Container */}
-                                    <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                                        <Calendar size={14} className="text-slate-500" />
+                                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
+                                        <Calendar size={15} className="text-slate-500" />
                                     </div>
 
                                     {/* Select Input */}
                                     <select
                                         value={selectedYear || ''}
                                         onChange={(e) => setSelectedYear(Number(e.target.value))}
-                                        className="appearance-none bg-transparent hover:bg-white/50 pl-9 pr-8 py-2.5 rounded-full text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 cursor-pointer transition-all uppercase tracking-wider"
+                                        className="appearance-none bg-transparent hover:bg-white/50 pl-10 pr-9 h-9 md:h-10 rounded-full text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 cursor-pointer transition-all uppercase tracking-wider"
                                     >
                                         {(data || []).map(d => (
                                             <option key={d.year} value={d.year}>Tahun {d.year}</option>
@@ -2434,7 +2426,7 @@ ${smartNarrative.terrainNarrative}
                                     </select>
 
                                     {/* Chevron */}
-                                    <div className="absolute inset-y-0 right-0 pr-2.5 flex items-center pointer-events-none">
+                                    <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none">
                                         <ChevronDown size={14} className="text-slate-400" />
                                     </div>
                                 </div>
@@ -2799,7 +2791,7 @@ ${smartNarrative.terrainNarrative}
 
                     {
                         isCompareMode && data && (
-                            <div className="absolute top-14 left-1/2 transform -translate-x-1/2 bg-white/95 backdrop-blur rounded-xl px-4 py-2 shadow-2xl border border-indigo-200 z-[1000] flex items-center gap-4">
+                            <div className="absolute top-14 left-1/2 transform -translate-x-1/2 bg-white/95 backdrop-blur rounded-xl px-4 py-2 shadow-2xl border border-emerald-200 z-[1000] flex items-center gap-4">
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500 uppercase font-bold">Kiri (Sebelum)</div>
                                     <select
@@ -2811,7 +2803,7 @@ ${smartNarrative.terrainNarrative}
                                             setCompareMapUrl(d?.map_url);
                                             setCompareRgbMapUrl(d?.rgb_url);
                                         }}
-                                        className="text-xs border-none bg-transparent font-bold text-indigo-600 focus:ring-0 p-0 text-center cursor-pointer"
+                                        className="text-xs border-none bg-transparent font-bold text-emerald-600 focus:ring-0 p-0 text-center cursor-pointer"
                                     >
                                         {(data || []).map(d => <option key={d.year} value={d.year}>{d.year}</option>)}
                                     </select>
@@ -2838,11 +2830,11 @@ ${smartNarrative.terrainNarrative}
 
                 {/* SIGAP LAYER CONTROLS (Floating Panel) */}
                 < div className={`absolute z-[3001] flex flex-col pointer-events-none gap-2 transition-all duration-300 ${showSidebar ? 'opacity-0' : 'opacity-100'} 
-                    top-20 left-6 items-start`}>
+                    top-16 left-3 md:top-20 md:left-6 items-start`}>
 
                     {/* Collapsible Panel */}
                     < div className={`transition-all duration-300 origin-top-left ${showSigapPanel ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4 pointer-events-none h-0 overflow-hidden'}`}>
-                        <div className="bg-white/95 backdrop-blur-xl p-3 rounded-2xl shadow-xl border border-white/50 pointer-events-auto w-[260px] max-h-[65vh] md:max-h-[80vh] overflow-y-auto no-scrollbar ring-1 ring-black/5">
+                        <div className="bg-white/95 backdrop-blur-xl p-3 rounded-2xl shadow-xl border border-white/50 pointer-events-auto w-[230px] sm:w-[250px] md:w-[260px] max-h-[65vh] md:max-h-[80vh] overflow-y-auto no-scrollbar ring-1 ring-black/5">
                             <div className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest px-1 sticky top-0 bg-white/50 backdrop-blur-sm pb-2 z-10 border-b border-slate-100 flex justify-between items-center">
                                 <span>Layer & Legenda</span>
                                 <button onClick={() => setShowSigapPanel(false)} className="text-slate-400 hover:text-slate-600 md:hidden p-1">
@@ -3069,8 +3061,8 @@ ${smartNarrative.terrainNarrative}
                 {/* FLOATING CHART PANEL - Compact & Proportional */}
                 {
                     (!showHistoryTable) && ( // Always visible when chart is enabled and not in history table view
-                        <div className={`absolute bottom-6 left-1/2 -translate-x-1/2 z-[1000] w-[95%] max-w-5xl transition-all duration-500 ${showSidebar ? 'md:translate-x-[20px] md:max-w-4xl' : ''}`}>
-                            <div className={`bg-white/95 backdrop-blur-xl border border-emerald-100/50 rounded-[2rem] shadow-[0_10px_40px_rgba(0,0,0,0.15)] transition-all duration-700 overflow-hidden ${chartMinimized ? 'h-[3.5rem] md:h-[3.5rem]' : 'h-[85vh] md:h-[26rem]'}`}>
+                        <div className={`absolute bottom-3 md:bottom-6 left-1/2 -translate-x-1/2 z-[1000] w-[96%] md:w-[95%] max-w-5xl transition-all duration-500 ${showSidebar ? 'md:translate-x-[20px] md:max-w-4xl' : ''}`}>
+                            <div className={`bg-white/95 backdrop-blur-xl border border-emerald-100/50 rounded-2xl md:rounded-[2rem] shadow-[0_10px_40px_rgba(0,0,0,0.15)] transition-all duration-700 overflow-hidden ${chartMinimized ? 'h-[3.5rem] md:h-[3.5rem]' : 'h-[72vh] sm:h-[78vh] md:h-[26rem]'}`}>
 
                                 {/* Header Toggle */}
                                 <div
@@ -3096,7 +3088,16 @@ ${smartNarrative.terrainNarrative}
                                                 <div className="flex-1 min-w-0 flex flex-col justify-center">
                                                     <div className="flex items-center">
                                                         <span className="font-bold text-[12px] md:text-sm tracking-tight text-slate-800 line-clamp-1">
-                                                            {showAllPins ? 'DASHBOARD GealGeolGeo' : (file?.name ? `${file.name.replace('.zip', '').replace('.geojson', '')}` : 'Analisis Multitemporal')}
+                                                            {showAllPins
+                                                                ? 'DASHBOARD GealGeolGeo'
+                                                                : (
+                                                                    file?.kps_info?.nama_kps
+                                                                    || (typeof file?.name === 'string'
+                                                                        ? file.name.replace(/\.(zip|geojson|shp|json)$/i, '')
+                                                                        : null)
+                                                                    || 'Analisis Multitemporal'
+                                                                )
+                                                            }
                                                         </span>
                                                     </div>
                                                 </div>
@@ -3115,7 +3116,7 @@ ${smartNarrative.terrainNarrative}
                                 </div>
 
 
-                                <div className="px-6 pb-5 h-[calc(100%-4rem)] animate-in fade-in slide-in-from-bottom-10 duration-700 overflow-y-auto">
+                                <div className="px-4 md:px-6 pb-4 md:pb-5 h-[calc(100%-4rem)] animate-in fade-in slide-in-from-bottom-10 duration-700 overflow-y-auto">
                                     {loading ? (
                                         <div className="h-full flex flex-col items-center justify-center px-12 gap-8 animate-in fade-in duration-500">
                                             <div className="w-full max-w-2xl space-y-4">
@@ -3654,7 +3655,7 @@ ${smartNarrative.terrainNarrative}
                                 onClick={handleCopyNarrative}
                                 className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-all ${narrativeCopied
                                     ? 'bg-emerald-500 text-white'
-                                    : 'bg-blue-600 hover:bg-blue-700 text-white active:scale-95'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white active:scale-95'
                                     }`}
                             >
                                 {narrativeCopied ? (

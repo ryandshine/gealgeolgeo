@@ -3,26 +3,64 @@ import axios from 'axios';
 import { CheckCircle2, History, Calendar, Database, Activity, AlertCircle, ArrowRight, RefreshCw } from 'lucide-react';
 import { CALIBRATION_DEFAULTS, LAND_COVER_CONFIG, API_URL, MAX_BATCH_SIZE } from './constants';
 
+const DYNAMIC_IMPORT_RELOAD_FLAG = '__lazy_chunk_reload_once__';
+
+function lazyWithAutoReload(loader) {
+    return React.lazy(() =>
+        loader().catch((error) => {
+            const message = String(error?.message || '');
+            const isChunkFetchError =
+                message.includes('Failed to fetch dynamically imported module') ||
+                message.includes('Importing a module script failed');
+
+            if (isChunkFetchError && typeof window !== 'undefined') {
+                const hasRetried = window.sessionStorage.getItem(DYNAMIC_IMPORT_RELOAD_FLAG) === '1';
+                if (!hasRetried) {
+                    window.sessionStorage.setItem(DYNAMIC_IMPORT_RELOAD_FLAG, '1');
+                    window.location.reload();
+                    return new Promise(() => {});
+                }
+            }
+            throw error;
+        })
+    );
+}
+
 // Lazy load components
-const MainLayout = React.lazy(() => import('./MainLayout'));
-const Login = React.lazy(() => import('./Login'));
-const BatchQueueList = React.lazy(() => import('./components/BatchQueueList'));
-const CarbonDashboard = React.lazy(() => import('./components/CarbonDashboard'));
-const KpsDetectionDialog = React.lazy(() => import('./components/KpsDetectionDialog'));
-const DuplicateDialog = React.lazy(() => import('./components/DuplicateDialog'));
-const BulkUploadDialog = React.lazy(() => import('./components/BulkUploadDialog'));
-const BulkReportDialog = React.lazy(() => import('./components/BulkReportDialog'));
-const MonitoringTerkiniDashboard = React.lazy(() => import('./components/MonitoringTerkiniDashboard'));
+const MainLayout = lazyWithAutoReload(() => import('./MainLayout'));
+const Login = lazyWithAutoReload(() => import('./Login'));
+const BatchQueueList = lazyWithAutoReload(() => import('./components/BatchQueueList'));
+const CarbonDashboard = lazyWithAutoReload(() => import('./components/CarbonDashboard'));
+const KpsDetectionDialog = lazyWithAutoReload(() => import('./components/KpsDetectionDialog'));
+const DuplicateDialog = lazyWithAutoReload(() => import('./components/DuplicateDialog'));
+const BulkUploadDialog = lazyWithAutoReload(() => import('./components/BulkUploadDialog'));
+const BulkReportDialog = lazyWithAutoReload(() => import('./components/BulkReportDialog'));
+const MonitoringTerkiniDashboard = lazyWithAutoReload(() => import('./components/MonitoringTerkiniDashboard'));
 
 // Proj4 definitions and helpers moved to src/utils/geoUtils.js
 
 
 const App = () => {
     // Authentication State
-    const [isAuthenticated, setIsAuthenticated] = useState(() => {
-        const user = localStorage.getItem('user');
-        return !!user;
+    const [authToken, setAuthToken] = useState(() => localStorage.getItem('auth_token') || '');
+    const [authUser, setAuthUser] = useState(() => {
+        try {
+            const raw = localStorage.getItem('auth_user');
+            return raw ? JSON.parse(raw) : null;
+        } catch (_) {
+            return null;
+        }
     });
+    const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(localStorage.getItem('auth_token')));
+    const isAdmin = (authUser?.role || '').toLowerCase() === 'admin';
+
+    useEffect(() => {
+        if (authToken) {
+            axios.defaults.headers.common.Authorization = `Bearer ${authToken}`;
+        } else {
+            delete axios.defaults.headers.common.Authorization;
+        }
+    }, [authToken]);
 
     // Session Timeout Configuration (30 minutes = 1800000 ms)
     const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
@@ -49,7 +87,11 @@ const App = () => {
         }
 
         console.log('🔒 Session expired - Auto logout');
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
         localStorage.removeItem('user');
+        setAuthToken('');
+        setAuthUser(null);
         setIsAuthenticated(false);
         setFile(null);
         setData(null);
@@ -107,6 +149,10 @@ const App = () => {
     }, [isAuthenticated, resetSessionTimeout]);
 
     useEffect(() => {
+        if (typeof window !== 'undefined') {
+            window.sessionStorage.removeItem(DYNAMIC_IMPORT_RELOAD_FLAG);
+        }
+
         const link = document.createElement('link');
         link.href = 'https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@100;200;300;400;500;600;700&display=swap';
         link.rel = 'stylesheet';
@@ -200,7 +246,7 @@ const App = () => {
     const [batchQueue, setBatchQueue] = useState([]); // Array of { id, file, status, error }
     const [currentJobId, setCurrentJobId] = useState(null);
     const [isBatchRunning, setIsBatchRunning] = useState(false); // Manual start control
-    const [isBatchMode, setIsBatchMode] = useState(false); // Toggle for Batch Mode vs Single Mode
+    const [isBatchMode] = useState(false); // Legacy mode flag, bulk flow uses Bulk Upload dialog
     const batchWsRef = useRef(null); // WebSocket ref for batch cancellation
 
     // Track loading, batch, and data state in refs for timeout callback
@@ -222,10 +268,51 @@ const App = () => {
     const wsRef = useRef(null);
     const isCancelledRef = useRef(false);
     const pendingReanalyzeRef = useRef(false);
+    const activeAnalyzeClientIdRef = useRef(null);
 
     // Cloud Probability Threshold - FIXED at 50% per methodology
     // Cannot be changed by user to ensure consistency across all years and runs
     const CLOUD_PROB_THRESHOLD_FIXED = 50;
+
+    const notifyAnalysisCancel = useCallback((clientId) => {
+        if (!clientId) return;
+        const cancelUrl = `${API_URL}/analysis/cancel/${clientId}`;
+        try {
+            if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+                const ok = navigator.sendBeacon(cancelUrl, new Blob([], { type: 'text/plain' }));
+                if (ok) return;
+            }
+            // Fallback for browsers where sendBeacon fails/unsupported.
+            fetch(cancelUrl, { method: 'POST', keepalive: true }).catch(() => { });
+        } catch (_) {
+            // Ignore cancel transport errors.
+        }
+    }, []);
+
+    useEffect(() => {
+        const cancelInFlightAnalysis = () => {
+            const activeClientId = activeAnalyzeClientIdRef.current;
+            if (activeClientId) {
+                notifyAnalysisCancel(activeClientId);
+                activeAnalyzeClientIdRef.current = null;
+            }
+            if (wsRef.current) {
+                try { wsRef.current.close(); } catch (_) { }
+                wsRef.current = null;
+            }
+            if (abortControllerRef.current) {
+                try { abortControllerRef.current.abort(); } catch (_) { }
+                abortControllerRef.current = null;
+            }
+        };
+
+        window.addEventListener('beforeunload', cancelInFlightAnalysis);
+        window.addEventListener('pagehide', cancelInFlightAnalysis);
+        return () => {
+            window.removeEventListener('beforeunload', cancelInFlightAnalysis);
+            window.removeEventListener('pagehide', cancelInFlightAnalysis);
+        };
+    }, [notifyAnalysisCancel]);
 
     // Global View States (moved from MainLayout for centralized control)
     const [showAllPins, setShowAllPins] = useState(true);
@@ -414,7 +501,7 @@ const App = () => {
             // Validation for Single Mode
             const groupCount = zipFiles.length + geoJsonFiles.length + (shpComponents.length > 0 ? 1 : 0);
             if (groupCount > 1) {
-                setError("Mode Single hanya untuk 1 file analisis. Aktifkan 'Batch Mode' untuk upload banyak file sekaligus.");
+                setError("Upload ini hanya untuk 1 file analisis. Untuk banyak file, gunakan tombol 'Bulk Upload'.");
                 return;
             }
 
@@ -898,6 +985,9 @@ const App = () => {
 
 
     const handleDeleteHistory = async (id) => {
+        if (!isAdmin) {
+            throw new Error('Hanya admin yang dapat menghapus data.');
+        }
         try {
             await axios.delete(`${API_URL}/history/${id}`, {
                 headers: { 'X-User-ID': userId }
@@ -931,10 +1021,19 @@ const App = () => {
     // Strip expired GEE tile URLs from analysis results loaded from history.
     // GEE tile URLs expire after a few hours, so when loading saved data
     // we nullify them to let the fallback ImageOverlay (using local thumb_url/rgb_thumb_url) work.
+    const normalizeHistoryResults = (results) => {
+        if (!results) return [];
+        if (Array.isArray(results)) return results;
+        if (typeof results === 'object') {
+            return Object.values(results).filter(item => item && typeof item === 'object');
+        }
+        return [];
+    };
+
     const stripExpiredGeeUrls = (results) => {
-        if (!results) return results;
+        const normalized = normalizeHistoryResults(results);
         const isGeeUrl = (url) => url && (url.includes('earthengine.googleapis.com') || url.includes('googleapis.com/v1'));
-        return results.map(r => ({
+        return normalized.map(r => ({
             ...r,
             map_url: isGeeUrl(r.map_url) ? null : r.map_url,
             rgb_url: isGeeUrl(r.rgb_url) ? null : r.rgb_url,
@@ -942,6 +1041,63 @@ const App = () => {
     };
 
     const handleHistorySelect = async (item) => {
+        const historyId = item?.id || item?.analysis_id;
+        if (!historyId) {
+            console.error('❌ Invalid history item id:', item);
+            setError('Data riwayat tidak valid (ID tidak ditemukan).');
+            return;
+        }
+
+        const applySlopeSummary = (records) => {
+            if (!Array.isArray(records) || records.length === 0) {
+                setSlopeDbSummary(null);
+                setSlopeDbSummaryOutside(null);
+                return false;
+            }
+            const insideSlope = records.find(s => s.scope === 'INSIDE') || null;
+            const outsideSlope = records.find(s => s.scope === 'OUTSIDE_2KM')
+                || records.find(s => s.scope === 'OUTSIDE')
+                || null;
+            setSlopeDbSummary(insideSlope);
+            setSlopeDbSummaryOutside(outsideSlope);
+            return Boolean(insideSlope || outsideSlope);
+        };
+
+        const fetchSlopeSummaryFallback = async (historyId) => {
+            try {
+                const slopeRes = await axios.get(`${API_URL}/history/${historyId}/slope`);
+                const slopeAnalysis = slopeRes?.data?.slope_analysis || {};
+                const mapped = [];
+                if (slopeAnalysis.INSIDE) {
+                    mapped.push({
+                        scope: 'INSIDE',
+                        avg_slope: slopeAnalysis.INSIDE.avg_slope ?? 0,
+                        slope_0_8: slopeAnalysis.INSIDE.classes?.datar_0_8 ?? 0,
+                        slope_8_15: slopeAnalysis.INSIDE.classes?.landai_8_15 ?? 0,
+                        slope_15_25: slopeAnalysis.INSIDE.classes?.agak_curam_15_25 ?? 0,
+                        slope_25_40: slopeAnalysis.INSIDE.classes?.curam_25_45 ?? 0,
+                        slope_above_40: slopeAnalysis.INSIDE.classes?.sangat_curam_45_plus ?? 0,
+                    });
+                }
+                if (slopeAnalysis.OUTSIDE_2KM) {
+                    mapped.push({
+                        scope: 'OUTSIDE_2KM',
+                        avg_slope: slopeAnalysis.OUTSIDE_2KM.avg_slope ?? 0,
+                        slope_0_8: slopeAnalysis.OUTSIDE_2KM.classes?.datar_0_8 ?? 0,
+                        slope_8_15: slopeAnalysis.OUTSIDE_2KM.classes?.landai_8_15 ?? 0,
+                        slope_15_25: slopeAnalysis.OUTSIDE_2KM.classes?.agak_curam_15_25 ?? 0,
+                        slope_25_40: slopeAnalysis.OUTSIDE_2KM.classes?.curam_25_45 ?? 0,
+                        slope_above_40: slopeAnalysis.OUTSIDE_2KM.classes?.sangat_curam_45_plus ?? 0,
+                    });
+                }
+                if (mapped.length > 0) {
+                    applySlopeSummary(mapped);
+                }
+            } catch (slopeErr) {
+                console.warn(`⚠️ Could not fetch slope fallback for history ${historyId}:`, slopeErr?.message || slopeErr);
+            }
+        };
+
         // --- ⚡ OPTIMIZATION: RENDER DASHBOARD IMMEDIATELY ---
         // First, hide the global pins view so the dashboard knows we are in a specific item view
         setShowAllPins(false);
@@ -952,34 +1108,35 @@ const App = () => {
         setVectorLayerData(null);
 
         // Set the file/name immediately to update the dashboard title
-        setFile({ name: item.nama_kps || item.display_name || item.filename, size: item.file_size, id: item.id, kps_info: item.kps_info || null });
+        setFile({
+            name: item.nama_kps || item.display_name || item.filename,
+            size: item.file_size,
+            id: historyId,
+            kps_info: item.kps_info || null
+        });
 
         // Use the stats we already have from the list view
         // Strip expired GEE tile URLs so local assets (thumb_url, rgb_thumb_url) are used as fallback
-        if (item.analysis_results) {
-            console.log("📊 Setting analysis results immediately:", item.analysis_results.length, "years");
-            setData(stripExpiredGeeUrls(item.analysis_results));
+        const immediateResults = stripExpiredGeeUrls(item.analysis_results);
+        if (immediateResults.length > 0) {
+            console.log("📊 Setting analysis results immediately:", immediateResults.length, "years");
         }
+        setData(immediateResults);
 
         setTransitionSummary(item.metadata?.transition_summary || null);
         setAuditReport(item.metadata?.audit_report || null);
 
-        // Restore slope data if available in summary
-        if (item.slope_summary && item.slope_summary.length > 0) {
-            const insideSlope = item.slope_summary.find(s => s.scope === 'INSIDE');
-            const outsideSlope = item.slope_summary.find(s => s.scope === 'OUTSIDE_2KM')
-                || item.slope_summary.find(s => s.scope === 'OUTSIDE');
-            if (insideSlope) setSlopeDbSummary(insideSlope);
-            if (outsideSlope) setSlopeDbSummaryOutside(outsideSlope);
-        }
-        // Restore slope map URL if available from DB
-        if (item.slope_map_url) {
-            setSlopeStaticMapUrl(item.slope_map_url);
-        }
+        // Reset first to avoid stale slope from previously selected history
+        setSlopeDbSummary(null);
+        setSlopeDbSummaryOutside(null);
+        setSlopeStaticMapUrl(item.slope_map_url || null);
 
-        if (item.analysis_results?.length > 0) {
+        // Try quick restore from list payload (if present)
+        applySlopeSummary(item.slope_summary);
+
+        if (immediateResults.length > 0) {
             // Set to the highest year (most recent)
-            const maxYear = Math.max(...item.analysis_results.map(d => d.year));
+            const maxYear = Math.max(...immediateResults.map(d => d.year));
             setSelectedYear(maxYear);
             setMapType('SENTINEL_RGB');
             setShowOverlay(true);
@@ -987,15 +1144,13 @@ const App = () => {
 
         // If we have a centroid/point from the list, use it as temporary geoData 
         // until the full geometry loads, so the dashboard doesn't show "No Location"
-        if (item.geo_data) {
-            setGeoData(item.geo_data);
-        }
+        setGeoData(item.geo_data || null);
 
         // --- 🛰️ BACKGROUND FETCH FOR GEOMETRIES ---
         setLoadingGeometries(true);
         try {
-            console.log(`📡 Background Fetch: GeoJSON for history item ${item.id}`);
-            const response = await axios.get(`${API_URL}/history/${item.id}`);
+            console.log(`📡 Background Fetch: GeoJSON for history item ${historyId}`);
+            const response = await axios.get(`${API_URL}/history/${historyId}`);
             const fullItem = response.data;
 
             // Only update if we're still looking at the same item
@@ -1006,16 +1161,14 @@ const App = () => {
 
             // Sync any other details that might only be in the full item
             // Strip expired GEE URLs so local assets are used
-            if (fullItem.analysis_results) {
-                const cleanedResults = stripExpiredGeeUrls(fullItem.analysis_results);
-                setData(cleanedResults);
-                // Set selectedYear ke tahun terbaru jika belum di-set
-                if (cleanedResults.length > 0) {
-                    const maxYear = Math.max(...cleanedResults.map(d => d.year));
-                    setSelectedYear(maxYear);
-                    setMapType('SENTINEL_RGB');
-                    setShowOverlay(true);
-                }
+            const cleanedResults = stripExpiredGeeUrls(fullItem.analysis_results);
+            setData(cleanedResults);
+            // Set selectedYear ke tahun terbaru jika belum di-set
+            if (cleanedResults.length > 0) {
+                const maxYear = Math.max(...cleanedResults.map(d => d.year));
+                setSelectedYear(maxYear);
+                setMapType('SENTINEL_RGB');
+                setShowOverlay(true);
             }
 
             // Update file with kps_info from full detail
@@ -1029,6 +1182,11 @@ const App = () => {
             // Restore slope map URL from DB if available
             if (fullItem.slope_map_url) {
                 setSlopeStaticMapUrl(fullItem.slope_map_url);
+            }
+            // Restore slope summary from detail payload (or fallback endpoint)
+            const hasSlopeFromDetail = applySlopeSummary(fullItem.slope_summary);
+            if (!hasSlopeFromDetail) {
+                await fetchSlopeSummaryFallback(historyId);
             }
 
             console.log('✅ Background GeoJSON loaded');
@@ -1049,6 +1207,10 @@ const App = () => {
     }, [geoData]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleHistoryReanalyze = async (item) => {
+        if (!isAdmin) {
+            alert("Hanya admin yang dapat mengulang analisis.");
+            return;
+        }
         setLoadingHistory(true);
         try {
             const response = await axios.get(`${API_URL}/history/${item.id}`);
@@ -1095,6 +1257,11 @@ const App = () => {
 
     const handleCancel = () => {
         isCancelledRef.current = true;
+        const activeClientId = activeAnalyzeClientIdRef.current;
+        if (activeClientId) {
+            notifyAnalysisCancel(activeClientId);
+            activeAnalyzeClientIdRef.current = null;
+        }
         if (wsRef.current) {
             wsRef.current.close();
             wsRef.current = null;
@@ -1282,6 +1449,8 @@ const App = () => {
         setShowMonitoringTerkini(true);
     };
 
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
     const handleAnalyze = async (customThresholds = null) => {
         if (!geoData) return;
 
@@ -1307,6 +1476,98 @@ const App = () => {
 
         const WS_URL = API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
         const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        activeAnalyzeClientIdRef.current = clientId;
+
+        const waitPipelineUntilReady = async (historyId) => {
+            if (!historyId) return;
+
+            const maxWaitMs = 10 * 60 * 1000; // 10 minutes
+            const pollEveryMs = 2500;
+            const startedAt = Date.now();
+
+            setProgress(prev => Math.max(prev, 96));
+            setProgressStep("Finalisasi Asset Lokal...");
+            setProgressDetail("Menyiapkan tile & thumbnail lokal...");
+
+            while (Date.now() - startedAt < maxWaitMs) {
+                if (isCancelledRef.current) return;
+
+                try {
+                    const statusRes = await axios.get(`${API_URL}/history/${historyId}/pipeline-status`);
+                    const state = statusRes?.data?.pipeline_state || 'UNKNOWN';
+                    const prog = statusRes?.data?.progress || {};
+                    const tilePct = Number(prog.tile_progress_pct ?? 0);
+                    const assetPct = Number(prog.asset_progress_pct ?? 0);
+
+                    // Keep loading bar near-complete while finalization runs
+                    const finalPct = Math.min(99, 96 + Math.round(Math.max(tilePct, assetPct) / 25));
+                    setProgress(prev => Math.max(prev, finalPct));
+                    setProgressDetail(`Pipeline ${state} • Tile ${tilePct}% • Asset ${assetPct}%`);
+
+                    if (state === 'COMPLETED' || state === 'LEGACY') return;
+                    if (state === 'FAILED') {
+                        console.warn(`⚠️ Pipeline FAILED for ${historyId}, continuing to show results.`);
+                        return;
+                    }
+                } catch (pipelineErr) {
+                    // If endpoint not available / temporary errors, don't block forever.
+                    console.warn("⚠️ Pipeline status check failed:", pipelineErr?.message || pipelineErr);
+                    return;
+                }
+
+                await sleep(pollEveryMs);
+            }
+
+            console.warn(`⚠️ Pipeline wait timeout for ${historyId}, continuing UI flow.`);
+        };
+
+        const saveHistoryAndFinalize = async (analysisResults, transitionSummary, auditReportPayload) => {
+            if (!analysisResults?.length) return null;
+
+            setProgress(prev => Math.max(prev, 95));
+            setProgressStep("Menyimpan Hasil...");
+            setProgressDetail("Menyimpan riwayat analisa ke database...");
+
+            const resolvedKps = detectedKps || file?.kps_info || null;
+            const resolvedKpsId = resolvedKps?.id_kps_api || resolvedKps?.kps_id || null;
+            const resolvedNoSk = resolvedKps?.no_sk || extractedNoSk || null;
+            const resolvedKpsName = resolvedKps?.nama_kps || null;
+
+            const saveRes = await axios.post(`${API_URL}/history`, {
+                filename: file?.name || 'Unknown',
+                file_size: file?.size || 0,
+                metadata: {
+                    feature_count: geoData.features.length,
+                    geometry_type: geoData.features[0]?.geometry?.type,
+                    start_year: startYear,
+                    end_year: endYear,
+                    version: "3.0 (RF)",
+                    cloud_prob: CLOUD_PROB_THRESHOLD_FIXED,
+                    ...(resolvedNoSk ? { no_sk: resolvedNoSk } : {}),
+                    ...(resolvedKpsName ? { kps_name: resolvedKpsName } : {}),
+                    ...(resolvedKpsId ? { kps_id: resolvedKpsId } : {})
+                },
+                analysis_results: analysisResults,
+                geo_data: geoData,
+                mode: analysisMode,
+                transition_summary: transitionSummary,
+                audit_report: auditReportPayload,
+                // KPS Detection Fields
+                kps_id: resolvedKpsId,
+                link_method: kpsLinkMethod || 'NONE',
+                analysis_scope: resolvedKpsId ? 'KPS' : 'NON_KPS'
+            }, {
+                headers: { 'X-User-ID': userId }
+            });
+
+            const historyId = saveRes?.data?.data?.id;
+            if (historyId) {
+                await waitPipelineUntilReady(historyId);
+            }
+
+            await fetchHistory();
+            return historyId;
+        };
 
         const runWebSocketAnalysis = () => new Promise((resolve, reject) => {
             const ws = new WebSocket(`${WS_URL}/ws/analyze/${clientId}`);
@@ -1347,51 +1608,61 @@ const App = () => {
                         setQueuePosition(null);
                         console.log('✅ Analysis complete! Data received:', msg.data);
                         console.log('📊 Data array length:', msg.data.data?.length);
-                        completed = true; setProgress(100); setProgressStep("Analisis Selesai!");
+                        completed = true;
                         setData(msg.data.data);
                         setTransitionSummary(msg.data.transition_summary || null);
                         setAuditReport(msg.data.audit_report || null);
                         if (msg.data.data?.length > 0) {
-                            console.log('💾 Saving to history...');
                             // Set to the highest year (most recent)
                             const maxYear = Math.max(...msg.data.data.map(d => d.year));
                             const lastData = msg.data.data.find(d => d.year === maxYear) || msg.data.data[msg.data.data.length - 1];
                             setSelectedYear(maxYear); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB');
-                            axios.post(`${API_URL}/history`, {
-                                filename: file?.name || 'Unknown',
-                                file_size: file?.size || 0,
-                                metadata: {
-                                    feature_count: geoData.features.length,
-                                    geometry_type: geoData.features[0]?.geometry?.type,
-                                    start_year: startYear,
-                                    end_year: endYear,
-                                    version: "3.0 (RF)",
-                                    cloud_prob: CLOUD_PROB_THRESHOLD_FIXED
-                                },
-                                analysis_results: msg.data.data,
-                                geo_data: geoData,
-                                mode: analysisMode, // Pass the mode (merge/replace)
-                                transition_summary: msg.data.transition_summary,
-                                audit_report: msg.data.audit_report,
-                                // KPS Detection Fields
-                                kps_id: detectedKps?.id_kps_api || null,
-                                link_method: kpsLinkMethod || 'NONE',
-                                analysis_scope: detectedKps ? 'KPS' : 'NON_KPS'
-                            }, {
-                                headers: { 'X-User-ID': userId }
-                            }).then(() => {
-                                console.log('✅ History saved successfully');
-                                fetchHistory();
-                            }).catch(err => {
-                                console.error('❌ Failed to save history:', err.response?.data || err.message);
+
+                            // Keep overlay open until local asset pipeline is done.
+                            saveHistoryAndFinalize(
+                                msg.data.data,
+                                msg.data.transition_summary,
+                                msg.data.audit_report
+                            ).then(() => {
+                                setProgress(100);
+                                setProgressStep("Analisis Selesai!");
+                                setProgressDetail("Semua asset lokal siap digunakan.");
+                                setLoading(false);
+                                setShowAnalysisComplete(true);
+                                setTimeout(() => setProgress(0), 2000);
+                                activeAnalyzeClientIdRef.current = null;
+                                ws.close();
+                                resolve(msg.data);
+                            }).catch((finalizeErr) => {
+                                console.error('❌ Finalization failed:', finalizeErr);
+                                ws.close();
+                                const err = new Error(`Finalisasi analisa gagal: ${finalizeErr?.message || finalizeErr}`);
+                                err.noFallback = true;
+                                reject(err);
                             });
+                            return;
                         } else {
                             console.warn('⚠️ Analysis returned empty data array - history not saved');
+                            setProgress(100);
+                            setProgressStep("Analisis Selesai!");
+                            setProgressDetail("Tidak ada data tahunan untuk disimpan.");
+                            setLoading(false);
+                            setShowAnalysisComplete(true);
+                            setTimeout(() => setProgress(0), 2000);
+                            activeAnalyzeClientIdRef.current = null;
+                            ws.close();
+                            resolve(msg.data);
+                            return;
                         }
-                        setLoading(false); setShowAnalysisComplete(true); setTimeout(() => setProgress(0), 2000); ws.close(); resolve(msg.data);
                     } else if (msg.type === 'error') {
                         console.error('❌ WebSocket error message:', msg.error);
-                        completed = true; setLoading(false); ws.close(); reject(new Error(msg.error));
+                        completed = true;
+                        setLoading(false);
+                        activeAnalyzeClientIdRef.current = null;
+                        ws.close();
+                        const err = new Error(msg.error);
+                        err.noFallback = true;
+                        reject(err);
                     }
                 } catch (e) { console.error(e); }
             };
@@ -1399,7 +1670,13 @@ const App = () => {
         });
 
         try { await runWebSocketAnalysis(); } catch (wsError) {
+            activeAnalyzeClientIdRef.current = null;
             if (isCancelledRef.current) return;
+            if (wsError?.noFallback) {
+                setError(wsError.message || 'Finalisasi analisa gagal.');
+                setLoading(false);
+                return;
+            }
             console.log('Falling back to HTTP');
             const progressInterval = setInterval(() => {
                 setProgress(p => p >= 95 ? p : p + 2);
@@ -1427,32 +1704,18 @@ const App = () => {
                         const maxYear = Math.max(...response.data.data.map(d => d.year));
                         const lastData = response.data.data.find(d => d.year === maxYear) || response.data.data[response.data.data.length - 1];
                         setSelectedYear(maxYear); setMapUrl(lastData.map_url); setRgbMapUrl(lastData.rgb_url); setMapType('SENTINEL_RGB'); setShowOverlay(true);
-                        axios.post(`${API_URL}/history`, {
-                            filename: file?.name || 'Unknown',
-                            file_size: file?.size || 0,
-                            metadata: {
-                                feature_count: geoData.features.length,
-                                geometry_type: geoData.features[0]?.geometry?.type,
-                                start_year: startYear,
-                                end_year: endYear,
-                                version: "3.0 (RF)",
-                                cloud_prob: CLOUD_PROB_THRESHOLD_FIXED
-                            },
-                            analysis_results: response.data.data,
-                            geo_data: geoData,
-                            transition_summary: response.data.transition_summary,
-                            audit_report: response.data.audit_report,
-                            // KPS Detection Fields
-                            kps_id: detectedKps?.id_kps_api || null,
-                            link_method: kpsLinkMethod || 'NONE',
-                            analysis_scope: detectedKps ? 'KPS' : 'NON_KPS'
-                        }, {
-                            headers: { 'X-User-ID': userId }
-                        }).then(() => fetchHistory());
+                        await saveHistoryAndFinalize(
+                            response.data.data,
+                            response.data.transition_summary,
+                            response.data.audit_report
+                        );
                     }
+                    setProgress(100);
+                    setProgressStep("Analisis Selesai!");
+                    setProgressDetail("Semua asset lokal siap digunakan.");
                     setShowAnalysisComplete(true);
                 } else setError(response.data.message || 'Analisis gagal');
-            } catch (err) { setError(`Error: ${err.message}`); } finally { clearInterval(progressInterval); setLoading(false); setTimeout(() => setProgress(0), 2000); }
+            } catch (err) { setError(`Error: ${err.message}`); } finally { clearInterval(progressInterval); setLoading(false); setTimeout(() => setProgress(0), 2000); activeAnalyzeClientIdRef.current = null; }
         }
     };
 
@@ -1520,17 +1783,18 @@ const App = () => {
         }
     }, [selectedYearData]);
 
+    const useLocalTiles = pipelineState === 'COMPLETED';
+
     // Local tile URLs for cache-first serving (pipeline Phase 1)
     const localMapTileUrl = useMemo(() => {
-        if (!file?.id || !selectedYear) return null;
-        const idShort = file.id.substring(0, 8);
+        if (!useLocalTiles || !file?.id || !selectedYear) return null;
         return `${API_URL}/tiles/${file.id}/classified/${selectedYear}/{z}/{x}/{y}.png`;
-    }, [file?.id, selectedYear]);
+    }, [useLocalTiles, file?.id, selectedYear]);
 
     const localRgbTileUrl = useMemo(() => {
-        if (!file?.id || !selectedYear) return null;
+        if (!useLocalTiles || !file?.id || !selectedYear) return null;
         return `${API_URL}/tiles/${file.id}/rgb/${selectedYear}/{z}/{x}/{y}.png`;
-    }, [file?.id, selectedYear]);
+    }, [useLocalTiles, file?.id, selectedYear]);
     const yearStats = useMemo(() => {
         if (!selectedYearData) return null;
         const stats = Object.entries(LAND_COVER_CONFIG).map(([key, config]) => ({ key, ...config, value: selectedYearData[key] || 0 })).filter(s => s.value > 0);
@@ -1559,8 +1823,6 @@ const App = () => {
         showDAS, setShowDAS, dasOpacity, setDasOpacity,
         // Slope Analysis Layer
         showSlopeLayer, setShowSlopeLayer, slopeOpacityInside, setSlopeOpacityInside, slopeOpacityOutside, setSlopeOpacityOutside, slopeMapUrlInside, slopeMapUrlOutside, slopeDbSummary, slopeDbSummaryOutside,
-        // Batch Mode
-        isBatchMode, setIsBatchMode,
         // Carbon Time-Series Mode
         onOpenCarbonMode: (historyId, filename) => {
             setCarbonHistoryId(historyId);
@@ -1576,16 +1838,32 @@ const App = () => {
         setShowBulkUploadDialog,
         // Monitoring Terkini
         onOpenMonitoringTerkini: handleOpenMonitoringTerkini,
-        detectedKps
+        detectedKps,
+        canDeleteHistory: isAdmin
     };
 
     // Login Handler
-    const handleLoginSuccess = (userData) => {
-        setIsAuthenticated(true);
+    const handleLoginSuccess = (sessionData) => {
+        const token = sessionData?.token || localStorage.getItem('auth_token') || '';
+        const user = sessionData?.user || (() => {
+            try {
+                const raw = localStorage.getItem('auth_user');
+                return raw ? JSON.parse(raw) : null;
+            } catch (_) {
+                return null;
+            }
+        })();
+        setAuthToken(token);
+        setAuthUser(user);
+        setIsAuthenticated(Boolean(token));
     };
 
     const handleLogout = () => {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
         localStorage.removeItem('user');
+        setAuthToken('');
+        setAuthUser(null);
         setIsAuthenticated(false);
         // Reset all state when logging out
         setFile(null);

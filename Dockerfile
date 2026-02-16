@@ -4,13 +4,15 @@ WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ .
-ARG VITE_API_URL=""
-ARG VITE_SUPABASE_URL=""
-ARG VITE_SUPABASE_ANON_KEY=""
-ENV VITE_API_URL=$VITE_API_URL
-ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
-ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
-RUN npm run build
+COPY .env.example /app/.env.production
+ARG BUILD_VITE_API_URL=""
+ARG BUILD_VITE_SUPABASE_URL=""
+ARG BUILD_VITE_SUPABASE_ANON_KEY=""
+RUN set -e; \
+    if [ -n "$BUILD_VITE_API_URL" ] || [ -n "$BUILD_VITE_SUPABASE_URL" ] || [ -n "$BUILD_VITE_SUPABASE_ANON_KEY" ]; then \
+      printf 'VITE_API_URL=%s\nVITE_SUPABASE_URL=%s\nVITE_SUPABASE_ANON_KEY=%s\n' "$BUILD_VITE_API_URL" "$BUILD_VITE_SUPABASE_URL" "$BUILD_VITE_SUPABASE_ANON_KEY" > /app/.env.production.local; \
+    fi; \
+    npm run build
 
 # ── Stage 2: Production ──
 FROM python:3.11-slim

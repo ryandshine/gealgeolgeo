@@ -8,24 +8,29 @@ import os
 import time
 import json
 import hashlib
+import hmac
 import math
+import re
 import asyncio
+import secrets
 import requests
 import numpy as np
+from collections import defaultdict, deque
 from scipy import sparse
 from scipy.sparse.linalg import splu
 from datetime import datetime, timedelta
 # Force reload: 2026-01-11 07:11
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 
 import ee
+import httplib2
 import zipfile
 import io
 import traceback
 import logging
 import base64
 import shapefile # pyshp
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response, Request, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response, Request, BackgroundTasks, Query, Depends, Header
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -34,6 +39,7 @@ from shapely.validation import make_valid
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 import pathlib
+from urllib.parse import urlparse, unquote
 
 from pkps_sync import run_sync_process
 from pipeline import PipelineState, PipelineManager, AssetManifest, calculate_bbox_from_geojson
@@ -71,6 +77,219 @@ if SUPABASE_URL and SUPABASE_KEY:
         print("✅ Supabase client initialized")
     except Exception as e:
         print(f"⚠️ Failed to initialize Supabase: {e}")
+
+# Authentication Configuration
+AUTH_ISSUER = os.getenv("AUTH_ISSUER", "gealgeolgeo-api")
+AUTH_SECRET = os.getenv("AUTH_SECRET") or os.getenv("APP_AUTH_SECRET") or SUPABASE_KEY
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+AUTH_TOKEN_EXPIRE_HOURS = max(1, _env_int("AUTH_TOKEN_EXPIRE_HOURS", 12))
+PASSWORD_HASH_ITERATIONS = max(100_000, _env_int("PASSWORD_HASH_ITERATIONS", 210000))
+ADMIN_EMAILS = {
+    email.strip().lower()
+    for email in os.getenv("ADMIN_EMAILS", "").split(",")
+    if email.strip()
+}
+SYNC_VISUAL_PERSIST_ON_SAVE = os.getenv("SYNC_VISUAL_PERSIST_ON_SAVE", "false").strip().lower() in {"1", "true", "yes", "on"}
+DASHBOARD_AGG_CACHE_SECONDS = max(0, _env_int("DASHBOARD_AGG_CACHE_SECONDS", 60))
+HISTORY_LIST_CACHE_SECONDS = max(0, _env_int("HISTORY_LIST_CACHE_SECONDS", 300))
+HISTORY_KPS_LOOKUP_CONCURRENCY = max(1, _env_int("HISTORY_KPS_LOOKUP_CONCURRENCY", 8))
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def _b64url_decode(raw: str) -> bytes:
+    padding = "=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(raw + padding)
+
+def _create_access_token(user_id: str, email: str, role: str) -> str:
+    if not AUTH_SECRET:
+        raise HTTPException(status_code=500, detail="Auth secret is not configured on server")
+
+    now = int(time.time())
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "role": role,
+        "iat": now,
+        "exp": now + (AUTH_TOKEN_EXPIRE_HOURS * 3600),
+        "iss": AUTH_ISSUER,
+    }
+    header = {"alg": "HS256", "typ": "JWT"}
+    encoded_header = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    encoded_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_payload}"
+    signature = hmac.new(AUTH_SECRET.encode("utf-8"), signing_input.encode("utf-8"), hashlib.sha256).digest()
+    return f"{signing_input}.{_b64url_encode(signature)}"
+
+def _decode_access_token(token: str) -> Dict[str, Any]:
+    if not AUTH_SECRET:
+        raise HTTPException(status_code=500, detail="Auth secret is not configured on server")
+
+    try:
+        encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+
+    signing_input = f"{encoded_header}.{encoded_payload}"
+    expected_signature = hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        signing_input.encode("utf-8"),
+        hashlib.sha256
+    ).digest()
+
+    try:
+        token_signature = _b64url_decode(encoded_signature)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token signature")
+
+    if not hmac.compare_digest(expected_signature, token_signature):
+        raise HTTPException(status_code=401, detail="Invalid token signature")
+
+    try:
+        payload = json.loads(_b64url_decode(encoded_payload).decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    now = int(time.time())
+    exp = int(payload.get("exp", 0))
+    if exp <= now:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    issuer = payload.get("iss")
+    if issuer != AUTH_ISSUER:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+
+    return payload
+
+def hash_password_pbkdf2(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS
+    )
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+def verify_password_pbkdf2(password: str, stored_hash: str) -> bool:
+    try:
+        prefix, iter_str, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if prefix != "pbkdf2_sha256":
+            return False
+        iterations = int(iter_str)
+        salt = bytes.fromhex(salt_hex)
+        expected_digest = bytes.fromhex(digest_hex)
+    except Exception:
+        return False
+
+    actual_digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations
+    )
+    return hmac.compare_digest(actual_digest, expected_digest)
+
+def verify_user_password(plain_password: str, user_row: Dict[str, Any]) -> Tuple[bool, bool]:
+    stored_hash = user_row.get("password_hash")
+    if isinstance(stored_hash, str) and stored_hash.strip():
+        if verify_password_pbkdf2(plain_password, stored_hash.strip()):
+            return True, False
+
+    legacy_password = user_row.get("password")
+    if legacy_password is None:
+        return False, False
+
+    if hmac.compare_digest(str(legacy_password), plain_password):
+        needs_upgrade = not (isinstance(stored_hash, str) and stored_hash.strip())
+        return True, needs_upgrade
+    return False, False
+
+def resolve_user_role(user_row: Dict[str, Any]) -> str:
+    email = str(user_row.get("email") or "").strip().lower()
+    raw_role = str(user_row.get("role") or "").strip().lower()
+
+    if bool(user_row.get("is_admin")):
+        return "admin"
+    if raw_role in {"admin", "superadmin", "super_admin", "owner"}:
+        return "admin"
+    if email and email in ADMIN_EMAILS:
+        return "admin"
+    if raw_role:
+        return raw_role
+    return "user"
+
+def is_user_active(user_row: Dict[str, Any]) -> bool:
+    for active_key in ("is_active", "active"):
+        if active_key in user_row and user_row.get(active_key) is False:
+            return False
+
+    status = str(user_row.get("status") or "").strip().lower()
+    if status in {"inactive", "disabled", "blocked", "suspended"}:
+        return False
+
+    return True
+
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    # Try richer variants first; keep role/is_admin in every fallback so admin mapping
+    # still works even if optional auth columns (e.g. password_hash/status) are absent.
+    select_variants = [
+        "id,email,password_hash,password,role,is_admin,is_active,active,status",
+        "id,email,password_hash,password,role,is_admin",
+        "id,email,password,role,is_admin,is_active,active,status",
+        "id,email,password,role,is_admin",
+        "id,email,password_hash,password,is_admin,role",
+        "id,email,password",
+    ]
+
+    for fields in select_variants:
+        try:
+            res = await asyncio.to_thread(
+                lambda f=fields: supabase.table("users")
+                .select(f)
+                .eq("email", email)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            return rows[0] if rows else None
+        except Exception as e:
+            msg = str(e).lower()
+            if "column" in msg and "does not exist" in msg:
+                continue
+            raise
+
+    return None
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    parts = authorization.strip().split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = parts[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    return token
+
+async def get_current_user_claims(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    token = _extract_bearer_token(authorization)
+    return _decode_access_token(token)
+
+async def require_admin_user(current_user: Dict[str, Any] = Depends(get_current_user_claims)) -> Dict[str, Any]:
+    role = str(current_user.get("role") or "").strip().lower()
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can perform this action")
+    return current_user
 
 # ==============================================================================
 # SERVER-SIDE FILE CACHE (diskcache) - PERMANENT MODE
@@ -153,6 +372,177 @@ pipeline_manager: Optional[PipelineManager] = None
 if supabase:
     pipeline_manager = PipelineManager(supabase, STORAGE_ROOT)
     print("✅ Pipeline manager initialized")
+
+# ==============================================================================
+# TILE MISS AUTO-HEAL (Recover + Regenerate Fallback)
+# ==============================================================================
+TILE_MISS_WINDOW_SEC = max(30, _env_int("TILE_MISS_WINDOW_SEC", 90))
+TILE_MISS_THRESHOLD = max(20, _env_int("TILE_MISS_THRESHOLD", 40))
+TILE_AUTO_HEAL_COOLDOWN_SEC = max(120, _env_int("TILE_AUTO_HEAL_COOLDOWN_SEC", 600))
+
+# key: "{history_id}:{asset_type}:{year}" -> deque[(timestamp, z, x, y)]
+_TILE_MISS_EVENTS: Dict[str, deque] = defaultdict(deque)
+# key: history_id -> bool/time marker
+_TILE_AUTO_HEAL_RUNNING: Dict[str, bool] = {}
+_TILE_AUTO_HEAL_LAST_RUN: Dict[str, float] = {}
+
+
+def _tile_miss_key(history_id: str, asset_type: str, year: str) -> str:
+    return f"{history_id}:{asset_type}:{year}"
+
+
+def _record_tile_miss(history_id: str, asset_type: str, year: str, z: int, x: int, y: int) -> int:
+    now_ts = time.time()
+    key = _tile_miss_key(history_id, asset_type, year)
+    events = _TILE_MISS_EVENTS[key]
+    events.append((now_ts, z, x, y))
+
+    cutoff = now_ts - TILE_MISS_WINDOW_SEC
+    while events and events[0][0] < cutoff:
+        events.popleft()
+    return len(events)
+
+
+def _lng_to_tile_x(lng: float, zoom: int) -> int:
+    return int((lng + 180.0) / 360.0 * (1 << zoom))
+
+
+def _lat_to_tile_y(lat: float, zoom: int) -> int:
+    # Clamp latitude to Web Mercator valid range to avoid tan/cos overflow.
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    lat_rad = math.radians(lat)
+    n = 1 << zoom
+    return int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+
+
+def _tile_is_inside_manifest_bbox(manifest: Dict[str, Any], z: int, x: int, y: int) -> bool:
+    try:
+        bbox = (manifest or {}).get("bbox") or {}
+        west = float(bbox.get("west"))
+        east = float(bbox.get("east"))
+        north = float(bbox.get("north"))
+        south = float(bbox.get("south"))
+
+        x_min = _lng_to_tile_x(west, z)
+        x_max = _lng_to_tile_x(east, z)
+        y_min = _lat_to_tile_y(north, z)
+        y_max = _lat_to_tile_y(south, z)
+        return x_min <= x <= x_max and y_min <= y <= y_max
+    except Exception:
+        # If manifest/bbox unavailable, do not block healing decisions.
+        return True
+
+
+async def _fetch_history_pipeline_row(history_id: str) -> Optional[Dict[str, Any]]:
+    if not supabase:
+        return None
+    try:
+        row = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .select("id,pipeline_state,asset_manifest")
+            .eq("id", history_id)
+            .single()
+            .execute()
+        )
+        if row and row.data:
+            return row.data
+    except Exception as e:
+        print(f"⚠️ Auto-heal: failed reading pipeline row for {history_id[:8]}: {e}")
+    return None
+
+
+async def _run_tile_auto_heal(history_id: str, reason: str):
+    """
+    Best-effort self-healing for missing local tiles:
+    1) try recover pipeline (uses existing URLs),
+    2) if URLs expired -> force regenerate visuals, then recover again.
+    """
+    try:
+        if not pipeline_manager:
+            return
+
+        short_id = history_id[:8]
+        print(f"🛠️ [TileAutoHeal:{short_id}] Start ({reason})")
+        recover_result = await pipeline_manager.recover_assets(history_id)
+        print(f"🛠️ [TileAutoHeal:{short_id}] recover_result={recover_result}")
+
+        if isinstance(recover_result, dict) and recover_result.get("status") == "needs_regeneration":
+            print(f"🔄 [TileAutoHeal:{short_id}] URLs expired, running force regenerate...")
+            try:
+                await regenerate_visuals(history_id, trigger_pipeline=False, force=True)
+            except Exception as regen_err:
+                print(f"⚠️ [TileAutoHeal:{short_id}] force regenerate failed: {regen_err}")
+            recover_result = await pipeline_manager.recover_assets(history_id)
+            print(f"🛠️ [TileAutoHeal:{short_id}] recover_after_regen={recover_result}")
+
+    except Exception as e:
+        print(f"⚠️ Tile auto-heal failed for {history_id[:8]}: {e}")
+    finally:
+        now_ts = time.time()
+        _TILE_AUTO_HEAL_RUNNING[history_id] = False
+        _TILE_AUTO_HEAL_LAST_RUN[history_id] = now_ts
+
+        # Clear stale miss buckets for this history so counter restarts cleanly.
+        prefix = f"{history_id}:"
+        for key in [k for k in list(_TILE_MISS_EVENTS.keys()) if k.startswith(prefix)]:
+            _TILE_MISS_EVENTS.pop(key, None)
+
+
+async def _maybe_schedule_tile_auto_heal(
+    history_id: str,
+    asset_type: str,
+    year: str,
+    z: int,
+    x: int,
+    y: int,
+):
+    if not pipeline_manager:
+        return
+    if asset_type not in {"classified", "rgb"}:
+        return
+
+    total_miss = _record_tile_miss(history_id, asset_type, year, z, x, y)
+    if total_miss < TILE_MISS_THRESHOLD:
+        return
+
+    now_ts = time.time()
+    if _TILE_AUTO_HEAL_RUNNING.get(history_id):
+        return
+    last_run = _TILE_AUTO_HEAL_LAST_RUN.get(history_id, 0)
+    if now_ts - last_run < TILE_AUTO_HEAL_COOLDOWN_SEC:
+        return
+
+    row = await _fetch_history_pipeline_row(history_id)
+    if not row:
+        return
+
+    pipeline_state = str(row.get("pipeline_state") or "").upper()
+    if pipeline_state in {"ANALYZING", "SAVING_ASSETS", "RECOVERING", "VALIDATING"}:
+        return
+
+    manifest = row.get("asset_manifest") or {}
+    year_assets = (manifest.get("assets_per_year") or {}).get(str(year), {})
+    asset_key = "tile_archive" if asset_type == "classified" else "rgb_tile_archive"
+    asset_status = (year_assets.get(asset_key) or {}).get("status")
+    if str(asset_status).lower() == "skipped":
+        return
+
+    # Avoid false-positive heal from panning outside SHP bounds:
+    # trigger only if enough misses happen INSIDE the expected bbox.
+    miss_key = _tile_miss_key(history_id, asset_type, year)
+    events = _TILE_MISS_EVENTS.get(miss_key) or []
+    inside_miss = 0
+    for _, ev_z, ev_x, ev_y in events:
+        if _tile_is_inside_manifest_bbox(manifest, ev_z, ev_x, ev_y):
+            inside_miss += 1
+    if inside_miss < TILE_MISS_THRESHOLD:
+        return
+
+    _TILE_AUTO_HEAL_RUNNING[history_id] = True
+    short_id = history_id[:8]
+    reason = f"{inside_miss} miss/{TILE_MISS_WINDOW_SEC}s {asset_type} y{year}"
+    print(f"🚨 [TileAutoHeal:{short_id}] Triggered ({reason})")
+    asyncio.create_task(_run_tile_auto_heal(history_id, reason))
 
 def save_image_persistence(data: Any, filename: str) -> Optional[str]:
     """
@@ -256,6 +646,65 @@ def save_image_persistence(data: Any, filename: str) -> Optional[str]:
 # Alias for backward compatibility
 save_local_image = save_image_persistence
 
+def extract_thumbnail_object_name(asset_url: Optional[str]) -> Optional[str]:
+    """
+    Extract Supabase Storage object name under `thumbnails/` bucket from URL.
+    Returns filename/path relative to bucket or None.
+    """
+    if not asset_url:
+        return None
+
+    raw = str(asset_url).strip()
+    if not raw:
+        return None
+
+    # Accept both full URL and path-like values.
+    path = urlparse(raw).path if "://" in raw else raw
+    path = unquote(path)
+
+    marker = "/storage/v1/object/public/thumbnails/"
+    if marker in path:
+        obj = path.split(marker, 1)[1]
+        obj = obj.split("?", 1)[0].strip("/")
+        return obj or None
+
+    return None
+
+def extract_local_storage_relative_path(asset_url: Optional[str]) -> Optional[str]:
+    """
+    Extract relative local path from `/storage/...` URL.
+    Example: `/storage/thumbnails/a.webp` -> `thumbnails/a.webp`
+    """
+    if not asset_url:
+        return None
+
+    raw = str(asset_url).strip()
+    if not raw:
+        return None
+
+    path = urlparse(raw).path if "://" in raw else raw
+    path = unquote(path)
+
+    marker = "/storage/"
+    if marker not in path:
+        return None
+
+    rel = path.split(marker, 1)[1].split("?", 1)[0].strip("/")
+    if not rel or ".." in rel:
+        return None
+    return rel
+
+def safe_local_storage_path(relative_path: str) -> Optional[str]:
+    """Build normalized local path under STORAGE_ROOT and prevent path traversal."""
+    if not relative_path:
+        return None
+
+    root = os.path.normpath(STORAGE_ROOT)
+    full = os.path.normpath(os.path.join(root, relative_path))
+    if full == root or full.startswith(root + os.sep):
+        return full
+    return None
+
 # ==============================================================================
 # CACHE HELPER FUNCTIONS
 # ==============================================================================
@@ -291,6 +740,83 @@ def invalidate_cache(pattern: str):
             print(f"🗑️ Invalidated {deleted_count} cache entries matching: {pattern}")
     except Exception as e:
         print(f"⚠️ Cache invalidation failed for {pattern}: {e}")
+
+
+def extract_no_sk_from_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract NO_SK-like value from analysis metadata with tolerant key matching."""
+    if not isinstance(metadata, dict):
+        return None
+
+    preferred_keys = [
+        "no_sk", "NO_SK", "noSk", "nosk", "NO_SK_PPHD", "NO_SK_PPHKM", "NO_SK_PPHTR",
+        "sk_number", "SK_NUMBER", "no_kps", "NO_KPS", "nosk_kps", "NOSK_KPS"
+    ]
+
+    for key in preferred_keys:
+        val = metadata.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+
+    for key, val in metadata.items():
+        if val is None or not str(val).strip():
+            continue
+        up_key = str(key).upper()
+        if ("NO" in up_key and "SK" in up_key) or up_key in {"SK", "NO_SK"}:
+            return str(val).strip()
+
+    return None
+
+
+def extract_no_sk_from_filename(filename: Optional[str]) -> Optional[str]:
+    """Best-effort extraction of NO_SK token from filename, e.g. '...SK_8273_...' -> '8273'."""
+    if not filename:
+        return None
+
+    base = os.path.splitext(os.path.basename(str(filename)))[0]
+
+    # Common pattern from uploaded SHP names: *_SK_8273_*
+    m = re.search(r"(?:^|[_\-\s])SK[_\-\s]*([0-9]{2,8})(?:[_\-\s]|$)", base, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Fallback: if filename mentions SK, take first numeric token
+    if re.search(r"\bSK\b|_SK_|-SK-", base, flags=re.IGNORECASE):
+        m2 = re.search(r"([0-9]{2,8})", base)
+        if m2:
+            return m2.group(1)
+
+    return None
+
+
+def normalize_link_method(method: Optional[str]) -> str:
+    """Normalize link method to DB-safe enum values."""
+    raw = str(method or "NONE").strip().upper()
+    if raw in {"NO_SK_METADATA", "MANUAL", "NONE", "AUTO"}:
+        return raw
+    if raw in {"AUTO_DETECTED", "AUTO_NO_SK", "AUTO_NO_SK_FALLBACK"}:
+        return "AUTO"
+    return "NONE"
+
+
+async def lookup_kps_by_no_sk(no_sk: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Lookup master_kps record by NO_SK with partial matching."""
+    if not supabase or not no_sk or not str(no_sk).strip():
+        return None
+
+    query_str = str(no_sk).strip()
+    try:
+        res = await supabase_query(
+            lambda: supabase.table("master_kps")
+            .select("id_kps_api, nama_kps, no_sk, provinsi, kab_kota, kps_type")
+            .ilike("no_sk", f"%{query_str}%")
+            .limit(1)
+            .execute()
+        )
+        if res and res.data:
+            return res.data[0]
+    except Exception as e:
+        print(f"⚠️ lookup_kps_by_no_sk failed for '{query_str}': {e}")
+    return None
 
 # Sentinel-2 Surface Reflectance Collection
 SENTINEL2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
@@ -359,7 +885,7 @@ from contextlib import asynccontextmanager
 class AnalysisQueueManager:
     """Manages concurrent analysis jobs with position tracking and notifications."""
     
-    def __init__(self, max_concurrent=2):
+    def __init__(self, max_concurrent=1):
         self.max_concurrent = max_concurrent
         self.waiting_queue = [] # List of job_ids in order
         self.active_jobs = set() # Set of job_ids currently running
@@ -367,7 +893,12 @@ class AnalysisQueueManager:
         self.current_semaphore = asyncio.Semaphore(max_concurrent)
 
     @asynccontextmanager
-    async def enter_queue(self, job_id: str, on_queue_update: Callable = None):
+    async def enter_queue(
+        self,
+        job_id: str,
+        on_queue_update: Callable = None,
+        check_cancel: Optional[Callable] = None,
+    ):
         """Register a job in the queue and wait for its turn."""
         async with self.lock:
             if job_id not in self.waiting_queue and job_id not in self.active_jobs:
@@ -382,26 +913,46 @@ class AnalysisQueueManager:
             pos = await self.get_position(job_id)
             await on_queue_update(pos)
 
-        # Wait for semaphore slot
-        async with self.current_semaphore:
+        acquired = False
+        try:
+            # Wait for semaphore slot, but keep checking cancellation while waiting.
+            while not acquired:
+                if check_cancel and await check_cancel():
+                    async with self.lock:
+                        if job_id in self.waiting_queue:
+                            self.waiting_queue.remove(job_id)
+                    print(f"⛔ Job {job_id} cancelled while waiting in queue.")
+                    await self._broadcast_queue_shifts()
+                    raise Exception("Analisis dibatalkan oleh pengguna")
+
+                try:
+                    await asyncio.wait_for(self.current_semaphore.acquire(), timeout=0.5)
+                    acquired = True
+                except asyncio.TimeoutError:
+                    # Keep queue position updates responsive while waiting.
+                    if on_queue_update:
+                        pos = await self.get_position(job_id)
+                        await on_queue_update(pos)
+
             async with self.lock:
                 # Remove from waiting, move to active
                 if job_id in self.waiting_queue:
                     self.waiting_queue.remove(job_id)
                 self.active_jobs.add(job_id)
                 print(f"🚀 Job {job_id} starting execution.")
-            
+
             # Notify everyone remaining in queue that positions might have shifted
             await self._broadcast_queue_shifts()
-            
-            try:
-                yield True
-            finally:
-                async with self.lock:
-                    if job_id in self.active_jobs:
-                        self.active_jobs.remove(job_id)
+
+            yield True
+        finally:
+            async with self.lock:
+                if job_id in self.active_jobs:
+                    self.active_jobs.remove(job_id)
                     print(f"✅ Job {job_id} finished.")
-                await self._broadcast_queue_shifts()
+            if acquired:
+                self.current_semaphore.release()
+            await self._broadcast_queue_shifts()
 
     async def get_position(self, job_id: str) -> int:
         """Get 1-based position in queue. 0 if active/not found."""
@@ -415,6 +966,25 @@ class AnalysisQueueManager:
         async with self.lock:
             return len(self.waiting_queue) == 0 and len(self.active_jobs) == 0
 
+    async def cancel_job(self, job_id: str) -> Dict[str, Any]:
+        """
+        Cancel queue participation for a job.
+        - waiting: removed immediately
+        - active: cannot hard-stop here; caller should use cancel token
+        """
+        status = "not_found"
+        async with self.lock:
+            if job_id in self.waiting_queue:
+                self.waiting_queue.remove(job_id)
+                status = "removed_from_waiting_queue"
+            elif job_id in self.active_jobs:
+                status = "active_marked_for_cancel"
+
+        if status == "removed_from_waiting_queue":
+            await self._broadcast_queue_shifts()
+
+        return {"job_id": job_id, "status": status}
+
     async def _broadcast_queue_shifts(self):
         """Helper to trigger position updates for all waiting jobs."""
         active_copy = []
@@ -426,11 +996,36 @@ class AnalysisQueueManager:
             # We assume Job ID == Client ID for WebSocket clients
             await ws_manager.send_queue_status(client_id, pos)
 
-# Global Queue Manager (Limit to 2 concurrent jobs for stability)
-analysis_queue = AnalysisQueueManager(max_concurrent=2)
+# Global Queue Manager (configurable via env; default single-flight queue)
+ANALYSIS_MAX_CONCURRENT = max(1, _env_int("ANALYSIS_MAX_CONCURRENT", 1))
+analysis_queue = AnalysisQueueManager(max_concurrent=ANALYSIS_MAX_CONCURRENT)
+print(f"🚦 Analysis queue max_concurrent={ANALYSIS_MAX_CONCURRENT}")
 # ANALYSIS_SEMAPHORE kept for backward compatibility if any legacy code uses it, 
 # but we will migrate core endpoints.
 ANALYSIS_SEMAPHORE = analysis_queue.current_semaphore
+
+
+class AnalysisCancellationRegistry:
+    """In-memory cancellation tokens keyed by analysis WebSocket client_id."""
+
+    def __init__(self):
+        self._cancelled = set()
+        self._lock = asyncio.Lock()
+
+    async def mark_cancelled(self, client_id: str):
+        async with self._lock:
+            self._cancelled.add(client_id)
+
+    async def clear(self, client_id: str):
+        async with self._lock:
+            self._cancelled.discard(client_id)
+
+    async def is_cancelled(self, client_id: str) -> bool:
+        async with self._lock:
+            return client_id in self._cancelled
+
+
+analysis_cancellations = AnalysisCancellationRegistry()
 
 
 # ==============================================================================
@@ -806,6 +1401,24 @@ class MonitoringTerkiniRequest(BaseModel):
     """Request body untuk endpoint /api/dashboard/monitoring-terkini."""
     geo_data: Dict[str, Any]
     nama: Optional[str] = "Analisis Monitoring"
+    delta_ndvi_threshold: float = Field(
+        default=-0.2,
+        ge=-1.0,
+        le=-0.01,
+        description="Threshold penurunan NDVI (nilai negatif, contoh -0.2)"
+    )
+    min_patch_area_ha: float = Field(
+        default=0.25,
+        ge=0.01,
+        le=10000.0,
+        description="Luas minimum patch signifikan (hektar)"
+    )
+    max_patch_points: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Jumlah maksimal titik centroid patch yang ditampilkan"
+    )
 
 
 class SaveHistoryRequest(BaseModel):
@@ -982,6 +1595,78 @@ print(f"🚀 Local storage mounted at /storage")
 
 # Jalankan cek saat startup (merged with GEE init below)
 
+class AuthLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=1)
+
+@app.post("/auth/login")
+async def auth_login(payload: AuthLoginRequest):
+    """
+    Secure login endpoint:
+    - Password verification happens server-side
+    - Returns signed bearer token with role claim
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    email = payload.email.strip().lower()
+    password = payload.password
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email dan password wajib diisi")
+
+    user_row = await get_user_by_email(email)
+    if not user_row or not is_user_active(user_row):
+        # Keep generic error message to avoid leaking which part failed
+        raise HTTPException(status_code=401, detail="Email atau password tidak cocok")
+
+    is_valid_password, should_upgrade_hash = verify_user_password(password, user_row)
+    if not is_valid_password:
+        raise HTTPException(status_code=401, detail="Email atau password tidak cocok")
+
+    user_id = str(user_row.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=500, detail="User record is missing id")
+
+    role = resolve_user_role(user_row)
+
+    if should_upgrade_hash:
+        try:
+            upgraded_hash = hash_password_pbkdf2(password)
+            await asyncio.to_thread(
+                lambda: supabase.table("users")
+                .update({"password_hash": upgraded_hash})
+                .eq("id", user_id)
+                .execute()
+            )
+            print(f"🔐 Password hash upgraded for user {email}")
+        except Exception as e:
+            # Non-fatal: user can still login, but migration upgrade failed.
+            print(f"⚠️ Failed to upgrade password hash for {email}: {e}")
+
+    token = _create_access_token(user_id=user_id, email=email, role=role)
+    return {
+        "status": "success",
+        "token": token,
+        "user": {
+            "id": user_id,
+            "email": email,
+            "role": role
+        }
+    }
+
+@app.get("/auth/me")
+async def auth_me(current_user: Dict[str, Any] = Depends(get_current_user_claims)):
+    """Return current authenticated user claims."""
+    return {
+        "status": "success",
+        "user": {
+            "id": current_user.get("sub"),
+            "email": current_user.get("email"),
+            "role": current_user.get("role", "user")
+        }
+    }
+
 
 # ==============================================================================
 # WEBSOCKET CONNECTION MANAGER
@@ -1015,6 +1700,7 @@ class ConnectionManager:
                 })
             except Exception as e:
                 print(f"⚠️ Failed to send progress: {e}")
+                self.disconnect(client_id)
     
     async def send_complete(self, client_id: str, data: dict):
         """Send completion message with results."""
@@ -1026,6 +1712,7 @@ class ConnectionManager:
                 })
             except Exception as e:
                 print(f"⚠️ Failed to send completion: {e}")
+                self.disconnect(client_id)
     
     async def send_queue_status(self, client_id: str, position: int):
         """Send queue position update to a specific client."""
@@ -1038,6 +1725,7 @@ class ConnectionManager:
                 print(f"🚥 Notify {client_id}: Queue Position #{position}")
             except Exception as e:
                 print(f"⚠️ Failed to send queue status: {e}")
+                self.disconnect(client_id)
     
     async def send_error(self, client_id: str, error: str):
         """Send error message."""
@@ -1049,6 +1737,7 @@ class ConnectionManager:
                 })
             except Exception as e:
                 print(f"⚠️ Failed to send error: {e}")
+                self.disconnect(client_id)
     
     async def broadcast_log(self, log_entry: dict):
         """Broadcast log message to all log viewer clients."""
@@ -1148,6 +1837,21 @@ logger.info("🔧 System ready to accept connections")
 # GEE INITIALIZATION
 # ==============================================================================
 
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+# Keep yearly composites tractable: too many scenes per year causes slow median + timeout.
+GEE_MAX_SCENES_PER_YEAR = _get_env_int("GEE_MAX_SCENES_PER_YEAR", 60)
+GEE_DEADLINE_MS = _get_env_int("GEE_DEADLINE_MS", 300000)
+
+
 def initialize_gee():
     """Inisialisasi Google Earth Engine dengan kredensial Service Account."""
     try:
@@ -1160,9 +1864,18 @@ def initialize_gee():
             ee.Initialize()
             print("✅ GEE terinisialisasi dengan kredensial default")
             logger.info("✅ Google Earth Engine initialized with default credentials")
+            
+        # Set deadline AFTER successful initialization
+        try:
+            ee.data.setDeadline(GEE_DEADLINE_MS)
+            logger.info(f"✅ GEE deadline set to {round(GEE_DEADLINE_MS / 1000, 1)}s")
+        except Exception as timeout_err:
+            logger.warning(f"⚠️ Gagal mengatur GEE deadline: {str(timeout_err)}")
+            
     except Exception as e:
-        print(f"❌ Gagal inisialisasi GEE: {str(e)}")
-        logger.error(f"❌ Failed to initialize Google Earth Engine: {str(e)}")
+        error_msg = f"❌ Gagal inisialisasi GEE: {str(e)}"
+        print(error_msg)
+        logger.error(error_msg)
         raise RuntimeError(f"Inisialisasi GEE gagal: {str(e)}")
 
 
@@ -1607,6 +2320,7 @@ async def link_kps_to_analysis(request: dict):
         # Invalidate caches
         invalidate_cache(f"history_detail_{history_id}")
         invalidate_cache("history_list")
+        invalidate_cache("dashboard_global_")
         
         return {
             "status": "success", 
@@ -1774,6 +2488,186 @@ class BulkSaveResult(BaseModel):
     lahan_id: Optional[str] = None
     error: Optional[str] = None
 
+
+class BulkReportExcelRow(BaseModel):
+    """Single row for bulk upload report export."""
+    filename: str
+    no_sk: Optional[str] = None
+    status: str
+    kps_name: Optional[str] = None
+    kps_no_sk: Optional[str] = None
+    link_method: Optional[str] = None
+    error: Optional[str] = None
+
+
+class BulkReportExcelRequest(BaseModel):
+    """Request payload for exporting bulk upload report to Excel."""
+    rows: List[BulkReportExcelRow] = Field(default_factory=list)
+
+
+@app.post("/api/bulk/report/excel")
+async def export_bulk_report_excel(request: BulkReportExcelRequest):
+    """
+    Export Bulk Upload Report to formatted Excel (.xlsx).
+    """
+    rows = request.rows or []
+    if not rows:
+        raise HTTPException(status_code=400, detail="Tidak ada data report untuk diexport")
+
+    try:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Bulk Upload Report"
+
+        # Styles
+        title_font = Font(bold=True, size=14, color="FFFFFF")
+        title_fill = PatternFill(start_color="0F766E", end_color="0F766E", fill_type="solid")
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+
+        thin = Side(style="thin", color="D1D5DB")
+        cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        status_fill_map = {
+            "valid": PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid"),
+            "needs_manual": PatternFill(start_color="FEFCE8", end_color="FEFCE8", fill_type="solid"),
+            "non_kps": PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid"),
+            "error": PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid"),
+        }
+
+        status_label_map = {
+            "valid": "VALID",
+            "needs_manual": "NEEDS_MANUAL",
+            "non_kps": "NON_KPS",
+            "error": "ERROR",
+        }
+
+        # Title + metadata
+        ws.merge_cells("A1:H1")
+        ws["A1"] = "Bulk Upload Report - GealGeolGeo"
+        ws["A1"].font = title_font
+        ws["A1"].fill = title_fill
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws["A2"] = "Generated At"
+        ws["B2"] = generated_at
+        ws["A2"].font = Font(bold=True)
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
+
+        # Header
+        headers = ["No", "Filename", "NO_SK Input", "Status", "Nama KPS", "NO_SK KPS", "Metode Link", "Keterangan"]
+        header_row = 4
+
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = cell_border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        # Rows
+        for idx, item in enumerate(rows, 1):
+            r = header_row + idx
+            status_key = (item.status or "").strip().lower()
+            status_label = status_label_map.get(status_key, (item.status or "-").upper())
+
+            note = item.error
+            if not note:
+                if status_key == "needs_manual":
+                    note = "Perlu pemilihan KPS manual"
+                elif status_key == "non_kps":
+                    note = "Diproses sebagai Non-KPS"
+                elif status_key == "valid":
+                    note = "Auto-detected"
+                else:
+                    note = "-"
+
+            values = [
+                idx,
+                item.filename or "-",
+                item.no_sk or "-",
+                status_label,
+                item.kps_name or "-",
+                item.kps_no_sk or "-",
+                item.link_method or "-",
+                note or "-",
+            ]
+
+            for col_idx, value in enumerate(values, 1):
+                cell = ws.cell(row=r, column=col_idx, value=value)
+                cell.border = cell_border
+                cell.alignment = Alignment(
+                    horizontal="center" if col_idx in (1, 4, 7) else "left",
+                    vertical="top",
+                    wrap_text=True
+                )
+
+                row_fill = status_fill_map.get(status_key)
+                if row_fill:
+                    cell.fill = row_fill
+
+        last_data_row = header_row + len(rows)
+        ws.auto_filter.ref = f"A{header_row}:H{last_data_row}"
+        ws.freeze_panes = "A5"
+
+        # Summary block
+        valid_count = sum(1 for r in rows if (r.status or "").lower() == "valid")
+        manual_count = sum(1 for r in rows if (r.status or "").lower() == "needs_manual")
+        non_kps_count = sum(1 for r in rows if (r.status or "").lower() == "non_kps")
+        error_count = sum(1 for r in rows if (r.status or "").lower() == "error")
+
+        summary_start = last_data_row + 2
+        ws.cell(row=summary_start, column=1, value="Ringkasan").font = Font(bold=True)
+        summary_rows = [
+            ("Total File", len(rows)),
+            ("Valid (Auto)", valid_count),
+            ("Needs Manual", manual_count),
+            ("Non-KPS", non_kps_count),
+            ("Error", error_count),
+        ]
+        for i, (label, value) in enumerate(summary_rows, 1):
+            label_cell = ws.cell(row=summary_start + i, column=1, value=label)
+            value_cell = ws.cell(row=summary_start + i, column=2, value=value)
+            label_cell.font = Font(bold=True)
+            label_cell.border = cell_border
+            value_cell.border = cell_border
+            label_cell.alignment = Alignment(horizontal="left")
+            value_cell.alignment = Alignment(horizontal="center")
+
+        # Column widths
+        widths = {
+            "A": 6,
+            "B": 52,
+            "C": 24,
+            "D": 16,
+            "E": 32,
+            "F": 24,
+            "G": 16,
+            "H": 42,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename_out = f"Bulk_Upload_Report_{timestamp}.xlsx"
+
+        return Response(
+            content=output.read(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename_out}"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Bulk report Excel export error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/bulk/save", response_model=List[BulkSaveResult])
 async def bulk_save_files(request: BulkSaveRequest, background_tasks: BackgroundTasks):
     """
@@ -1901,6 +2795,23 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
     # Bulk uploads assume analysis_results are already prepared
     updated_analysis_results = request.analysis_results
 
+    # Resolve KPS identity with fallback from metadata NO_SK
+    metadata_no_sk = extract_no_sk_from_metadata(request.metadata) or extract_no_sk_from_filename(request.filename)
+    resolved_kps_id = request.kps_id
+    resolved_link_method = normalize_link_method(request.link_method)
+    if not resolved_kps_id and metadata_no_sk:
+        auto_kps = await lookup_kps_by_no_sk(metadata_no_sk)
+        if auto_kps and auto_kps.get("id_kps_api"):
+            resolved_kps_id = auto_kps["id_kps_api"]
+            if resolved_link_method == "NONE":
+                resolved_link_method = "AUTO"
+            print(
+                f"🔗 [bulk] Auto-linked by NO_SK '{metadata_no_sk}' -> "
+                f"{auto_kps.get('nama_kps')} ({resolved_kps_id})"
+            )
+
+    effective_scope = "KPS" if resolved_kps_id else (request.analysis_scope or "NON_KPS")
+
     # 4. Save to analysis_history
     mode = request.mode or "replace"
 
@@ -1940,9 +2851,9 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
         "lahan_id": lahan_id,
         "filename": request.filename,
         "file_size": request.file_size,
-        "analysis_scope": request.analysis_scope,
-        "link_method": request.link_method,
-        "kps_id": request.kps_id,
+        "analysis_scope": effective_scope,
+        "link_method": resolved_link_method,
+        "kps_id": resolved_kps_id,
         "non_kps_id": request.non_kps_id,
         "metadata": request.metadata,
         "analysis_results": updated_analysis_results,
@@ -1995,6 +2906,7 @@ async def _save_history_internal(request: SaveHistoryRequest, background_tasks: 
     #     background_tasks.add_task(populate_kps_hotspots, history_id, request.kps_id)
 
     invalidate_cache("history_list")
+    invalidate_cache("dashboard_global_")
 
     return (history_id, lahan_id)
 
@@ -2195,7 +3107,7 @@ async def update_pin(pin_id: str, pin: CustomPinUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/pins/{pin_id}")
-async def delete_pin(pin_id: str):
+async def delete_pin(pin_id: str, _: Dict[str, Any] = Depends(require_admin_user)):
     """
     Delete a custom pin.
     """
@@ -2975,11 +3887,13 @@ def create_yearly_composite_robust(geometry, year, cloud_prob_threshold=50):
     start_date = f"{year}-01-01"
     end_date = f"{year}-12-31"
     
-    # Get S2 SR collection
+    # Get S2 SR collection and cap per-year scene count to avoid expensive median on huge stacks.
     s2_collection = (ee.ImageCollection(SENTINEL2_COLLECTION)
                      .filterBounds(geometry)
                      .filterDate(start_date, end_date)
-                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80)))
+                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+                     .sort('CLOUDY_PIXEL_PERCENTAGE')
+                     .limit(GEE_MAX_SCENES_PER_YEAR))
     
     s2_count = s2_collection.size().getInfo()
     logger.info(f"      Found {s2_count} S2 scenes for {year}")
@@ -2991,23 +3905,19 @@ def create_yearly_composite_robust(geometry, year, cloud_prob_threshold=50):
     try:
         # Get Cloud Probability collection
         cloud_prob_collection = _get_cloud_probability_collection(geometry, start_date, end_date)
-        cloud_prob_count = cloud_prob_collection.size().getInfo()
-        logger.info(f"      Found {cloud_prob_count} Cloud Probability scenes")
+        # Join S2 with Cloud Probability
+        s2_with_cloud_prob = _join_s2_with_cloud_probability(s2_collection, cloud_prob_collection)
+        joined_count = s2_with_cloud_prob.size().getInfo()
+        logger.info(f"      Joined: {joined_count} matched scenes")
         
-        if cloud_prob_count > 0:
-            # Join S2 with Cloud Probability
-            s2_with_cloud_prob = _join_s2_with_cloud_probability(s2_collection, cloud_prob_collection)
-            joined_count = s2_with_cloud_prob.size().getInfo()
-            logger.info(f"      Joined: {joined_count} matched scenes")
-            
-            if joined_count > 0:
-                # Apply robust masking to each image BEFORE compositing
-                masked_collection = s2_with_cloud_prob.map(
-                    lambda img: _mask_clouds_and_shadows_robust(img, cloud_prob_threshold)
-                )
-                composite = masked_collection.median().clip(geometry)
-                logger.info(f"      ✅ Created composite with Cloud Probability masking")
-                return composite
+        if joined_count > 0:
+            # Apply robust masking to each image BEFORE compositing
+            masked_collection = s2_with_cloud_prob.map(
+                lambda img: _mask_clouds_and_shadows_robust(img, cloud_prob_threshold)
+            )
+            composite = masked_collection.median().clip(geometry)
+            logger.info(f"      ✅ Created composite with Cloud Probability masking")
+            return composite
         
         # Fallback: use SCL-based masking
         logger.warning(f"      ⚠️ Cloud Probability join failed, using SCL fallback")
@@ -3528,21 +4438,20 @@ def get_transition_map_url(binary_image: ee.Image, color: str) -> str:
 
 
 def get_rgb_map_url(image: ee.Image) -> str:
-    """Generate URL tile layer GEE for RGB satellite imagery (Sentinel-2) at native 10m resolution."""
-    # Resample to 10m native resolution for sharper imagery
-    resampled = image.select(['B4', 'B3', 'B2']).reproject(
-        crs='EPSG:4326',
-        scale=10
-    )
-    
-    # Visualization parameters adjusted for premium natural color look
+    """Generate URL tile layer GEE for RGB Sentinel-2 imagery.
+
+    Notes:
+    - Upstream composites are already scaled to 0..1 reflectance.
+    - Avoid forcing EPSG:4326 reproject here; aggressive reprojection can produce
+      coarse/black-looking tiles on small AOI.
+    """
     vis_params = {
         'bands': ['B4', 'B3', 'B2'],
         'min': 0.02,
-        'max': 0.38,
-        'gamma': 1.3
+        'max': 0.35,
+        'gamma': 1.2
     }
-    map_id_dict = resampled.getMapId(vis_params)
+    map_id_dict = image.select(['B4', 'B3', 'B2']).getMapId(vis_params)
     return map_id_dict['tile_fetcher'].url_format
 
 
@@ -3580,12 +4489,12 @@ def get_thumb_url(classified_image: ee.Image, geometry: ee.Geometry) -> str:
 
 def get_rgb_thumb_url(image: ee.Image, geometry: ee.Geometry) -> str:
     """Generate static thumbnail URL for real RGB satellite imagery."""
-    # Sentinel-2 RGB Bands: B4 (Red), B3 (Green), B2 (Blue)
+    # Composites are scaled to 0..1, so use reflectance-range visualization.
     vis_params = {
         'bands': ['B4', 'B3', 'B2'],
-        'min': 0,
-        'max': 3000,
-        'gamma': 1.4,
+        'min': 0.02,
+        'max': 0.35,
+        'gamma': 1.2,
         'dimensions': 600
     }
     try:
@@ -3727,6 +4636,70 @@ async def analyze_land_cover(
         await on_progress(5, "Inisialisasi", "Mempersiapkan analisis Multi-Year RF...")
     
     results = []
+
+    async def _checkpoint_cancel(stage: str = ""):
+        """Frequent cancellation checkpoint with optional stage label."""
+        if check_cancel and await check_cancel():
+            msg = "Analisis dibatalkan oleh pengguna"
+            if stage:
+                logger.warning(f"⛔ Cancel checkpoint hit at: {stage}")
+            raise Exception(msg)
+
+    async def _run_gee_heavy(stage: str, fn: Callable, *args, **kwargs):
+        """
+        Run heavy GEE-bound work in executor with periodic cancel polling.
+        This improves cancellation responsiveness while a long task is in-flight.
+        """
+        await _checkpoint_cancel(f"{stage}:before")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        poll_interval = 0.25
+
+        while True:
+            done, _ = await asyncio.wait({future}, timeout=poll_interval)
+            if done:
+                await _checkpoint_cancel(f"{stage}:after")
+                return future.result()
+            await _checkpoint_cancel(f"{stage}:poll")
+
+    # Limit per-year finalize fan-out so we speed up wall time without flooding GEE.
+    finalize_gee_semaphore = asyncio.Semaphore(3)
+
+    async def _run_finalize_gee(stage: str, fn: Callable, *args, **kwargs):
+        async with finalize_gee_semaphore:
+            return await _run_gee_heavy(stage, fn, *args, **kwargs)
+
+    async def _reduce_region_with_retry(stage: str, build_reduce_fn: Callable[[int], Any]):
+        """
+        Retry reduceRegion with adaptive tileScale for better throughput.
+        Start with larger tiles (faster), then fallback to smaller chunks if needed.
+        """
+        last_error = None
+        for tile_scale in (4, 8, 16):
+            await _checkpoint_cancel(f"{stage}:tileScale:{tile_scale}:before")
+            try:
+                return await _run_finalize_gee(
+                    f"{stage}:tileScale:{tile_scale}",
+                    lambda ts=tile_scale: build_reduce_fn(ts),
+                )
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc).lower()
+                retryable = any(token in msg for token in (
+                    "memory",
+                    "too many pixels",
+                    "timed out",
+                    "deadline",
+                ))
+                if retryable and tile_scale != 16:
+                    logger.warning(
+                        f"      ⚠️ {stage} retry with tileScale={tile_scale * 2} after: {exc}"
+                    )
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"{stage} failed without explicit error")
     
     try:
         # =====================================================================
@@ -3769,22 +4742,17 @@ async def analyze_land_cover(
         
         # Sequential composite building - ONLY for years_to_compute
         for year in years_to_compute:
-            # Check cancellation inside loop
-            if check_cancel and await check_cancel():
-                logger.warning("⛔ Analysis cancelled by user.")
-                raise Exception("Analisis dibatalkan oleh pengguna")
+            await _checkpoint_cancel(f"composite_loop:{year}")
 
             try:
                 logger.info(f"   🛰️ Processing {year}...")
                 
                 # Create robust cloud-masked composite
-                composite = await asyncio.to_thread(
+                composite = await _run_gee_heavy(
+                    f"create_yearly_composite:{year}",
                     create_yearly_composite_robust, geometry, year, CLOUD_PROB_THRESHOLD_FIXED
                 )
-                
-                # Verify composite has data
-                band_count = await asyncio.to_thread(lambda: composite.bandNames().size().getInfo())
-                logger.info(f"      ✅ Composite {year} created: {band_count} bands")
+                logger.info(f"      ✅ Composite {year} created")
                 
                 yearly_composites[year] = composite
                 years_successfully_built.append(year)
@@ -3842,13 +4810,17 @@ async def analyze_land_cover(
 
         latest_year = years_with_composites[-1]
         latest_composite = yearly_composites[latest_year]
+        await _checkpoint_cancel(f"training:prepare:{latest_year}")
         
         logger.info(f"   🎯 Generating training samples from {latest_year} (latest computed)...")
         training_samples = generate_training_samples_from_composite(
             latest_composite, geometry, samples_per_class=100
         )
         
-        sample_count = training_samples.size().getInfo()
+        sample_count = await _run_gee_heavy(
+            f"training_samples_count:{latest_year}",
+            lambda: training_samples.size().getInfo()
+        )
         logger.info(f"   ✅ Training samples: {sample_count} points")
         
         # Create training features with FIXED band names
@@ -3891,14 +4863,16 @@ async def analyze_land_cover(
         # STEP 3.1: First Pass - Classify all years (Original Indices)
         logger.info("🗂️ STEP 3.1: First pass classification...")
         for idx, year in enumerate(years_successfully_built):
-             # Check cancellation in loop
-            if check_cancel and await check_cancel():
-                logger.warning("⛔ Analysis cancelled by user.")
-                raise Exception("Analisis dibatalkan oleh pengguna")
+            await _checkpoint_cancel(f"classify_first_pass:{year}")
 
             try:
-                features = await asyncio.to_thread(construct_features_fixed, yearly_composites[year])
-                classified = await asyncio.to_thread(
+                features = await _run_gee_heavy(
+                    f"construct_features:{year}",
+                    construct_features_fixed,
+                    yearly_composites[year]
+                )
+                classified = await _run_gee_heavy(
+                    f"classify_year:{year}",
                     lambda: features.classify(classifier).rename('landcover').clip(geometry)
                 )
                 year_images[year] = classified
@@ -3940,8 +4914,10 @@ async def analyze_land_cover(
 
         for idx, year in enumerate(years_successfully_built):
             if year not in year_images: continue
+            await _checkpoint_cancel(f"finalize_loop:{year}")
             
             try:
+                year_t0 = time.perf_counter()
                 if on_progress:
                     loop_percent = 55 + (idx / len(years_successfully_built) * 35)
                     await on_progress(int(loop_percent), "Klasifikasi", f"Finalisasi data tahun {year} ({idx+1}/{len(years_successfully_built)})")
@@ -3962,32 +4938,42 @@ async def analyze_land_cover(
                 
                 # NO SHIFTING for others! 3,4,5,6 are correct.
                 
-                # Compute area statistics with new indices (1-9)
+                # Compute area statistics with new indices (1-9) while fetching visualization assets.
                 area_image = ee.Image.pixelArea().divide(10000).rename('area')
                 combined = area_image.addBands(refined.rename('class')).select(['area', 'class'])
-                
-                stats = await asyncio.to_thread(lambda: combined.reduceRegion(
-                    reducer=ee.Reducer.sum().group(groupField=1, groupName='class'),
-                    geometry=geometry,
-                    scale=10,
-                    maxPixels=1e10,
-                    bestEffort=True,
-                    tileScale=16  # Divide into 16x16 tiles to reduce memory usage
-                ).getInfo())
-                
+
+                stats, map_url, rgb_url, thumb_url, rgb_thumb_url = await asyncio.gather(
+                    _reduce_region_with_retry(
+                        f"reduce_region_stats:{year}",
+                        lambda tile_scale: combined.reduceRegion(
+                            reducer=ee.Reducer.sum().group(groupField=1, groupName='class'),
+                            geometry=geometry,
+                            scale=10,
+                            maxPixels=1e10,
+                            bestEffort=True,
+                            tileScale=tile_scale,
+                        ).getInfo(),
+                    ),
+                    _run_finalize_gee(f"map_url:{year}", lambda: get_map_url(refined)),
+                    _run_finalize_gee(
+                        f"rgb_map_url:{year}",
+                        lambda: get_rgb_map_url(yearly_composites[year]),
+                    ),
+                    _run_finalize_gee(
+                        f"thumb_url:{year}",
+                        lambda: get_thumb_url(refined, geometry),
+                    ),
+                    _run_finalize_gee(
+                        f"rgb_thumb_url:{year}",
+                        lambda: get_rgb_thumb_url(yearly_composites[year], geometry),
+                    ),
+                )
+
                 groups = stats.get('groups', [])
                 raw_areas = {int(item['class']): item['sum'] for item in groups if item.get('class')}
                 
                 # Log new breakdown
                 logger.info(f"      📊 {year} breakdown: Primer={raw_areas.get(1,0):.1f}ha, Sekunder={raw_areas.get(2,0):.1f}ha")
-                
-                # Generate map URLs
-                map_url = await asyncio.to_thread(lambda: get_map_url(refined))
-                rgb_url = await asyncio.to_thread(lambda: get_rgb_map_url(yearly_composites[year]))
-                
-                # Generate thumbnails
-                thumb_url = await asyncio.to_thread(lambda: get_thumb_url(refined, geometry))
-                rgb_thumb_url = await asyncio.to_thread(lambda: get_rgb_thumb_url(yearly_composites[year], geometry))
                 
                 # Create result object
                 yearly_data = YearlyData(
@@ -4040,15 +5026,32 @@ async def analyze_land_cover(
                         stable_forest_img.rename('stable'),
                         builtup_exp_img.rename('builtup_exp')
                     ]).multiply(ee.Image.pixelArea().divide(10000))
-                    
-                    trans_stats = await asyncio.to_thread(lambda: trans_combined.reduceRegion(
-                        reducer=ee.Reducer.sum(),
-                        geometry=geometry,
-                        scale=10,
-                        maxPixels=1e10,
-                        bestEffort=True,
-                        tileScale=16  # Divide into tiles to reduce memory usage
-                    ).getInfo())
+
+                    trans_stats, deforestation_map_url, reforestation_map_url, builtup_expansion_map_url = await asyncio.gather(
+                        _reduce_region_with_retry(
+                            f"transition_stats:{year}",
+                            lambda tile_scale: trans_combined.reduceRegion(
+                                reducer=ee.Reducer.sum(),
+                                geometry=geometry,
+                                scale=10,
+                                maxPixels=1e10,
+                                bestEffort=True,
+                                tileScale=tile_scale,
+                            ).getInfo(),
+                        ),
+                        _run_finalize_gee(
+                            f"deforestation_map_url:{year}",
+                            lambda: get_transition_map_url(defor_img, "#FF4500"),
+                        ),
+                        _run_finalize_gee(
+                            f"reforestation_map_url:{year}",
+                            lambda: get_transition_map_url(refor_img, "#22C55E"),
+                        ),
+                        _run_finalize_gee(
+                            f"builtup_expansion_map_url:{year}",
+                            lambda: get_transition_map_url(builtup_exp_img, "#A855F7"),
+                        ),
+                    )
                     
                     yearly_data.forest_loss = round(trans_stats.get('defor', 0), 2)
                     yearly_data.forest_gain = round(trans_stats.get('refor', 0), 2)
@@ -4057,13 +5060,13 @@ async def analyze_land_cover(
                     yearly_data.deforestation_ha = yearly_data.forest_loss
                     yearly_data.reforestation_ha = yearly_data.forest_gain
                     
-                    # Maps
-                    yearly_data.deforestation_map_url = await asyncio.to_thread(lambda: get_transition_map_url(defor_img, "#FF4500"))
-                    yearly_data.reforestation_map_url = await asyncio.to_thread(lambda: get_transition_map_url(refor_img, "#22C55E"))
-                    yearly_data.builtup_expansion_map_url = await asyncio.to_thread(lambda: get_transition_map_url(builtup_exp_img, "#A855F7"))
+                    yearly_data.deforestation_map_url = deforestation_map_url
+                    yearly_data.reforestation_map_url = reforestation_map_url
+                    yearly_data.builtup_expansion_map_url = builtup_expansion_map_url
 
                 last_refined_img = refined
                 classification_results.append(yearly_data)
+                logger.info(f"      ⏱️ Finalisasi {year} selesai dalam {time.perf_counter() - year_t0:.1f}s")
                 
             except Exception as e:
                 logger.error(f"   ❌ Finalization error {year}: {e}")
@@ -4152,6 +5155,23 @@ async def health_check():
         return {"status": "tidak sehat", "gee": "terputus", "error": str(e)}
 
 
+@app.post("/analysis/cancel/{client_id}")
+async def cancel_analysis(client_id: str):
+    """Cancel in-flight or queued analysis for a given WebSocket client_id."""
+    import re
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", client_id):
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+
+    await analysis_cancellations.mark_cancelled(client_id)
+    queue_result = await analysis_queue.cancel_job(client_id)
+    ws_manager.disconnect(client_id)
+    return {
+        "status": "cancel_requested",
+        "client_id": client_id,
+        "queue": queue_result,
+    }
+
+
 @app.websocket("/ws/analyze/{client_id}")
 async def websocket_analyze(websocket: WebSocket, client_id: str):
     """
@@ -4165,6 +5185,8 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
         return
 
     await ws_manager.connect(websocket, client_id)
+    # Clear stale cancel token (if any) from previous sessions using same id.
+    await analysis_cancellations.clear(client_id)
     
     try:
         data = await websocket.receive_json()
@@ -4187,6 +5209,16 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
         # Define progress callback
         async def on_progress(percent, step, detail):
             await ws_manager.send_progress(client_id, percent, step, detail)
+
+        # Cancellation wrapper for WebSocket flow
+        async def check_cancel():
+            if await analysis_cancellations.is_cancelled(client_id):
+                print(f"⛔ Cancel token received for {client_id}, aborting analysis.")
+                return True
+            if client_id not in ws_manager.active_connections:
+                print(f"⛔ Client {client_id} disconnected, aborting analysis.")
+                return True
+            return False
         
         print(f"🔍 DEBUG: Starting analyze_land_cover...")
         print(f"   📍 Geometry type: {type(geometry)}")
@@ -4198,7 +5230,9 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
         cloud_prob_threshold = data.get("cloud_prob_threshold", 50)
         
         # Call unified analysis logic with SMART QUEUE tracking
-        async with analysis_queue.enter_queue(client_id):
+        async with analysis_queue.enter_queue(client_id, check_cancel=check_cancel):
+            if await check_cancel():
+                raise Exception("Analisis dibatalkan oleh pengguna")
             results, transition_summary, audit_report = await analyze_land_cover(
                 geometry=geometry,
                 start_year=start_year,
@@ -4209,6 +5243,7 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
                 specific_date=specific_date,
                 on_progress=on_progress,
                 scale=scale,
+                check_cancel=check_cancel,
                 existing_data=data.get("existing_data")
             )
         
@@ -4242,6 +5277,7 @@ async def websocket_analyze(websocket: WebSocket, client_id: str):
         traceback.print_exc()
         await ws_manager.send_error(client_id, str(e))
     finally:
+        await analysis_cancellations.clear(client_id)
         ws_manager.disconnect(client_id)
 
 
@@ -4267,7 +5303,7 @@ async def analyze(request: Request, body: AnalyzeRequest):
         job_id = f"http_{hashlib.md5(request.client.host.encode()).hexdigest()[:8]}_{int(time.time())}"
         
         # Lakukan analisis tutupan lahan via SMART QUEUE
-        async with analysis_queue.enter_queue(job_id):
+        async with analysis_queue.enter_queue(job_id, check_cancel=check_cancel):
             data, transition_summary, audit_report = await analyze_land_cover(
                 geometry, 
                 start_year=body.start_year,
@@ -4982,109 +6018,118 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
         if not lahan_id:
             raise HTTPException(status_code=500, detail="Gagal mendapatkan ID Lahan")
             
-        # --- LOGIC PERSISTENT THUMBNAIL (BASE64) ---
-        # URL dari Earth Engine akan kadaluarsa dalam hitungan jam.
-        # Kita harus download gambarnya sekarang dan simpan sebagai Base64 string agar permanen di DB.
-        
-        updated_analysis_results = []
-        import base64
-        import requests
-        
-        print(f"🔄 Processing thumbnails for persistence... ({len(request.analysis_results)} years)")
+        # Default path: avoid long blocking work here to prevent 524 timeout
+        # from edge proxies (Cloudflare/Traefik). Heavy visual persistence can run
+        # asynchronously after the history row has been saved.
+        updated_analysis_results = [item.copy() for item in (request.analysis_results or [])]
 
-        for idx, item in enumerate(request.analysis_results, 1):
-            new_item = item.copy()
-            year = new_item.get('year', 'unknown')
-            url = new_item.get("thumb_url")
+        if SYNC_VISUAL_PERSIST_ON_SAVE:
+            print(f"🔄 Processing thumbnails for persistence... ({len(updated_analysis_results)} years)")
 
-            print(f"   📅 [{idx}/{len(request.analysis_results)}] Processing Year {year}...")
+            for idx, item in enumerate(updated_analysis_results, 1):
+                year = item.get('year', 'unknown')
+                print(f"   📅 [{idx}/{len(updated_analysis_results)}] Processing Year {year}...")
 
-            # --- LOGIK PERSISTENSI VEKTOR & THUMBNAIL ---
+                # 1. Konversi EE Geometry sekali saja untuk efisiensi
+                if 'ee_geometry_cache' not in locals():
+                    ee_geometry_cache = geojson_to_ee_geometry(request.geo_data)
 
-            # 1. Konversi EE Geometry sekali saja untuk efisiensi
-            if 'ee_geometry_cache' not in locals():
-                 ee_geometry_cache = geojson_to_ee_geometry(request.geo_data)
+                # 2. Generate Vector GeoJSON (Wajib ada untuk PDF)
+                if not item.get('vector_geojson'):
+                    try:
+                        print(f"      📐 Generating vector for {year}...")
+                        classified = get_classified_image(ee_geometry_cache, year)
+                        if classified:
+                            vector_scale = request.metadata.get('scale', 30)
+                            print(f"         📍 Using vector scale: {vector_scale}m")
+                            vectors_fc = classified.reduceToVectors(
+                                geometry=ee_geometry_cache,
+                                scale=vector_scale,
+                                geometryType='polygon',
+                                eightConnected=False,
+                                labelProperty='class',
+                                reducer=ee.Reducer.countEvery(),
+                                maxPixels=1e8,
+                                bestEffort=True
+                            )
+                            vector_data = await asyncio.to_thread(lambda: vectors_fc.getInfo())
+                            if vector_data and 'features' in vector_data:
+                                for f in vector_data['features']:
+                                    f['properties'] = {'class': f['properties']['class']}
+                                item['vector_geojson'] = vector_data
+                                print(f"         ✅ Vector Generated ({len(vector_data['features'])} polygons).")
+                    except Exception as ve:
+                        print(f"         ⚠️ Failed to generate vector during save: {ve}")
 
-            # 2. Generate Vector GeoJSON (Wajib ada untuk PDF)
-            if not new_item.get('vector_geojson'):
-                try:
-                    print(f"      📐 Generating vector for {year}...")
-                    classified = get_classified_image(ee_geometry_cache, year)
-                    if classified:
-                        # Use scale from metadata if provided, fallback to 30
-                        vector_scale = request.metadata.get('scale', 30)
-                        print(f"         📍 Using vector scale: {vector_scale}m")
-                        vectors_fc = classified.reduceToVectors(
-                            geometry=ee_geometry_cache,
-                            scale=vector_scale,
-                            geometryType='polygon',
-                            eightConnected=False,
-                            labelProperty='class',
-                            reducer=ee.Reducer.countEvery(),
-                            maxPixels=1e8,
-                            bestEffort=True
-                        )
-                        vector_data = await asyncio.to_thread(lambda: vectors_fc.getInfo())
+                # 3. Persistent Thumbnail (Cloud Storage)
+                thumb_url = item.get("thumb_url")
+                if thumb_url and ("earthengine.googleapis.com" in thumb_url or "googleapis.com" in thumb_url):
+                    try:
+                        print(f"         ☁️ Persisting thumbnail...")
+                        perm_url = await download_and_save_locally(thumb_url, f"history_{lahan_id}")
+                        if perm_url:
+                            item["thumb_url"] = perm_url
+                            print(f"         ✅ Thumbnail persisted: {perm_url}")
+                        else:
+                            print(f"         ⚠️ Failed to persist (returned None), keeping original URL")
+                    except Exception as e:
+                        print(f"         ❌ Failed to persist thumbnail: {e}")
+                elif thumb_url:
+                    print(f"         ℹ️ Thumbnail already local: {thumb_url[:50]}...")
 
-                        # Simplify properties
-                        if vector_data and 'features' in vector_data:
-                            for f in vector_data['features']:
-                                f['properties'] = {'class': f['properties']['class']}
-                            new_item['vector_geojson'] = vector_data
-                            print(f"         ✅ Vector Generated ({len(vector_data['features'])} polygons).")
-                except Exception as ve:
-                    print(f"         ⚠️ Failed to generate vector during save: {ve}")
+                # 4. Persistent RGB Thumbnail (Cloud Storage)
+                rgb_url = item.get("rgb_thumb_url")
+                if rgb_url and ("earthengine.googleapis.com" in rgb_url or "googleapis.com" in rgb_url):
+                    try:
+                        print(f"         ☁️ Persisting RGB thumbnail...")
+                        perm_rgb = await download_and_save_locally(rgb_url, f"history_{lahan_id}_rgb")
+                        if perm_rgb:
+                            item["rgb_thumb_url"] = perm_rgb
+                            print(f"         ✅ RGB Thumbnail persisted: {perm_rgb}")
+                        else:
+                            print(f"         ⚠️ Failed to persist RGB (returned None), keeping original URL")
+                    except Exception as e:
+                        print(f"         ❌ Failed to persist RGB thumbnail: {e}")
+                elif rgb_url:
+                    print(f"         ℹ️ RGB thumbnail already local: {rgb_url[:50]}...")
 
-            # 3. Persistent Thumbnail (Cloud Storage)
-            # Replace temporary GEE URLs with permanent Local Storage URLs
-            thumb_url = new_item.get("thumb_url")
-            if thumb_url and ("earthengine.googleapis.com" in thumb_url or "googleapis.com" in thumb_url):
-                try:
-                    print(f"         ☁️ Persisting thumbnail...")
-                    # Function is async, await directly
-                    perm_url = await download_and_save_locally(thumb_url, f"history_{lahan_id}")
-                    if perm_url:
-                        new_item["thumb_url"] = perm_url
-                        print(f"         ✅ Thumbnail persisted: {perm_url}")
-                    else:
-                        print(f"         ⚠️ Failed to persist (returned None), keeping original URL")
-                except Exception as e:
-                    print(f"         ❌ Failed to persist thumbnail: {e}")
-                    # Keep original URL as fallback
-            elif thumb_url:
-                print(f"         ℹ️ Thumbnail already local: {thumb_url[:50]}...")
+                print(f"      ✅ Year {year} processed successfully")
 
-            # 4. Persistent RGB Thumbnail (Cloud Storage)
-            rgb_url = new_item.get("rgb_thumb_url")
-            if rgb_url and ("earthengine.googleapis.com" in rgb_url or "googleapis.com" in rgb_url):
-                try:
-                    print(f"         ☁️ Persisting RGB thumbnail...")
-                    perm_rgb = await download_and_save_locally(rgb_url, f"history_{lahan_id}_rgb")
-                    if perm_rgb:
-                        new_item["rgb_thumb_url"] = perm_rgb
-                        print(f"         ✅ RGB Thumbnail persisted: {perm_rgb}")
-                    else:
-                        print(f"         ⚠️ Failed to persist RGB (returned None), keeping original URL")
-                except Exception as e:
-                    print(f"         ❌ Failed to persist RGB thumbnail: {e}")
-                    # Keep original URL as fallback
-            elif rgb_url:
-                print(f"         ℹ️ RGB thumbnail already local: {rgb_url[:50]}...")
-
-            print(f"      ✅ Year {year} processed successfully")
-            updated_analysis_results.append(new_item)
-
-        print(f"✅ All {len(updated_analysis_results)} years processed for thumbnail persistence")
+            print(f"✅ All {len(updated_analysis_results)} years processed for thumbnail persistence")
+        else:
+            print(
+                "⏩ Skipping synchronous visual persistence on /history "
+                "(SYNC_VISUAL_PERSIST_ON_SAVE=false). Will continue asynchronously."
+            )
             
         # --- LOGIKA PENYIMPANAN: Replace vs Merge (Request User) ---
         mode = getattr(request, 'mode', 'replace')
         print(f"💾 Saving history in mode: {mode} for lahan_id: {lahan_id}")
 
+        # Resolve KPS identity with fallback from metadata NO_SK
+        metadata_no_sk = extract_no_sk_from_metadata(request.metadata) or extract_no_sk_from_filename(request.filename)
+        resolved_kps_id = request.kps_id
+        resolved_link_method = normalize_link_method(request.link_method)
+        auto_kps = None
+
+        if not resolved_kps_id and metadata_no_sk:
+            auto_kps = await lookup_kps_by_no_sk(metadata_no_sk)
+            if auto_kps and auto_kps.get("id_kps_api"):
+                resolved_kps_id = auto_kps["id_kps_api"]
+                if resolved_link_method == "NONE":
+                    resolved_link_method = "AUTO"
+                print(
+                    f"🔗 Auto-linked history to KPS by NO_SK '{metadata_no_sk}': "
+                    f"{auto_kps.get('nama_kps')} ({resolved_kps_id})"
+                )
+
+        effective_scope = "KPS" if resolved_kps_id else (request.analysis_scope or "NON_KPS")
+
         if mode == "merge":
             try:
                 # 1. Cari data lama untuk digabungkan
                 old_res = await asyncio.to_thread(lambda: supabase.table("analysis_history")
-                    .select("id, analysis_results, metadata")
+                    .select("id, analysis_results, metadata, non_kps_id")
                     .eq("lahan_id", lahan_id)
                     .limit(1).execute())
                 
@@ -5116,7 +6161,11 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                         "analysis_results": final_results,
                         "metadata": new_meta,
                         "filename": request.filename, # Update nama file jika berubah
-                        "created_at": datetime.now().isoformat() # Bump timestamp agar muncul paling atas
+                        "created_at": datetime.now().isoformat(), # Bump timestamp agar muncul paling atas
+                        "kps_id": resolved_kps_id,
+                        "link_method": resolved_link_method,
+                        "analysis_scope": effective_scope,
+                        "non_kps_id": None if effective_scope == "KPS" else old_history.get("non_kps_id"),
                     }
                     
                     await asyncio.to_thread(lambda: supabase.table("analysis_history")
@@ -5127,6 +6176,7 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                     print(f"✅ Data merged successfully into id: {old_history['id']}")
                     invalidate_cache(f"history_detail_{old_history['id']}")
                     invalidate_cache("history_list")
+                    invalidate_cache("dashboard_global_")
                     return {"status": "success", "data": {"id": old_history['id']}, "message": "Data berhasil digabungkan (Smart Merge)"}
             except Exception as me:
                 print(f"⚠️ Smart Merge failed, falling back to replace: {me}")
@@ -5144,8 +6194,6 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
             print(f"⚠️ Cleanup failed (ignored): {e}")
 
         # 3. Simpan SEBAGAI BARU (Insert)
-        # Determine analysis_scope based on kps_id
-        effective_scope = "KPS" if request.kps_id else (request.analysis_scope or "NON_KPS")
 
         # --- AUTO-CREATE NON-KPS MASTER RECORD IF NEEDED ---
         non_kps_id = None
@@ -5238,9 +6286,9 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
             "reforestation_ha": refor_val,
             "trend_type": trend_val,
             # KPS Detection Fields
-            "kps_id": request.kps_id,
+            "kps_id": resolved_kps_id,
             "non_kps_id": non_kps_id,  # Link to master_non_kps if NON_KPS analysis
-            "link_method": request.link_method or "NONE",
+            "link_method": resolved_link_method,
             "analysis_scope": effective_scope
         }
         
@@ -5261,6 +6309,7 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
         if hist_res is not None and hasattr(hist_res, 'data') and hist_res.data and len(hist_res.data) > 0:
              # Invalidate list cache on successful save
              invalidate_cache("history_list")
+             invalidate_cache("dashboard_global_")
 
              saved_history = hist_res.data[0]
              history_id = saved_history.get("id")
@@ -5350,6 +6399,12 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
                  )
                  print(f"🗺️ Launched tile download pipeline for history {history_id[:8]}")
 
+             # Avoid proxy timeout (524): run heavy thumbnail/vector persistence
+             # asynchronously after returning success.
+             if history_id and not SYNC_VISUAL_PERSIST_ON_SAVE:
+                 background_tasks.add_task(regenerate_visuals, history_id, False)
+                 print(f"🧩 Scheduled async visual persistence for history {history_id[:8]}")
+
              return {"status": "success", "data": saved_history}
         else:
              raise Exception("Insert analysis_history failed after retries.")
@@ -5376,7 +6431,7 @@ async def save_history(request: SaveHistoryRequest, background_tasks: Background
 
 
 @app.delete("/history/{history_id}")
-async def delete_history(history_id: str):
+async def delete_history(history_id: str, _: Dict[str, Any] = Depends(require_admin_user)):
     """
     Menghapus item riwayat analisis secara robust.
     Pola 'context 7': Menggunakan pengecekan keberadaan eksplisit dan logging detail.
@@ -5391,7 +6446,7 @@ async def delete_history(history_id: str):
         # Ambil analysis_results untuk keperluan cleanup file images
         check_res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("id, analysis_results")
+            .select("id, analysis_results, slope_map_url, asset_manifest, lahan_id")
             .eq("id", history_id)
             .limit(1)
             .execute()
@@ -5406,46 +6461,132 @@ async def delete_history(history_id: str):
                 "id": history_id
             }
 
-        # --- CLEANUP CLOUD FILES ---
+        # --- CLEANUP ASSET FILES (Cloud + Local) ---
+        item_data = check_res.data[0]
         try:
-            item_data = check_res.data[0]
-            results = item_data.get('analysis_results', [])
-            files_to_delete = []
-            
+            results = item_data.get('analysis_results', []) or []
+            asset_manifest = item_data.get('asset_manifest') or {}
+            asset_urls = set()
+
             for r in results:
-                # Check Thumbnail
-                t_url = r.get('thumb_url')
-                if t_url and '/thumbnails/' in t_url:
-                    # Extract filename after /thumbnails/
-                    fname = t_url.split('/thumbnails/')[-1]
-                    if fname: files_to_delete.append(fname)
-                
-                # Check RGB Thumbnail
-                rgb_url = r.get('rgb_thumb_url')
-                if rgb_url and '/thumbnails/' in rgb_url:
-                    fname = rgb_url.split('/thumbnails/')[-1]
-                    if fname: files_to_delete.append(fname)
-            
-            if files_to_delete:
-                print(f"🗑️ Deleting {len(files_to_delete)} images from Cloud Storage...")
-                # Supabase remove takes list of filenames
+                if not isinstance(r, dict):
+                    continue
+                thumb = r.get('thumb_url')
+                rgb_thumb = r.get('rgb_thumb_url')
+                if thumb:
+                    asset_urls.add(thumb)
+                if rgb_thumb:
+                    asset_urls.add(rgb_thumb)
+
+            # Include slope image if present.
+            slope_map_url = item_data.get("slope_map_url")
+            if slope_map_url:
+                asset_urls.add(slope_map_url)
+
+            # Include manifest local paths as fallback source of truth.
+            for year_data in (asset_manifest.get("assets_per_year") or {}).values():
+                if not isinstance(year_data, dict):
+                    continue
+                for key in ("thumb_url", "rgb_thumb_url"):
+                    info = year_data.get(key) or {}
+                    local_path = info.get("local_path") if isinstance(info, dict) else None
+                    if local_path:
+                        asset_urls.add(local_path)
+
+            cloud_objects = sorted({
+                obj for obj in (extract_thumbnail_object_name(u) for u in asset_urls) if obj
+            })
+            local_files = sorted({
+                safe_local_storage_path(rel)
+                for rel in (extract_local_storage_relative_path(u) for u in asset_urls)
+                if rel
+            })
+            local_files = [p for p in local_files if p]
+
+            if cloud_objects:
+                print(f"🗑️ Deleting {len(cloud_objects)} images from Supabase Storage...")
                 await asyncio.to_thread(
-                    lambda: supabase.storage.from_('thumbnails').remove(files_to_delete)
+                    lambda: supabase.storage.from_('thumbnails').remove(cloud_objects)
                 )
-                print(f"✅ Deleted {len(files_to_delete)} files from Cloud.")
+                print(f"✅ Deleted {len(cloud_objects)} files from Supabase Storage.")
+
+            deleted_local_files = 0
+            for file_path in local_files:
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        deleted_local_files += 1
+                except Exception as local_err:
+                    print(f"ℹ️ Local file cleanup skipped ({file_path}): {local_err}")
+            if deleted_local_files:
+                print(f"✅ Deleted {deleted_local_files} local asset files.")
+
+            # Cleanup tile cache directory for this history.
+            try:
+                history_short = history_id[:8]
+                if pipeline_manager and getattr(pipeline_manager, "downloader", None):
+                    pipeline_manager.downloader.cleanup_tiles(history_short)
+                else:
+                    import shutil
+                    shutil.rmtree(os.path.join(STORAGE_ROOT, "tiles", history_short), ignore_errors=True)
+                print(f"✅ Deleted local tile cache for history {history_short}.")
+            except Exception as tile_err:
+                print(f"ℹ️ Local tile cleanup skipped (non-fatal): {tile_err}")
         except Exception as storage_err:
-            print(f"⚠️ Failed to clean up cloud storage (non-fatal): {storage_err}")
+            print(f"⚠️ Failed to clean up image assets (non-fatal): {storage_err}")
         # ---------------------------
 
-        # 2. Lakukan penghapusan database
-        # Tambahkan .select() untuk memastikan kembalian data jika didukung
-        res = await asyncio.to_thread(
+        # 2. Hapus relasi child secara eksplisit (defensive cleanup)
+        # Tetap aman walau FK ON DELETE CASCADE belum konsisten di semua environment.
+        lahan_id = item_data.get("lahan_id")
+
+        child_tables = [
+            "analysis_yearly_data",
+            "analysis_hotspots",
+            "analysis_slope_summary",
+            "analysis_erosion_risk",
+        ]
+        for table_name in child_tables:
+            try:
+                child_res = await asyncio.to_thread(
+                    lambda t=table_name: supabase.table(t).delete().eq("history_id", history_id).execute()
+                )
+                deleted_rows = len(child_res.data) if getattr(child_res, "data", None) else 0
+                print(f"🧹 Child cleanup {table_name}: deleted {deleted_rows} rows for history {history_id}")
+            except Exception as child_err:
+                # Non-fatal: table/column mungkin tidak ada pada schema lama
+                print(f"ℹ️ Child cleanup skipped for {table_name}: {child_err}")
+
+        # 3. Hapus parent record utama
+        await asyncio.to_thread(
             lambda: supabase.table("analysis_history").delete().eq("id", history_id).execute()
         )
+
+        # 4. Jika tidak ada history lain yang pakai lahan yang sama, hapus master_lahan orphan.
+        if lahan_id:
+            try:
+                ref_res = await asyncio.to_thread(
+                    lambda: supabase.table("analysis_history")
+                    .select("id", count="exact")
+                    .eq("lahan_id", lahan_id)
+                    .limit(1)
+                    .execute()
+                )
+                remaining_refs = ref_res.count if ref_res.count is not None else len(ref_res.data or [])
+                if remaining_refs == 0:
+                    await asyncio.to_thread(
+                        lambda: supabase.table("master_lahan").delete().eq("id", lahan_id).execute()
+                    )
+                    print(f"🧹 Deleted orphan master_lahan: {lahan_id}")
+                else:
+                    print(f"ℹ️ master_lahan {lahan_id} kept (still referenced by {remaining_refs} history rows)")
+            except Exception as lahan_err:
+                print(f"ℹ️ master_lahan orphan cleanup skipped (non-fatal): {lahan_err}")
         
-        # 3. Invalidate cache
+        # 5. Invalidate cache
         invalidate_cache("history_list")
         invalidate_cache(f"history_detail_{history_id}")
+        invalidate_cache("dashboard_global_")
         
         print(f"✅ Successfully deleted history ID: {history_id}")
         return {
@@ -5481,8 +6622,8 @@ async def get_history():
     
     CACHE_KEY = "history_list"
     
-    # Try to get from cache first
-    cached_data = get_cached(CACHE_KEY)
+    # Bypass cache to avoid stale KPS identity fields in pin labels.
+    cached_data = None
     if cached_data is not None:
         print(f"🚀 Cache HIT for {CACHE_KEY}")
         return cached_data
@@ -5494,7 +6635,7 @@ async def get_history():
         # Include kps_id untuk ambil nama KPS dari master_kps
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("id, filename, file_size, created_at, metadata, analysis_results, kps_id, center_lat, center_lng, master_lahan(geom_geojson, centroid_lat, centroid_lng)")
+            .select("id, filename, file_size, created_at, metadata, analysis_results, kps_id, analysis_scope, link_method, center_lat, center_lng, master_lahan(geom_geojson, centroid_lat, centroid_lng)")
             .order("created_at", desc=True)
             .limit(50)
             .execute()
@@ -5502,6 +6643,8 @@ async def get_history():
 
         # Pruning Agresif untuk List View (Prevent 524 Timeout)
         data = []
+        kps_by_id_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        kps_by_no_sk_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         for item in res.data:
             # 1. Fallback Location Strategy
             # Jika center_lat/lng kosong, ambil dari master_lahan
@@ -5558,28 +6701,48 @@ async def get_history():
                     # (Detail view needs them for time series display)
                     # Only compress by keeping essential stats and first thumbnail for UI preview
 
-            # 4. Ambil nama KPS dari master_kps jika ada kps_id
-            if item.get('kps_id'):
-                try:
-                    kps_res = await asyncio.to_thread(
-                        lambda: supabase.table("master_kps")
-                        .select("nama_kps")
-                        .eq("id_kps_api", item['kps_id'])
-                        .single()
-                        .execute()
-                    )
-                    if kps_res.data and kps_res.data.get('nama_kps'):
-                        # Gunakan nama KPS sebagai display name
-                        item['display_name'] = kps_res.data['nama_kps']
-                    else:
-                        # Fallback ke filename jika KPS tidak ditemukan
-                        item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
-                except Exception as kps_err:
-                    print(f"⚠️ Failed to fetch KPS name for {item.get('kps_id')}: {kps_err}")
-                    item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
+            # 4. Resolve KPS display identity (kps_id first, then NO_SK metadata fallback)
+            kps_info = None
+            kps_id = item.get("kps_id")
+            if kps_id:
+                if kps_id in kps_by_id_cache:
+                    kps_info = kps_by_id_cache[kps_id]
+                else:
+                    try:
+                        kps_res = await asyncio.to_thread(
+                            lambda: supabase.table("master_kps")
+                            .select("id_kps_api, nama_kps, no_sk, kps_type, provinsi, kab_kota")
+                            .eq("id_kps_api", kps_id)
+                            .limit(1)
+                            .execute()
+                        )
+                        kps_info = (kps_res.data or [None])[0]
+                    except Exception as kps_err:
+                        print(f"⚠️ Failed to fetch KPS by id {kps_id}: {kps_err}")
+                        kps_info = None
+                    kps_by_id_cache[kps_id] = kps_info
+
+            metadata = item.get("metadata") or {}
+            metadata_no_sk = extract_no_sk_from_metadata(metadata) or extract_no_sk_from_filename(item.get("filename"))
+            if not kps_info and metadata_no_sk:
+                if metadata_no_sk in kps_by_no_sk_cache:
+                    kps_info = kps_by_no_sk_cache[metadata_no_sk]
+                else:
+                    kps_info = await lookup_kps_by_no_sk(metadata_no_sk)
+                    kps_by_no_sk_cache[metadata_no_sk] = kps_info
+
+            if kps_info and kps_info.get("nama_kps"):
+                item["display_name"] = kps_info.get("nama_kps")
+                item["kps_info"] = kps_info
+                item["analysis_scope"] = "KPS"
             else:
-                # Tidak ada kps_id, gunakan filename
-                item['display_name'] = item.get('filename', 'Analisis Tanpa Nama')
+                item["display_name"] = (
+                    metadata.get("kps_name")
+                    or metadata.get("location")
+                    or item.get("filename")
+                    or "Analisis Tanpa Nama"
+                )
+                item["kps_info"] = None
 
             data.append(item)
             
@@ -5593,6 +6756,7 @@ async def get_history():
 # NEW ENDPOINTS FOR DASHBOARD & KPS HISTORY
 # ==============================================================================
 
+@app.get("/analysis/history/kps")
 @app.get("/api/analysis/history/kps")
 async def get_history_kps(
     page: int = Query(1, ge=1),
@@ -5600,47 +6764,106 @@ async def get_history_kps(
     search: Optional[str] = None
 ):
     """
-    Get paginated history for KPS analysis.
-    Supports search by name, SK number, or location.
+    Get paginated history for dashboard table (KPS + NON_KPS).
+    Supports search by filename, KPS name/SK, and Non-KPS area name.
     """
     if not supabase:
         raise HTTPException(status_code=503, detail="Supabase client not configured")
 
     try:
+        normalized_search = re.sub(r"\s+", " ", (search or "")).strip().lower()
+        search_hash = hashlib.md5(normalized_search.encode("utf-8")).hexdigest()[:12]
+        cache_key = f"history_list_kps_page={page}_per={per_page}_s={search_hash}"
+        if HISTORY_LIST_CACHE_SECONDS > 0:
+            cached_payload = get_cached(cache_key)
+            if isinstance(cached_payload, dict):
+                return cached_payload
+
+        started = time.perf_counter()
         # Build query
         query = supabase.table("analysis_history") \
-            .select("*, master_kps!left(nama_kps, no_sk, provinsi, kab_kota, kps_type), master_lahan!left(geom_geojson, centroid_lat, centroid_lng)", count="exact") \
-            .eq("analysis_scope", "KPS") \
+            .select(
+                "id, filename, created_at, metadata, analysis_results, "
+                "analysis_scope, kps_id, non_kps_id, link_method, "
+                "center_lat, center_lng, trend_type, hotspot_count, "
+                "deforestation_ha, reforestation_ha, "
+                "master_kps!left(nama_kps, no_sk, provinsi, kab_kota, kps_type), "
+                "master_non_kps!left(nama_areal)",
+                count="planned"
+            ) \
             .order("created_at", desc=True)
-
-        if search:
-            # Complex search on joined tables via Supabase filtering
-            # Using 'or' with ILIKE.
-            search_filter = f"filename.ilike.%{search}%,master_kps.nama_kps.ilike.%{search}%,master_kps.no_sk.ilike.%{search}%,master_kps.provinsi.ilike.%{search}%"
-            query = query.or_(search_filter)
-
-        # Pagination
-        start = (page - 1) * per_page
-        end = start + per_page - 1
-        query = query.range(start, end)
-
-        res = await supabase_query(lambda: query.execute())
+        # For search mode, fetch ordered rows first and apply robust local filtering.
+        # This avoids PostgREST logic-tree parser issues on joined OR clauses.
+        if normalized_search:
+            res = await supabase_query(lambda: query.execute())
+        else:
+            start = (page - 1) * per_page
+            end = start + per_page - 1
+            paged_query = query.range(start, end)
+            res = await supabase_query(lambda: paged_query.execute())
 
         data = []
-        for item in res.data:
-            # Flatten KPS data
+        kps_by_no_sk_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        # Pre-fetch NO_SK fallback mapping in parallel for search mode to avoid
+        # long sequential waits when many rows miss joined KPS relation.
+        if normalized_search:
+            lookup_candidates: List[str] = []
+            for row in (res.data or []):
+                kps_join = row.get("master_kps") or {}
+                if kps_join.get("nama_kps"):
+                    continue
+                metadata = row.get("metadata") or {}
+                metadata_no_sk = extract_no_sk_from_metadata(metadata) or extract_no_sk_from_filename(row.get("filename"))
+                if metadata_no_sk:
+                    lookup_candidates.append(metadata_no_sk)
+
+            unique_candidates = list(dict.fromkeys(lookup_candidates))
+            if unique_candidates:
+                semaphore = asyncio.Semaphore(HISTORY_KPS_LOOKUP_CONCURRENCY)
+
+                async def _resolve_kps(no_sk: str):
+                    async with semaphore:
+                        return no_sk, await lookup_kps_by_no_sk(no_sk)
+
+                resolved_pairs = await asyncio.gather(*(_resolve_kps(no_sk) for no_sk in unique_candidates))
+                for no_sk, kps_row in resolved_pairs:
+                    kps_by_no_sk_cache[no_sk] = kps_row
+
+        for item in (res.data or []):
+            # Flatten KPS/Non-KPS identity fields
             kps = item.get('master_kps') or {}
-            item['nama_kps'] = kps.get('nama_kps')
-            item['no_sk'] = kps.get('no_sk')
-            item['provinsi'] = kps.get('provinsi')
-            item['kab_kota'] = kps.get('kab_kota')
-            item['kps_type'] = kps.get('kps_type')
-            
-            # Map center info
-            if item.get('center_lat') is None and item.get('master_lahan'):
-                 ml = item['master_lahan']
-                 item['center_lat'] = ml.get('centroid_lat')
-                 item['center_lng'] = ml.get('centroid_lng')
+            non_kps = item.get('master_non_kps') or {}
+            scope = (item.get('analysis_scope') or 'NON_KPS').upper()
+            metadata = item.get('metadata') or {}
+
+            # Fallback: resolve from metadata NO_SK when kps join is empty
+            if not kps.get('nama_kps'):
+                metadata_no_sk = extract_no_sk_from_metadata(metadata) or extract_no_sk_from_filename(item.get("filename"))
+                if metadata_no_sk:
+                    if metadata_no_sk in kps_by_no_sk_cache:
+                        kps_fallback = kps_by_no_sk_cache[metadata_no_sk]
+                    else:
+                        kps_fallback = await lookup_kps_by_no_sk(metadata_no_sk)
+                        kps_by_no_sk_cache[metadata_no_sk] = kps_fallback
+                    if kps_fallback:
+                        kps = kps_fallback
+                        scope = 'KPS'
+
+            item['nama_kps'] = (
+                kps.get('nama_kps')
+                or metadata.get('kps_name')
+                or metadata.get('location')
+                or non_kps.get('nama_areal')
+                or item.get('filename')
+                or 'Analisis Tanpa Nama'
+            )
+            item['no_sk'] = kps.get('no_sk') or extract_no_sk_from_metadata(metadata) or extract_no_sk_from_filename(item.get('filename')) or '-'
+            item['provinsi'] = kps.get('provinsi') or metadata.get('provinsi') or '-'
+            item['kab_kota'] = kps.get('kab_kota') or metadata.get('kab_kota') or '-'
+            item['kps_type'] = kps.get('kps_type') or ('NON_KPS' if scope != 'KPS' else 'KPS')
+            item['analysis_scope'] = scope
+            item['kps_info'] = kps if kps.get('nama_kps') else None
             
             # Simplify Analysis Results
             if 'analysis_results' in item:
@@ -5665,17 +6888,63 @@ async def get_history_kps(
                 item['analysis_results'] = None 
             
             # Remove heavy geometry
-            item['master_lahan'] = None
-            item['geo_data'] = None 
+            item['master_non_kps'] = None
             
             data.append(item)
 
-        return {
-            "data": data,
-            "total": res.count or 0,
-            "page": page,
-            "per_page": per_page
-        }
+        if normalized_search:
+            def _trend_match(query_text: str, trend_type: str) -> bool:
+                trend = (trend_type or "").upper()
+                if any(k in query_text for k in ("naik", "increase", "increasing", "bertambah")):
+                    return trend == "INCREASING"
+                if any(k in query_text for k in ("turun", "decrease", "decreasing", "berkurang")):
+                    return trend == "DECREASING"
+                if any(k in query_text for k in ("stabil", "tetap", "stable")):
+                    return trend == "STABLE"
+                return False
+
+            filtered_data = []
+            for item in data:
+                searchable_text = " ".join([
+                    str(item.get("filename") or ""),
+                    str(item.get("nama_kps") or ""),
+                    str(item.get("no_sk") or ""),
+                    str(item.get("provinsi") or ""),
+                    str(item.get("kab_kota") or ""),
+                    str(item.get("kps_type") or ""),
+                    str(item.get("trend_type") or ""),
+                ]).lower()
+
+                if normalized_search in searchable_text or _trend_match(normalized_search, item.get("trend_type")):
+                    filtered_data.append(item)
+
+            total_filtered = len(filtered_data)
+            start = (page - 1) * per_page
+            end = start + per_page
+            paged_data = filtered_data[start:end]
+
+            payload = {
+                "data": paged_data,
+                "total": total_filtered,
+                "page": page,
+                "per_page": per_page
+            }
+        else:
+            payload = {
+                "data": data,
+                "total": res.count or 0,
+                "page": page,
+                "per_page": per_page
+            }
+        elapsed = time.perf_counter() - started
+        reported_total = payload["total"] if normalized_search else (res.count or 0)
+        print(
+            f"⏱️ /api/analysis/history/kps page={page} per_page={per_page} "
+            f"rows={len(data)} total={reported_total} took={elapsed:.3f}s"
+        )
+        if HISTORY_LIST_CACHE_SECONDS > 0:
+            cache_file(cache_key, payload, expire=HISTORY_LIST_CACHE_SECONDS)
+        return payload
 
     except Exception as e:
         print(f"❌ Error fetching KPS history: {e}")
@@ -5689,6 +6958,12 @@ async def get_global_stats():
         return {}
 
     try:
+        cache_key = "dashboard_global_stats_v1"
+        if DASHBOARD_AGG_CACHE_SECONDS > 0:
+            cached = get_cached(cache_key)
+            if isinstance(cached, dict):
+                return cached
+
         # Fetch analysis history
         res = await supabase_query(
             lambda: supabase.table("analysis_history")
@@ -5729,13 +7004,16 @@ async def get_global_stats():
         except Exception as slope_err:
             print(f"⚠️ Slope query error (non-fatal): {slope_err}")
 
-        return {
+        payload = {
             "total_kps": len(data),
             "total_area_ha": round(total_area, 2),
             "current_forest_ha": round(total_forest, 2),
             "total_hotspots_all_time": total_hotspots,
             "total_slope_critical_ha": round(total_slope_critical, 2)
         }
+        if DASHBOARD_AGG_CACHE_SECONDS > 0:
+            cache_file(cache_key, payload, expire=DASHBOARD_AGG_CACHE_SECONDS)
+        return payload
     except Exception as e:
         print(f"Error global stats: {e}")
         import traceback
@@ -5774,6 +7052,10 @@ async def get_monitoring_terkini(id_kps: str = Query(..., description="ID KPS un
 async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
     """Run real-time GEE NDVI delta analysis for monitoring terkini."""
     try:
+        delta_ndvi_threshold = float(request.delta_ndvi_threshold)
+        min_patch_area_ha = float(request.min_patch_area_ha)
+        max_patch_points = int(request.max_patch_points)
+
         def _gee_analysis():
             from datetime import datetime, timedelta
 
@@ -5898,8 +7180,8 @@ async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
             # 6. Delta NDVI
             delta_ndvi = ndvi_recent.subtract(ndvi_baseline).rename('delta_ndvi')
 
-            # 7. Change mask: significant decrease (delta < -0.2)
-            change_mask = delta_ndvi.lt(-0.2)
+            # 7. Change mask: significant decrease with configurable threshold
+            change_mask = delta_ndvi.lt(delta_ndvi_threshold)
 
             # 8. Calculate luas_terindikasi_ha
             change_area_img = area_img.updateMask(change_mask)
@@ -5964,8 +7246,9 @@ async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
             # Cloud coverage estimate
             cloud_coverage_pct = round((1 - valid_pixel_ratio) * 100, 1)
 
-            # 11. Extract top 5 patch centroids via reduceToVectors
+            # 11. Extract centroid titik patch terbesar (berdasarkan threshold area)
             centroid_points = []
+            min_patch_area_m2 = min_patch_area_ha * 10000.0
             if luas_ha > 0:
                 try:
                     vectors = change_mask.selfMask().reduceToVectors(
@@ -5978,39 +7261,36 @@ async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
                         labelProperty='patch'
                     )
 
-                    # Calculate area and sort by largest
-                    def add_area(feat):
-                        a = feat.geometry().area()
-                        return feat.set('area_m2', a)
+                    # Compute area + centroid fully on GEE side (avoid local shapely dependency)
+                    def add_patch_stats(feat):
+                        centroid = feat.geometry().centroid(1).coordinates()
+                        return feat.set({
+                            'area_m2': feat.geometry().area(1),
+                            'centroid_lng': ee.List(centroid).get(0),
+                            'centroid_lat': ee.List(centroid).get(1),
+                        })
 
-                    vectors_with_area = vectors.map(add_area)
-                    sorted_vectors = vectors_with_area.sort('area_m2', False)
-                    top5 = sorted_vectors.limit(5)
-                    top5_list = top5.getInfo()
+                    vectors_with_stats = vectors.map(add_patch_stats)
+                    significant_vectors = vectors_with_stats.filter(
+                        ee.Filter.gte('area_m2', min_patch_area_m2)
+                    )
+                    sorted_vectors = significant_vectors.sort('area_m2', False)
+                    top_vectors = sorted_vectors.limit(max_patch_points)
+                    top_vectors_list = top_vectors.getInfo()
 
-                    for idx, feat in enumerate(top5_list.get('features', [])):
-                        geom = feat.get('geometry', {})
+                    for idx, feat in enumerate(top_vectors_list.get('features', [])):
                         props = feat.get('properties', {})
                         area_m2 = float(props.get('area_m2', 0))
-
-                        # Skip tiny patches (< 0.25 ha = 2500 m2)
-                        if area_m2 < 2500:
+                        lat = props.get('centroid_lat')
+                        lng = props.get('centroid_lng')
+                        if lat is None or lng is None:
                             continue
-
-                        # Compute centroid
-                        try:
-                            from shapely.geometry import shape as shapely_shape
-                            shp = shapely_shape(geom)
-                            centroid = shp.centroid
-                            centroid_points.append({
-                                'rank': idx + 1,
-                                'lat': round(centroid.y, 6),
-                                'lng': round(centroid.x, 6),
-                                'area_ha': round(area_m2 / 10000, 3)
-                            })
-                        except Exception as ce:
-                            print(f"   Centroid error for patch {idx}: {ce}")
-                            continue
+                        centroid_points.append({
+                            'rank': idx + 1,
+                            'lat': round(float(lat), 6),
+                            'lng': round(float(lng), 6),
+                            'area_ha': round(area_m2 / 10000, 3)
+                        })
                 except Exception as vec_err:
                     print(f"   reduceToVectors failed (non-fatal): {vec_err}")
 
@@ -6034,6 +7314,9 @@ async def run_monitoring_terkini(request: MonitoringTerkiniRequest):
                 'data_availability': data_availability,
                 'valid_pixel_ratio': round(valid_pixel_ratio, 3),
                 'recent_window_used': recent_window_used,
+                'delta_ndvi_threshold': round(delta_ndvi_threshold, 3),
+                'min_patch_area_ha': round(min_patch_area_ha, 3),
+                'max_patch_points': max_patch_points,
             }
 
         result = await asyncio.to_thread(_gee_analysis)
@@ -6107,6 +7390,12 @@ async def get_global_yearly():
         return []
 
     try:
+        cache_key = "dashboard_global_yearly_v1"
+        if DASHBOARD_AGG_CACHE_SECONDS > 0:
+            cached = get_cached(cache_key)
+            if isinstance(cached, list):
+                return cached
+
         res = await supabase_query(
             lambda: supabase.table("analysis_history")
             .select("analysis_results")
@@ -6203,6 +7492,8 @@ async def get_global_yearly():
                 if key != "year" and isinstance(entry[key], float):
                     entry[key] = round(entry[key], 2)
 
+        if DASHBOARD_AGG_CACHE_SECONDS > 0:
+            cache_file(cache_key, sorted_years, expire=DASHBOARD_AGG_CACHE_SECONDS)
         return sorted_years
     except Exception as e:
         print(f"Error global yearly: {e}")
@@ -6389,6 +7680,7 @@ async def _build_analysis_export_data() -> dict:
     }
 
 
+@app.get("/analysis/history/kps/export/json")
 @app.get("/api/analysis/history/kps/export/json")
 async def export_history_kps_json():
     """Export all analysis history as JSON."""
@@ -6403,6 +7695,7 @@ async def export_history_kps_json():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/analysis/history/kps/export/excel")
 @app.get("/api/analysis/history/kps/export/excel")
 async def export_history_kps_excel():
     """Export all analysis history to Excel with national + per-province sheets."""
@@ -6568,8 +7861,8 @@ async def get_history_detail(history_id: str):
     
     CACHE_KEY = f"history_detail_{history_id}"
     
-    # Try to get from cache first
-    cached_data = get_cached(CACHE_KEY)
+    # Bypass cache to avoid stale KPS identity fields in detail view.
+    cached_data = None
     if cached_data is not None:
         print(f"🚀 Cache HIT for {CACHE_KEY}")
         return cached_data
@@ -6579,7 +7872,7 @@ async def get_history_detail(history_id: str):
     try:
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("*, master_lahan(geom_geojson), master_kps(nama_kps, no_sk, provinsi, kab_kota, kps_type, kecamatan, desa, tgl_sk, luas_sk_ha)")
+            .select("*, master_lahan(geom_geojson), master_kps(id_kps_api, nama_kps, no_sk, provinsi, kab_kota, kps_type, kecamatan, desa, tgl_sk, luas_sk_ha)")
             .eq("id", history_id)
             .single()
             .execute()
@@ -6590,15 +7883,36 @@ async def get_history_detail(history_id: str):
 
         item = res.data
         master_lahan = item.get('master_lahan')
-        geo_data = None
+
+        # Keep geometry from analysis_history.geo_data when present,
+        # then prefer master_lahan geom as authoritative shape.
+        geo_data = item.get('geo_data')
         if master_lahan and isinstance(master_lahan, dict):
-            geo_data = master_lahan.get('geom_geojson')
+            master_geo = master_lahan.get('geom_geojson')
+            if master_geo:
+                geo_data = master_geo
+
+        # Last fallback for map centering when polygon geometry is unavailable.
+        if not geo_data and item.get("center_lat") is not None and item.get("center_lng") is not None:
+            try:
+                geo_data = {
+                    "type": "Point",
+                    "coordinates": [float(item.get("center_lng")), float(item.get("center_lat"))]
+                }
+            except (TypeError, ValueError):
+                geo_data = None
 
         if 'master_lahan' in item:
             del item['master_lahan']
 
         # Flatten master_kps into item for easy access
         kps_info = item.pop('master_kps', None) or {}
+        if not kps_info:
+            fallback_no_sk = extract_no_sk_from_metadata(item.get("metadata") or {}) or extract_no_sk_from_filename(item.get("filename"))
+            if fallback_no_sk:
+                fallback_kps = await lookup_kps_by_no_sk(fallback_no_sk)
+                if fallback_kps:
+                    kps_info = fallback_kps
         item['kps_info'] = kps_info
 
         item['geo_data'] = geo_data
@@ -6726,7 +8040,7 @@ async def get_history_hotspots(history_id: str, year: int = None):
 
 
 @app.delete("/admin/cache/clear")
-async def admin_clear_cache():
+async def admin_clear_cache(_: Dict[str, Any] = Depends(require_admin_user)):
     """
     Admin endpoint untuk menghapus semua cache secara manual.
     Berguna jika data diubah langsung di database.
@@ -7093,6 +8407,7 @@ async def migrate_to_local_storage():
 
         # Invalidate cache
         invalidate_cache("history_list")
+        invalidate_cache("dashboard_global_")
         
         msg = f"Migration complete. Updated {migrated_count} records, saved {total_images_saved} images to local disk."
         print(f"✨ {msg}")
@@ -7820,7 +9135,23 @@ async def serve_local_tile(history_id: str, asset_type: str, year: str, z: int, 
                 "X-Tile-Source": "local",
             }
         )
-    raise HTTPException(status_code=404, detail="Tile not found")
+
+    # Register miss and trigger auto-heal when miss bursts indicate cache loss.
+    try:
+        await _maybe_schedule_tile_auto_heal(history_id, asset_type, year, z, x, y)
+    except Exception as heal_err:
+        print(f"⚠️ Tile auto-heal scheduler error: {heal_err}")
+
+    # Cache "tile miss" briefly so browser doesn't hammer repeated 404 for the same coords.
+    return Response(
+        status_code=404,
+        media_type="text/plain",
+        content="Tile not found",
+        headers={
+            "Cache-Control": "public, max-age=120",
+            "X-Tile-Source": "miss",
+        },
+    )
 
 
 @app.get("/history/{history_id}/pipeline-status")
@@ -7862,7 +9193,7 @@ async def recover_assets(history_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/history/{history_id}/regenerate-visuals")
-async def regenerate_visuals(history_id: str):
+async def regenerate_visuals(history_id: str, trigger_pipeline: bool = True, force: bool = False):
     """
     Memperbaiki/Regenerate data visualisasi (Thumbnail & Vektor) yang hilang untuk item history tertentu.
     Ini juga me-refresh tile URL GEE yang mungkin sudah expired.
@@ -7873,19 +9204,19 @@ async def regenerate_visuals(history_id: str):
         
     print(f"🔧 Regenerating visuals for History ID: {history_id}")
     
-    # Check cache first - if data is already complete, return immediately
-    cached_data = get_cached(f"history_detail_{history_id}")
-    if cached_data:
+    # Check cache first unless force refresh is requested (used by auto-heal).
+    cached_data = None if force else get_cached(f"history_detail_{history_id}")
+    if cached_data and not force:
         # Verify data completeness
         analysis_results = cached_data.get('analysis_results', [])
         is_complete = all(
-            r.get('vector_geojson') and 
-            r.get('thumb_url') and 
+            r.get('vector_geojson') and
+            r.get('thumb_url') and
             not (r.get('thumb_url', '').startswith('http') and 'googleapis.com' in r.get('thumb_url', '')) and
             not r.get('thumb_url', '').startswith('data:image')
             for r in analysis_results
         )
-        
+
         if is_complete:
             print(f"🚀 Cache HIT - Data already complete, skipping regeneration")
             return {"status": "success", "message": "Data already complete (from cache)", "data": cached_data}
@@ -8086,9 +9417,10 @@ async def regenerate_visuals(history_id: str):
             # Update cache with fresh complete data
             cache_file(f"history_detail_{history_id}", data)
             invalidate_cache("history_list")  # Refresh list cache too
+            invalidate_cache("dashboard_global_")
 
             # Trigger tile download pipeline after visual regeneration
-            if pipeline_manager and geometry_geojson:
+            if trigger_pipeline and pipeline_manager and geometry_geojson:
                 asyncio.create_task(
                     pipeline_manager.run_pipeline(
                         history_id, updated_results, geometry_geojson
@@ -9322,7 +10654,7 @@ async def get_hotspot_stats():
 
 
 @app.delete("/hotspot/cache")
-async def clear_hotspot_cache(year: int = None):
+async def clear_hotspot_cache(year: int = None, _: Dict[str, Any] = Depends(require_admin_user)):
     """
     Clear hotspot cache from database.
     If year is provided, only clear that year. Otherwise clear all.
@@ -9587,7 +10919,7 @@ async def worker_bulk_regenerate():
         print(f"❌ Worker Failed: {e}")
 
 @app.get("/admin/migration/temporal-status")
-async def get_migration_instructions():
+async def get_migration_instructions(_: Dict[str, Any] = Depends(require_admin_user)):
     """
     Get migration SQL for temporal_status implementation.
     Use this to check schema and get instructions for applying the migration.
@@ -9642,7 +10974,7 @@ async def get_migration_instructions():
 
 
 @app.post("/admin/regenerate-all-thumbnails")
-async def admin_regenerate_all(background_tasks: BackgroundTasks):
+async def admin_regenerate_all(background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_admin_user)):
     """
     Trigger process to regenerate thumbnails for ALL history items.
     Runs in background to fix missing/expired images.
@@ -9662,6 +10994,15 @@ async def startup_pipeline_scan():
         print("🔍 Pipeline Startup Scan: Checking for stuck/failed items...")
 
         try:
+            # Warm critical dashboard caches to reduce first-open latency.
+            try:
+                await get_history_kps(page=1, per_page=15, search=None)
+                await get_global_stats()
+                await get_global_yearly()
+                print("⚡ Dashboard caches prewarmed (history + global stats).")
+            except Exception as warm_err:
+                print(f"ℹ️ Dashboard prewarm skipped (non-fatal): {warm_err}")
+
             # Find items stuck in transient states (interrupted by restart)
             res = await asyncio.to_thread(
                 lambda: supabase.table("analysis_history")

@@ -184,9 +184,9 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
     };
 
     return (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
-            <div className="bg-white rounded-lg shadow-xl p-8 max-w-2xl w-full mx-4">
-                <h2 className="text-2xl font-bold mb-6">Bulk SHP Upload</h2>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999] p-3 md:p-4">
+            <div className="bg-white rounded-lg shadow-xl p-4 md:p-8 max-w-[96vw] md:max-w-2xl w-full mx-auto max-h-[92vh] overflow-y-auto">
+                <h2 className="text-lg md:text-2xl font-bold mb-4 md:mb-6">Bulk SHP Upload</h2>
 
                 {!validationResults ? (
                     <>
@@ -196,12 +196,12 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                             onDragLeave={handleDrag}
                             onDragOver={handleDrag}
                             onDrop={handleDrop}
-                            className={`border-2 border-dashed rounded-lg p-8 text-center transition ${
+                            className={`border-2 border-dashed rounded-lg p-5 md:p-8 text-center transition ${
                                 dragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
                             } ${loading ? 'opacity-50 pointer-events-none' : ''}`}
                         >
                             <Upload className="mx-auto mb-4 w-12 h-12 text-gray-400" />
-                            <p className="text-lg font-semibold mb-2">Drop ZIP file here or click to select</p>
+                            <p className="text-base md:text-lg font-semibold mb-2">Drop ZIP file here or click to select</p>
                             <p className="text-sm text-gray-500 mb-4">Select a ZIP file containing multiple SHP files</p>
                             <input
                                 type="file"
@@ -213,7 +213,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                             />
                             <label
                                 htmlFor="bulk-file-input"
-                                className="inline-block px-6 py-2 bg-blue-500 text-white rounded-lg cursor-pointer hover:bg-blue-600 disabled:opacity-50"
+                                className="inline-block w-full sm:w-auto px-6 py-2 bg-blue-500 text-white rounded-lg cursor-pointer hover:bg-blue-600 disabled:opacity-50"
                             >
                                 Select ZIP File
                             </label>
@@ -245,7 +245,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                 ) : (
                     <>
                         {/* Validation Summary */}
-                        <div className="space-y-3 max-h-96 overflow-y-auto mb-6">
+                        <div className="space-y-3 max-h-[52vh] md:max-h-96 overflow-y-auto mb-6">
                             {validationResults.map((result, idx) => (
                                 <div key={idx} className="border rounded-lg p-3 flex items-start gap-3">
                                     {result.status === 'valid' ? (
@@ -274,7 +274,7 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                         </div>
 
                         {/* Stats */}
-                        <div className="grid grid-cols-4 gap-2 mb-6">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-6">
                             <div className="bg-gray-50 rounded p-2 text-center">
                                 <p className="text-xs text-gray-600">Total</p>
                                 <p className="text-lg font-bold">{validationResults.length}</p>
@@ -302,17 +302,17 @@ const BulkUploadDialog = ({ onClose, onValidationComplete, onError }) => {
                 )}
 
                 {/* Buttons */}
-                <div className="flex gap-3 justify-end">
+                <div className="flex flex-col-reverse md:flex-row gap-3 justify-end">
                     <button
                         onClick={onClose}
-                        className="px-6 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
+                        className="px-6 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 w-full md:w-auto"
                     >
                         Cancel
                     </button>
                     {validationResults && (
                         <button
                             onClick={() => onValidationComplete(validationResults, bulkFileItems)}
-                            className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600"
+                            className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 w-full md:w-auto"
                         >
                             Next
                         </button>

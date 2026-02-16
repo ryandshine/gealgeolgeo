@@ -116,12 +116,15 @@ export const DynamicTileLayer = ({ url, localTileUrl, opacity, show, pane = 'ove
         let layer;
 
         if (localTileUrl && url) {
+            const localMissCache = new Set();
             // Cache-first: use custom TileLayer that tries local first, falls back to GEE
             const CacheTileLayer = L.TileLayer.extend({
                 createTile: function(coords, done) {
                     const tile = document.createElement('img');
                     tile.alt = '';
                     tile.setAttribute('role', 'presentation');
+                    tile.decoding = 'async';
+                    tile.loading = 'lazy';
 
                     const localSrc = L.Util.template(localTileUrl, {
                         ...coords, z: coords.z, x: coords.x, y: coords.y
@@ -129,10 +132,20 @@ export const DynamicTileLayer = ({ url, localTileUrl, opacity, show, pane = 'ove
                     const geeSrc = L.Util.template(url, {
                         ...coords, z: coords.z, x: coords.x, y: coords.y
                     });
+                    const tileKey = `${coords.z}/${coords.x}/${coords.y}`;
+
+                    // Local cache is generated until MAX_ZOOM_TILES. Above that, directly hit GEE.
+                    if (coords.z > MAX_ZOOM_TILES || localMissCache.has(tileKey)) {
+                        tile.onload = function() { done(null, tile); };
+                        tile.onerror = function() { done(new Error('GEE tile failed'), tile); };
+                        tile.src = geeSrc;
+                        return tile;
+                    }
 
                     tile.onload = function() { done(null, tile); };
                     tile.onerror = function() {
                         // Local tile not found, fallback to GEE
+                        localMissCache.add(tileKey);
                         tile.onerror = function() { done(new Error('Both tile sources failed'), tile); };
                         tile.src = geeSrc;
                     };
@@ -153,11 +166,12 @@ export const DynamicTileLayer = ({ url, localTileUrl, opacity, show, pane = 'ove
             });
         } else {
             // Standard tile layer (GEE only or local only)
+            const nativeZoom = localTileUrl ? MAX_ZOOM_TILES : 18;
             layer = L.tileLayer(localTileUrl || url, {
                 opacity: opacity,
                 pane: pane,
                 zIndex: zIndex,
-                maxNativeZoom: 18,
+                maxNativeZoom: nativeZoom,
                 maxZoom: 18,
                 keepBuffer: 3,
                 updateWhenZooming: false,
@@ -569,7 +583,7 @@ export const HistoryPinsLayer = ({ historyData, onSelect }) => {
                                         {item.slope_summary && item.slope_summary.length > 0 && (
                                             <div className="col-span-2 pt-1 mt-1 border-t border-slate-200/60 flex justify-between items-center">
                                                 <div className="text-[8px] font-black text-slate-500 uppercase tracking-tighter">Rata-rata Kelerengan</div>
-                                                <div className="text-[11px] font-bold text-indigo-700">
+                                                <div className="text-[11px] font-bold text-emerald-700">
                                                     {Number(item.slope_summary.find(s => s.scope === 'INSIDE')?.avg_slope || 0).toFixed(1)}%
                                                 </div>
                                             </div>

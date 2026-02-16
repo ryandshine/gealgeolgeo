@@ -57,6 +57,12 @@ const STATUS_CONFIG = {
     }
 };
 
+const DEFAULT_MONITORING_THRESHOLD = Object.freeze({
+    deltaNdvi: -0.2,
+    minPatchAreaHa: 0.25,
+    maxPatchPoints: 5
+});
+
 const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }) => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
@@ -80,7 +86,10 @@ const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }
                 console.log('🚀 Requesting GEE analysis with geometry...');
                 response = await axios.post(`${API_URL}/api/dashboard/monitoring-terkini`, {
                     geo_data: geoData,
-                    nama: namaKps || 'Analisis Monitoring'
+                    nama: namaKps || 'Analisis Monitoring',
+                    delta_ndvi_threshold: DEFAULT_MONITORING_THRESHOLD.deltaNdvi,
+                    min_patch_area_ha: DEFAULT_MONITORING_THRESHOLD.minPatchAreaHa,
+                    max_patch_points: DEFAULT_MONITORING_THRESHOLD.maxPatchPoints
                 }, {
                     timeout: 120000  // 2 minutes for GEE processing
                 });
@@ -112,6 +121,9 @@ const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }
 
     const statusConfig = data ? (STATUS_CONFIG[data.status] || STATUS_CONFIG.KUNING) : null;
     const StatusIcon = statusConfig?.icon || AlertTriangle;
+    const deltaNdviThreshold = Number(data?.delta_ndvi_threshold ?? DEFAULT_MONITORING_THRESHOLD.deltaNdvi);
+    const minPatchAreaHa = Number(data?.min_patch_area_ha ?? DEFAULT_MONITORING_THRESHOLD.minPatchAreaHa);
+    const maxPatchPoints = Number(data?.max_patch_points ?? DEFAULT_MONITORING_THRESHOLD.maxPatchPoints);
 
     return (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[10000] flex items-center justify-center p-4">
@@ -309,7 +321,7 @@ const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }
                                         </h4>
                                     </div>
                                     <p className="text-xs text-slate-500">
-                                        Koordinat centroid untuk verifikasi lapangan (maksimal 5 patch terbesar)
+                                        Koordinat centroid untuk verifikasi lapangan (maksimal {maxPatchPoints} patch terbesar)
                                     </p>
                                 </div>
 
@@ -345,7 +357,10 @@ const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }
                                     <div className="p-8 text-center text-slate-500">
                                         <MapPin className="w-16 h-16 mx-auto mb-3 text-slate-300" />
                                         <p className="font-medium">Tidak ada patch yang terdeteksi</p>
-                                        <p className="text-xs mt-1">Tidak ada perubahan signifikan dengan kriteria threshold saat ini</p>
+                                        <p className="text-xs mt-1">
+                                            Tidak ada perubahan signifikan (delta NDVI &lt; {deltaNdviThreshold.toFixed(2)},
+                                            patch minimum {minPatchAreaHa.toFixed(2)} ha)
+                                        </p>
                                     </div>
                                 )}
                             </div>
@@ -361,7 +376,10 @@ const MonitoringTerkiniDashboard = ({ isOpen, onClose, idKps, namaKps, geoData }
                                             <li>Data memerlukan <strong>verifikasi lapangan</strong> untuk konfirmasi perubahan tutupan lahan</li>
                                             <li>Perubahan NDVI dapat disebabkan oleh faktor alami (musim, cuaca, fenologi tanaman)</li>
                                             <li>Baseline tetap: <strong>Q4 2025</strong> (Oktober-Desember 2025) tidak pernah dihitung ulang</li>
-                                            <li>Threshold deteksi: Delta NDVI &lt; -0.2, patch minimum 0.25 hektar</li>
+                                            <li>
+                                                Threshold deteksi: Delta NDVI &lt; {deltaNdviThreshold.toFixed(2)},
+                                                patch minimum {minPatchAreaHa.toFixed(2)} hektar
+                                            </li>
                                         </ul>
                                     </div>
                                 </div>

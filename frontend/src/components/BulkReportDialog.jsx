@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import axios from 'axios';
-import { Download, Loader, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Download, Loader, AlertCircle, CheckCircle2, Trash2 } from 'lucide-react';
 import KpsDetectionDialog from './KpsDetectionDialog';
 import { API_URL } from '../constants';
 
@@ -9,6 +9,7 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
     const [showKpsSearch, setShowKpsSearch] = useState(false);
     const [saving, setSaving] = useState(false);
     const [localResults, setLocalResults] = useState(validationResults);
+    const [localFileItems, setLocalFileItems] = useState(bulkFileItems || []);
 
     const handleKpsConfirm = (kpsData, linkMethod) => {
         if (editingIdx !== null) {
@@ -27,24 +28,54 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
         }
     };
 
-    const downloadReport = () => {
-        const headers = ['Filename', 'NO_SK', 'Status', 'KPS Name', 'KPS NO_SK'];
-        const rows = localResults.map(r => [
-            r.filename,
-            r.no_sk || '-',
-            r.status,
-            r.kps_name || '-',
-            r.kps_no_sk || '-'
-        ]);
+    const downloadReport = async () => {
+        try {
+            const payloadRows = localResults.map((r) => ({
+                filename: r.filename,
+                no_sk: r.no_sk || null,
+                status: r.status || '',
+                kps_name: r.kps_name || null,
+                kps_no_sk: r.kps_no_sk || null,
+                link_method: r.link_method || null,
+                error: r.error || null
+            }));
 
-        const csv = [headers, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
-        const blob = new Blob([csv], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `bulk-report-${new Date().toISOString().split('T')[0]}.csv`;
-        a.click();
-        URL.revokeObjectURL(url);
+            const response = await axios.post(
+                `${API_URL}/api/bulk/report/excel`,
+                { rows: payloadRows },
+                { responseType: 'blob' }
+            );
+
+            const blob = new Blob(
+                [response.data],
+                { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+            );
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+
+            let filename = 'Bulk_Upload_Report.xlsx';
+            const contentDisposition = response.headers?.['content-disposition'] || response.headers?.['Content-Disposition'];
+            if (contentDisposition) {
+                const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+                const basicMatch = contentDisposition.match(/filename=(?:\"([^\"]+)\"|([^;]+))/i);
+                const rawName = utf8Match?.[1] || basicMatch?.[1] || basicMatch?.[2];
+                if (rawName) {
+                    filename = decodeURIComponent(rawName.trim().replace(/^["']|["']$/g, ''));
+                }
+            }
+            filename = filename.replace(/[\\/:*?"<>|]/g, '_').replace(/\.xlsx_+$/i, '.xlsx');
+            if (!/\.xlsx$/i.test(filename)) filename = `${filename}.xlsx`;
+
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Bulk report download error:', error);
+            alert('Gagal mengunduh report Excel. Coba lagi.');
+        }
     };
 
     const handleProceed = async () => {
@@ -52,11 +83,14 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
             setSaving(true);
 
             // Prepare bulk save items from validation results and file items
-            if (!bulkFileItems || bulkFileItems.length !== localResults.length) {
-                throw new Error(`Data mismatch: ${localResults.length} results vs ${bulkFileItems?.length ?? 0} file items`);
+            if (!localFileItems || localFileItems.length !== localResults.length) {
+                throw new Error(`Data mismatch: ${localResults.length} results vs ${localFileItems?.length ?? 0} file items`);
+            }
+            if (localResults.length === 0) {
+                throw new Error('Daftar analisis kosong. Tambahkan SHP terlebih dahulu.');
             }
             const bulkSaveItems = localResults.map((result, idx) => {
-                const fileItem = bulkFileItems[idx];
+                const fileItem = localFileItems[idx];
                 if (!fileItem || !fileItem.geo_data) {
                     console.warn(`Skipping item ${idx} (${result.filename}): missing geo_data`);
                     return null;
@@ -84,7 +118,7 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
             console.log('Proceeding with bulk save of', bulkSaveItems.length, 'items');
 
             // For MVP, we'll just close and show that they need to proceed with normal analysis
-            onSuccess(localResults, bulkFileItems);
+            onSuccess(localResults, localFileItems);
 
         } catch (error) {
             console.error('Proceed error:', error);
@@ -94,13 +128,30 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
         }
     };
 
+    const handleDeleteRow = (idx) => {
+        const target = localResults[idx];
+        if (!target) return;
+        const ok = window.confirm(`Hapus "${target.filename}" dari daftar analisis?`);
+        if (!ok) return;
+
+        setLocalResults((prev) => prev.filter((_, i) => i !== idx));
+        setLocalFileItems((prev) => prev.filter((_, i) => i !== idx));
+
+        if (editingIdx === idx) {
+            setEditingIdx(null);
+            setShowKpsSearch(false);
+        } else if (editingIdx !== null && idx < editingIdx) {
+            setEditingIdx((prev) => (prev === null ? null : prev - 1));
+        }
+    };
+
     return (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
-            <div className="bg-white rounded-lg shadow-xl p-8 max-w-6xl w-full mx-4 max-h-[90vh] overflow-hidden flex flex-col">
-                <h2 className="text-2xl font-bold mb-6">Bulk Upload Report</h2>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999] p-3 md:p-4">
+            <div className="bg-white rounded-lg shadow-xl p-4 md:p-8 max-w-[96vw] md:max-w-6xl w-full mx-auto max-h-[92vh] md:max-h-[90vh] overflow-hidden flex flex-col">
+                <h2 className="text-lg md:text-2xl font-bold mb-4 md:mb-6">Bulk Upload Report</h2>
 
                 {/* Stats */}
-                <div className="grid grid-cols-5 gap-3 mb-6">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 md:gap-3 mb-4 md:mb-6">
                     <div className="bg-gray-50 rounded p-3 text-center">
                         <p className="text-xs text-gray-600">Total Files</p>
                         <p className="text-2xl font-bold">{localResults.length}</p>
@@ -146,10 +197,10 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                         <tbody>
                             {localResults.map((result, idx) => (
                                 <tr key={idx} className="border-b hover:bg-gray-50">
-                                    <td className="px-4 py-3 font-mono text-xs">{result.filename}</td>
+                                    <td className="px-4 py-3 font-mono text-xs break-all">{result.filename}</td>
                                     <td className="px-4 py-3 text-xs">{result.no_sk || '-'}</td>
                                     <td className="px-4 py-3">
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex flex-wrap items-center gap-2">
                                             {result.status === 'valid' && (
                                                 <span className="flex items-center gap-1 text-green-600 text-xs font-medium">
                                                     <CheckCircle2 className="w-4 h-4" /> Valid
@@ -179,26 +230,42 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                                         )}
                                     </td>
                                     <td className="px-4 py-3 text-xs">
-                                        {result.status === 'needs_manual' && (
+                                        <div className="flex items-center gap-2">
+                                            {result.status === 'needs_manual' && (
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => {
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        setEditingIdx(idx);
+                                                        setShowKpsSearch(true);
+                                                    }}
+                                                    className="px-3 py-1 bg-blue-50 text-blue-600 hover:bg-blue-100 font-medium rounded transition-colors cursor-pointer pointer-events-auto"
+                                                    aria-label={`Search KPS for ${result.filename}`}
+                                                >
+                                                    Search KPS
+                                                </button>
+                                            )}
                                             <button
                                                 type="button"
                                                 onClick={(e) => {
                                                     e.preventDefault();
                                                     e.stopPropagation();
-                                                    setEditingIdx(idx);
-                                                    setShowKpsSearch(true);
+                                                    handleDeleteRow(idx);
                                                 }}
-                                                className="px-3 py-1 bg-blue-50 text-blue-600 hover:bg-blue-100 font-medium rounded transition-colors cursor-pointer pointer-events-auto"
-                                                aria-label={`Search KPS for ${result.filename}`}
+                                                className="inline-flex items-center gap-1 px-3 py-1 bg-red-50 text-red-600 hover:bg-red-100 font-medium rounded transition-colors"
+                                                aria-label={`Delete ${result.filename}`}
+                                                title="Hapus dari daftar analisis"
                                             >
-                                                Search KPS
+                                                <Trash2 className="w-3.5 h-3.5" />
+                                                Delete
                                             </button>
-                                        )}
-                                        {result.error && (
-                                            <span className="text-red-500" title={result.error}>
-                                                View Error
-                                            </span>
-                                        )}
+                                            {result.error && (
+                                                <span className="text-red-500" title={result.error}>
+                                                    View Error
+                                                </span>
+                                            )}
+                                        </div>
                                     </td>
                                 </tr>
                             ))}
@@ -207,25 +274,25 @@ const BulkReportDialog = ({ validationResults, bulkFileItems, onClose, onSuccess
                 </div>
 
                 {/* Buttons */}
-                <div className="flex gap-3 justify-between mt-6">
+                <div className="flex flex-col gap-3 md:flex-row md:justify-between mt-4 md:mt-6">
                     <button
                         onClick={downloadReport}
-                        className="flex items-center gap-2 px-4 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
+                        className="flex items-center justify-center md:justify-start gap-2 px-4 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 w-full md:w-auto"
                     >
                         <Download className="w-4 h-4" />
                         Download Report
                     </button>
-                    <div className="flex gap-3">
+                    <div className="flex flex-col-reverse md:flex-row gap-3">
                         <button
                             onClick={onClose}
-                            className="px-6 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
+                            className="px-6 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 w-full md:w-auto"
                         >
                             Back
                         </button>
                         <button
                             onClick={handleProceed}
-                            disabled={saving}
-                            className="flex items-center gap-2 px-6 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 disabled:opacity-50"
+                            disabled={saving || localResults.length === 0}
+                            className="flex items-center justify-center gap-2 px-6 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 disabled:opacity-50 w-full md:w-auto"
                         >
                             {saving && <Loader className="w-4 h-4 animate-spin" />}
                             Proceed to Analysis

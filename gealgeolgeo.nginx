@@ -2,7 +2,7 @@ server {
     listen 80;
     server_name gealgeolgeo.ditpps.com;
 
-    root /home/ryandshine/gealgeolgeo/frontend/dist;
+    root /var/www/gealgeolgeo;
     index index.html;
 
     location / {

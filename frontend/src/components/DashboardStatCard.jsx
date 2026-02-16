@@ -10,7 +10,7 @@ const DashboardStatCard = ({ title, value, icon: Icon, color = "blue", trend, su
         red: "bg-red-50 text-red-600",
         yellow: "bg-yellow-50 text-yellow-600",
         orange: "bg-orange-50 text-orange-600",
-        purple: "bg-purple-50 text-purple-600",
+        purple: "bg-emerald-50 text-emerald-600",
         emerald: "bg-emerald-50 text-emerald-600",
         rose: "bg-rose-50 text-rose-600"
     };

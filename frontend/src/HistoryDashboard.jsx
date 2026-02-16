@@ -16,7 +16,7 @@ const TrendLabel = ({ type }) => {
     return <span className="text-[10px] font-bold text-slate-400">Stabil</span>;
 };
 
-const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) => {
+const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze, canDelete = false }) => {
     // Data state
     const [data, setData] = useState([]);
     const [total, setTotal] = useState(0);
@@ -102,13 +102,18 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
 
     // Manual search (on button click or Enter key)
     const handleSearch = useCallback(() => {
-        setSearchTerm(searchInput);
+        const normalized = searchInput.trim().replace(/\s+/g, ' ').slice(0, 120);
+        if (normalized === searchTerm && page === 1) return;
+        setSearchTerm(normalized);
         setPage(1);
-        fetchData(1, searchInput);
-    }, [fetchData, searchInput]);
+        fetchData(1, normalized);
+    }, [fetchData, page, searchInput, searchTerm]);
 
     const handleSearchKeyDown = useCallback((e) => {
-        if (e.key === 'Enter') handleSearch();
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            handleSearch();
+        }
     }, [handleSearch]);
 
     const handleClearSearch = useCallback(() => {
@@ -127,13 +132,18 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
     // Delete handler - use parent's onDelete for API call, then sync local state
     const handleConfirmDelete = useCallback(async () => {
         if (!deleteConfirmId) return;
+        if (!canDelete) {
+            showToast('error', 'Hanya admin yang dapat menghapus data');
+            setDeleteConfirmId(null);
+            return;
+        }
         setPendingRowId(deleteConfirmId);
         try {
             if (onDelete) {
                 await onDelete(deleteConfirmId);
             }
             // Remove row locally only after parent confirms success
-            setData(prev => prev.filter(r => (r.analysis_id || r.id) !== deleteConfirmId));
+            setData(prev => prev.filter(r => (r.id || r.analysis_id) !== deleteConfirmId));
             setTotal(prev => Math.max(0, prev - 1));
             showToast('success', 'Data berhasil dihapus');
         } catch (err) {
@@ -143,15 +153,19 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
             setDeleteConfirmId(null);
             setPendingRowId(null);
         }
-    }, [deleteConfirmId, onDelete, showToast]);
+    }, [canDelete, deleteConfirmId, onDelete, showToast]);
 
     // Re-Analisis handler
     const handleReanalyze = useCallback((e, item) => {
         e.stopPropagation();
-        if (onReanalyze) {
-            onReanalyze({ id: item.analysis_id || item.id, ...item });
+        if (!canDelete) {
+            showToast('error', 'Hanya admin yang dapat mengulang analisis');
+            return;
         }
-    }, [onReanalyze]);
+        if (onReanalyze) {
+            onReanalyze({ ...item, id: item.id || item.analysis_id });
+        }
+    }, [canDelete, onReanalyze, showToast]);
 
     // Excel Download handler
     const handleDownloadExcel = useCallback(async () => {
@@ -175,11 +189,17 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
             const contentDisposition = response.headers.get('Content-Disposition');
             let filename = 'Laporan_Analisis_KPS.xlsx';
             if (contentDisposition) {
-                const filenameMatch = contentDisposition.match(/filename="?(.+)"?/i);
-                if (filenameMatch) {
-                    filename = filenameMatch[1];
+                const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+                const basicMatch = contentDisposition.match(/filename=(?:"([^"]+)"|([^;]+))/i);
+                const rawName = utf8Match?.[1] || basicMatch?.[1] || basicMatch?.[2];
+                if (rawName) {
+                    const decoded = decodeURIComponent(rawName.trim().replace(/^["']|["']$/g, ''));
+                    filename = decoded;
                 }
             }
+            // Guard against malformed header parsing and force correct extension.
+            filename = filename.replace(/[\\/:*?"<>|]/g, '_').replace(/\.xlsx_+$/i, '.xlsx');
+            if (!/\.xlsx$/i.test(filename)) filename = `${filename}.xlsx`;
 
             a.download = filename;
             document.body.appendChild(a);
@@ -256,7 +276,9 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                         </div>
                         <div>
                             <h2 className="text-lg md:text-xl font-black text-slate-800 tracking-tight">Riwayat Analisis KPS</h2>
-                            <p className="text-slate-500 text-[10px] md:text-sm mt-0.5">Klik tombol aksi untuk melihat, re-analisis, atau hapus data</p>
+                            <p className="text-slate-500 text-[10px] md:text-sm mt-0.5">
+                                Klik tombol aksi untuk melihat, re-analisis, atau hapus data{!canDelete ? ' (ulang/hapus: admin only)' : ''}
+                            </p>
                         </div>
                     </div>
 
@@ -275,13 +297,15 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                                 className="block w-full pl-9 pr-9 py-2 md:py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs md:text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-inner"
                             />
                             {searchInput && (
-                                <button onClick={handleClearSearch} className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600">
+                                <button type="button" onClick={handleClearSearch} className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600">
                                     <X size={14} />
                                 </button>
                             )}
                         </div>
                         <button
+                            type="button"
                             onClick={handleSearch}
+                            disabled={loading}
                             className="px-3 py-2 md:py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm hover:shadow flex items-center gap-1.5 shrink-0"
                         >
                             <Search size={14} />
@@ -293,7 +317,7 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                     <button
                         onClick={handleDownloadExcel}
                         disabled={downloadingExcel}
-                        className="w-full md:w-auto bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 active:scale-95 text-white text-[11px] flex items-center justify-center gap-2 px-4 py-3 rounded-xl transition-all font-bold shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                        className="w-full md:w-auto bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 active:scale-95 text-white text-[11px] flex items-center justify-center gap-2 px-4 py-3 rounded-xl transition-all font-bold shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                     >
                         {downloadingExcel ? (
                             <>
@@ -358,7 +382,7 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                         { name: 'Tanah Kosong', value: globalYearly[globalYearly.length - 1]?.tanah_kosong || 0 },
                         { name: 'Air', value: globalYearly[globalYearly.length - 1]?.air || 0 },
                         { name: 'Lahan Terbangun', value: globalYearly[globalYearly.length - 1]?.lahan_terbangun || 0 },
-                    ].filter(d => d.value > 0)}
+                    ]}
                     loading={loadingGlobal}
                 />
 
@@ -379,7 +403,7 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {loading ? (
+                                {loading && data.length === 0 ? (
                                     [...Array(PER_PAGE)].map((_, i) => (
                                         <tr key={i} className="animate-pulse">
                                             {[...Array(8)].map((_, j) => (
@@ -397,7 +421,7 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                                     </tr>
                                 ) : (
                                     data.map((row, idx) => {
-                                        const rowId = row.analysis_id || row.id || idx;
+                                        const rowId = row.id || row.analysis_id || idx;
                                         const isPending = pendingRowId === rowId;
                                         return (
                                             <tr
@@ -473,30 +497,34 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
                                                         ) : (
                                                             <>
                                                                 <button
-                                                                    onClick={() => onSelect({ id: rowId, ...row })}
+                                                                    onClick={() => onSelect({ ...row, id: rowId })}
                                                                     className="py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold uppercase rounded shadow-sm hover:shadow transition-all flex items-center justify-center gap-1.5"
                                                                     title="Lihat Detail"
                                                                 >
                                                                     <Eye size={13} />
                                                                     <span className="hidden xl:inline">Lihat</span>
                                                                 </button>
-                                                                <button
-                                                                    onClick={(e) => handleReanalyze(e, row)}
-                                                                    className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg hover:bg-emerald-100 text-slate-500 hover:text-emerald-600 transition-all text-[10px] font-semibold"
-                                                                    title="Re-Analisis"
-                                                                >
-                                                                    <RefreshCw size={13} />
-                                                                    <span className="hidden xl:inline">Ulang</span>
-                                                                </button>
-                                                                <button
-                                                                    onClick={(e) => { e.stopPropagation(); setDeleteConfirmId(rowId); }}
-                                                                    disabled={pendingRowId === rowId}
-                                                                    className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg transition-all text-[10px] font-semibold ${pendingRowId === rowId ? 'opacity-50 cursor-not-allowed text-slate-400' : 'hover:bg-red-100 text-slate-500 hover:text-red-600'}`}
-                                                                    title="Hapus"
-                                                                >
-                                                                    {pendingRowId === rowId ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-                                                                    <span className="hidden xl:inline">Hapus</span>
-                                                                </button>
+                                                                {canDelete && (
+                                                                    <button
+                                                                        onClick={(e) => handleReanalyze(e, row)}
+                                                                        className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg hover:bg-emerald-100 text-slate-500 hover:text-emerald-600 transition-all text-[10px] font-semibold"
+                                                                        title="Re-Analisis"
+                                                                    >
+                                                                        <RefreshCw size={13} />
+                                                                        <span className="hidden xl:inline">Ulang</span>
+                                                                    </button>
+                                                                )}
+                                                                {canDelete && (
+                                                                    <button
+                                                                        onClick={(e) => { e.stopPropagation(); setDeleteConfirmId(rowId); }}
+                                                                        disabled={pendingRowId === rowId}
+                                                                        className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg transition-all text-[10px] font-semibold ${pendingRowId === rowId ? 'opacity-50 cursor-not-allowed text-slate-400' : 'hover:bg-red-100 text-slate-500 hover:text-red-600'}`}
+                                                                        title="Hapus"
+                                                                    >
+                                                                        {pendingRowId === rowId ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                                                                        <span className="hidden xl:inline">Hapus</span>
+                                                                    </button>
+                                                                )}
                                                             </>
                                                         )}
                                                     </div>
@@ -559,7 +587,7 @@ const HistoryDashboard = ({ onSelect, isSidebarOpen, onDelete, onReanalyze }) =>
             </div>
 
             {/* Delete Confirmation Modal */}
-            {deleteConfirmId && (
+            {deleteConfirmId && canDelete && (
                 <div className="fixed inset-0 z-[10001] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
                     <div className="bg-white rounded-3xl shadow-2xl max-w-sm w-full overflow-hidden animate-in zoom-in-95 duration-300">
                         <div className="p-6 text-center">
